@@ -173,27 +173,30 @@ def compute_indicators(candles):
 def get_session_context():
     """Retourne le contexte de la session de trading actuelle (heure UTC)"""
     hour = datetime.utcnow().hour
-    if 0 <= hour < 8:
-        session = "ASIA"
-        quality = "MEDIUM — Session Asie, volatilité modérée"
+    if 0 <= hour < 6:
+        session = "ASIA_EARLY"
+        quality = "MEDIUM — Asie early, peut trader si signal fort"
+    elif 6 <= hour < 8:
+        session = "ASIA_LATE"
+        quality = "GOOD — Fin session Asie, bonne activité"
     elif 8 <= hour < 12:
         session = "EUROPE_OPEN"
-        quality = "GOOD — Ouverture Europe, bonne liquidité"
+        quality = "EXCELLENT — Ouverture Europe, très bonne liquidité"
     elif 12 <= hour < 14:
         session = "LUNCH"
-        quality = "LOW — Pause déjeuner, faible volume"
+        quality = "MEDIUM — Déjeuner, trader si signal très fort"
     elif 14 <= hour < 17:
         session = "US_OPEN"
         quality = "EXCELLENT — Ouverture US, meilleure liquidité"
     elif 17 <= hour < 20:
         session = "US_AFTERNOON"
-        quality = "GOOD — Après-midi US, tendances fortes"
+        quality = "EXCELLENT — Après-midi US, tendances fortes"
     elif 20 <= hour < 22:
         session = "US_CLOSE"
-        quality = "MEDIUM — Clôture US, volatilité possible"
+        quality = "GOOD — Clôture US, encore actif"
     else:
         session = "OVERNIGHT"
-        quality = "LOW — Nuit, faible liquidité"
+        quality = "MEDIUM — Nuit, trader si signal clair"
 
     return {
         "session": session,
@@ -403,14 +406,20 @@ Bankroll: {bankroll:.2f} USDC
 ═══════════════════════════════
 RÈGLES DE DÉCISION
 ═══════════════════════════════
-1. NE PAS TRADER si session LOW (lunch/overnight) sauf signal EXCEPTIONNEL
-2. NE PAS TRADER si ATR < 0.05% (marché mort)
-3. NE PAS TRADER si timeframes contradictoires sans raison claire
-4. NE PAS TRADER si prix proche d'une résistance forte (pour UP) ou support fort (pour DOWN)
-5. RÉDUIRE mise si Fear&Greed extrême (< 20 ou > 80) — marché imprévisible
-6. AUGMENTER mise si session EXCELLENT + tous TF alignés + volume fort
-7. Après 2 pertes consécutives → exiger confluence parfaite
-8. Mise entre {MIN_BET_USD}$ et {min(MAX_BET_USD, bankroll*MAX_BET_PCT):.2f}$
+OBJECTIF: Trouver des opportunités de trading, pas les éviter. Trader ~60-70% du temps.
+
+1. TRADER dès que 2 timeframes sur 4 sont alignés dans la même direction
+2. TRADER même en session MEDIUM si RSI < 35 ou > 65 + MACD confirmé
+3. NE PAS TRADER SEULEMENT si ATR < 0.03% (marché vraiment mort) OU si les 4 TF contradictoires
+4. Fear&Greed extrême: RÉDUIRE la mise de 30% mais continuer à trader
+5. Prix près d'un S/R: si signal fort dans la direction opposée au niveau → c'est un rebond → TRADER
+6. Après 2 pertes consécutives → réduire mise à minimum mais continuer
+7. TOUJOURS choisir une direction si au moins 2 TF sont alignés — ne pas rester neutre
+8. RSI < 30 sur 5m = signal UP fort même si autres TF mitigés
+9. RSI > 70 sur 5m = signal DOWN fort même si autres TF mitigés
+10. Mise entre {MIN_BET_USD}$ et {min(MAX_BET_USD, bankroll*MAX_BET_PCT):.2f}$
+
+BIAIS: En cas de doute, trader plutôt que ne pas trader. Un PASS coûte des opportunités manquées.
 
 RÉPONDS UNIQUEMENT EN JSON:
 {{
