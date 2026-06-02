@@ -443,7 +443,13 @@ RÉPONDS UNIQUEMENT EN JSON:
                             "reasoning":f"Erreur API ({r.status})","trade":False}
                 data = await r.json()
                 raw  = data["content"][0]["text"].strip()
-                raw  = raw.replace("```json","").replace("```","").strip()
+                # Robust JSON extraction
+                raw = raw.replace("```json","").replace("```","").strip()
+                # Extract JSON object even if extra text around it
+                start = raw.find("{")
+                end   = raw.rfind("}") + 1
+                if start >= 0 and end > start:
+                    raw = raw[start:end]
                 res  = json.loads(raw)
                 return {
                     "dir":         res.get("direction"),
