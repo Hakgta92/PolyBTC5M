@@ -127,6 +127,32 @@ def support_resistance(candles, lookback=20):
     near_s = sorted([s for s in supports if s < price and price - s < threshold], reverse=True)[:3]
     return near_s, near_r
 
+def is_trending_market(candles_5m, candles_15m, threshold_pct=0.08):
+    """Retourne True si le marché est en tendance (pas en range)"""
+    if len(candles_5m) < 12 or len(candles_15m) < 6:
+        return True  # pas assez de données, on laisse passer
+
+    # Vérifier le mouvement sur les 30 dernières minutes (6 bougies 5m)
+    recent = candles_5m[-6:]
+    high = max(c["high"] for c in recent)
+    low  = min(c["low"]  for c in recent)
+    price = candles_5m[-1]["close"]
+    range_pct = (high - low) / price * 100
+
+    # Vérifier la pente des EMA sur 15m
+    closes_15m = [c["close"] for c in candles_15m[-8:]]
+    ema_slope = (closes_15m[-1] - closes_15m[0]) / closes_15m[0] * 100
+
+    # Vérifier le momentum sur 5m
+    closes_5m = [c["close"] for c in candles_5m[-12:]]
+    momentum = abs(closes_5m[-1] - closes_5m[0]) / closes_5m[0] * 100
+
+    # Marché en tendance si:
+    # - Range > threshold OU momentum > threshold OU pente EMA significative
+    is_trending = range_pct > threshold_pct or momentum > threshold_pct or abs(ema_slope) > 0.05
+    
+    return is_trending
+
 def compute_indicators(candles):
     if len(candles) < 10: return {}
     closes = [c["close"] for c in candles]
@@ -406,20 +432,37 @@ Bankroll: {bankroll:.2f} USDC
 ═══════════════════════════════
 RÈGLES DE DÉCISION
 ═══════════════════════════════
-OBJECTIF: Trouver des opportunités de trading, pas les éviter. Trader ~60-70% du temps.
+OBJECTIF: Maximiser le win rate. Ne trader QUE les setups à haute probabilité.
 
-1. TRADER dès que 2 timeframes sur 4 sont alignés dans la même direction
-2. TRADER même en session MEDIUM si RSI < 35 ou > 65 + MACD confirmé
-3. NE PAS TRADER SEULEMENT si ATR < 0.03% (marché vraiment mort) OU si les 4 TF contradictoires
-4. Fear&Greed extrême: RÉDUIRE la mise de 30% mais continuer à trader
-5. Prix près d'un S/R: si signal fort dans la direction opposée au niveau → c'est un rebond → TRADER
-6. Après 2 pertes consécutives → réduire mise à minimum mais continuer
-7. TOUJOURS choisir une direction si au moins 2 TF sont alignés — ne pas rester neutre
-8. RSI < 30 sur 5m = signal UP fort même si autres TF mitigés
-9. RSI > 70 sur 5m = signal DOWN fort même si autres TF mitigés
-10. Mise entre {MIN_BET_USD}$ et {min(MAX_BET_USD, bankroll*MAX_BET_PCT):.2f}$
+STRATÉGIE HAUTE PROBABILITÉ:
+1. Signal FORT (trader avec mise normale):
+   - 3+ timeframes alignés dans la même direction
+   - RSI < 25 (UP) ou RSI > 75 (DOWN) sur le 5m
+   - MACD confirme sur au moins 2 TF
+   - Volume ratio > 1.3 (confirmation institutionnelle)
 
-BIAIS: En cas de doute, trader plutôt que ne pas trader. Un PASS coûte des opportunités manquées.
+2. Signal MOYEN (trader avec mise réduite 50%):
+   - 2 timeframes alignés + RSI < 35 ou > 65
+   - Rebond clair sur support/résistance avec confirmation
+   - Session EXCELLENT ou GOOD uniquement
+
+3. NE PAS TRADER si:
+   - Tous les TF contradictoires
+   - ATR < 0.05% (marché vraiment mort)
+   - Prix exactement sur S/R sans direction claire
+   - 3 pertes consécutives sur le même setup (attendre changement)
+
+4. RÈGLES AVANCÉES:
+   - RSI divergence: RSI monte mais prix baisse → signal UP fort
+   - Après rebond RSI extrême (< 20) → chercher confirmation UP sur 1m
+   - Fear&Greed < 20: favoriser UP (marché survendu globalement)
+   - Fear&Greed > 80: favoriser DOWN (marché suracheté globalement)
+   - Session US_OPEN/US_AFTERNOON: augmenter confiance de 10%
+
+5. MISE:
+   - Signal FORT: {min(MAX_BET_USD, bankroll*MAX_BET_PCT):.2f}$ max
+   - Signal MOYEN: {MIN_BET_USD + (min(MAX_BET_USD, bankroll*MAX_BET_PCT)-MIN_BET_USD)*0.5:.2f}$
+   - Après 2 pertes: {MIN_BET_USD}$ minimum seulement
 
 RÉPONDS UNIQUEMENT EN JSON:
 {{
@@ -644,6 +687,12 @@ async def tick(context: ContextTypes.DEFAULT_TYPE):
     session = get_session_context()
 
     if not ind_5m: return
+
+    # Filtre tendance — pause si marché en range
+    if not is_trending_market(list(st.candles_5m), list(st.candles_15m)):
+        st.skipped_trades += 1
+        log.info("Marché en range — pause automatique")
+        return
 
     # Claude AI décide
     decision = await claude_decide(
