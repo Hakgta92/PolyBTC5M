@@ -34,7 +34,8 @@ DAILY_LOSS_MAX = 0.10   # stop si -10% dans la journée
 
 # Binance
 BINANCE_KLINES = "https://api.binance.com/api/v3/klines"
-BINANCE_PRICE  = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
+BINANCE_PRICE  = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd"
+
 
 # Polymarket CLOB (lecture seule pour l'instant)
 POLY_MARKETS   = "https://clob.polymarket.com/markets"
