@@ -518,6 +518,18 @@ BTC 24h: {btc_24h['change_pct']:+.2f}% | High: ${btc_24h['high_24h']:,.0f} | Low
 Session actuelle: {session['session']} ({session['quality']})
 Heure Paris: {session['hour_paris']}h
 
+TENDANCE COURT TERME (basée sur 1h klines):
+Prix actuel: ${ind_5m.get('price',0):,.2f}
+EMA 1h: {'HAUSSIER' if ind_1h.get('ema_bull') else 'BAISSIER'}
+MACD 1h: {ind_1h.get('macd_hist',0):+.4f}
+RSI 1h: {ind_1h.get('rsi_14',50)}
+Momentum 1h: {ind_1h.get('momentum',0):+.2f}
+
+⚠️ RÈGLE CRITIQUE: La tendance 1h EST PLUS FIABLE que la tendance 24h pour trader 5min.
+- Si EMA 1h BAISSIER + MACD 1h négatif → tendance court terme BAISSIÈRE → favoriser DOWN
+- Si EMA 1h HAUSSIER + MACD 1h positif → tendance court terme HAUSSIÈRE → favoriser UP
+- Ne jamais aller CONTRE la tendance 1h sauf RSI extrême (< 15 ou > 85) sur 5m
+
 ═══════════════════════════════
 SENTIMENT POLYMARKET (CRUCIAL)
 ═══════════════════════════════
