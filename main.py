@@ -38,6 +38,18 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
+# ─── Charge .env si présent ────────────────────────────────────────────────
+def load_env():
+    env_path = os.path.join(os.path.dirname(__file__), '.env')
+    if os.path.exists(env_path):
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    key, _, val = line.partition('=')
+                    os.environ.setdefault(key.strip(), val.strip())
+load_env()
+
 # ─── CONFIG ────────────────────────────────────────────────────────────────
 TOKEN           = os.getenv("TELEGRAM_TOKEN", "")
 ALLOWED_UID     = int(os.getenv("ALLOWED_USER_ID", "0"))
@@ -125,61 +137,37 @@ class PolyClient:
 
     async def find_btc_5min_market(self):
         """
-        Cherche le marché BTC UP/DOWN 5min actif.
-        URL Polymarket: /event/btc-updown-5m-XXXXXXXXXX
+        Calcule le slug BTC 5min mathématiquement — pas besoin de l'API Gamma.
+        Pattern: btc-updown-5m-TIMESTAMP (arrondi aux 5 minutes UTC)
+        Essaie le marché actuel ET le suivant pour fiabilité.
         """
+        now = int(time.time())
+        # Arrondi aux 5 minutes (300 secondes)
+        current_ts = (now // 300) * 300
+        next_ts    = current_ts + 300
+        prev_ts    = current_ts - 300
+
         headers = {
-            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15",
             "Accept": "application/json",
             "Referer": "https://polymarket.com/",
             "Origin": "https://polymarket.com",
         }
-        try:
-            async with aiohttp.ClientSession(headers=headers) as s:
 
-                # ── Méthode 1 : /events avec slug btc-updown-5m ──
-                try:
+        for ts in [current_ts, next_ts, prev_ts]:
+            slug = f"btc-updown-5m-{ts}"
+            log.info(f"Recherche marché: {slug}")
+            try:
+                async with aiohttp.ClientSession(headers=headers) as s:
+                    # Méthode 1 : API events avec slug exact
                     async with s.get(f"{POLY_GAMMA}/events",
-                                     params={"slug": "btc-updown-5m", "active": "true", "limit": 5},
+                                     params={"slug": slug},
                                      timeout=aiohttp.ClientTimeout(total=10)) as r:
                         if r.status == 200:
                             data = await r.json()
                             events = data if isinstance(data, list) else data.get("events", [])
                             for ev in events:
-                                markets = ev.get("markets", [])
-                                for m in markets:
-                                    clob_ids = m.get("clobTokenIds", "[]")
-                                    if isinstance(clob_ids, str):
-                                        try: clob_ids = json.loads(clob_ids)
-                                        except: clob_ids = []
-                                    if len(clob_ids) >= 2:
-                                        log.info(f"Marché via /events: {m.get('question','')}")
-                                        return {
-                                            "token_up":    clob_ids[0],
-                                            "token_down":  clob_ids[1],
-                                            "question":    m.get("question", ev.get("title","")),
-                                            "condition_id":m.get("conditionId",""),
-                                            "end_date":    m.get("endDate",""),
-                                            "market_slug": ev.get("slug",""),
-                                        }
-                except Exception as e:
-                    log.warning(f"Method1 events: {e}")
-
-                # ── Méthode 2 : /events recherche large ──
-                try:
-                    for params in [
-                        {"active": "true", "limit": 50, "tag_slug": "crypto"},
-                        {"active": "true", "limit": 100},
-                    ]:
-                        async with s.get(f"{POLY_GAMMA}/events", params=params,
-                                         timeout=aiohttp.ClientTimeout(total=10)) as r:
-                            if r.status != 200: continue
-                            data = await r.json()
-                            events = data if isinstance(data, list) else data.get("events", [])
-                            for ev in events:
-                                slug  = ev.get("slug","").lower()
-                                title = ev.get("title","").lower()
-                                if "btc-updown-5m" in slug or ("btc" in slug and "updown" in slug):
+                                if slug in ev.get("slug", ""):
                                     markets = ev.get("markets", [])
                                     for m in markets:
                                         clob_ids = m.get("clobTokenIds", "[]")
@@ -187,50 +175,47 @@ class PolyClient:
                                             try: clob_ids = json.loads(clob_ids)
                                             except: clob_ids = []
                                         if len(clob_ids) >= 2:
-                                            log.info(f"Marché via search: {slug}")
+                                            log.info(f"✅ Marché trouvé: {slug}")
                                             return {
                                                 "token_up":    clob_ids[0],
                                                 "token_down":  clob_ids[1],
-                                                "question":    title,
-                                                "condition_id":m.get("conditionId",""),
-                                                "end_date":    m.get("endDate",""),
+                                                "question":    ev.get("title", slug),
+                                                "condition_id":m.get("conditionId", ""),
+                                                "end_date":    m.get("endDate", ""),
                                                 "market_slug": slug,
                                             }
-                except Exception as e:
-                    log.warning(f"Method2 events: {e}")
+            except Exception as e:
+                log.warning(f"Slug {slug}: {e}")
 
-                # ── Méthode 3 : /markets avec slug direct ──
-                try:
-                    for slug_try in ["btc-updown-5m", "btc-up-or-down-5m"]:
-                        async with s.get(f"{POLY_GAMMA}/markets",
-                                         params={"slug": slug_try, "active": "true"},
-                                         timeout=aiohttp.ClientTimeout(total=8)) as r:
-                            if r.status == 200:
-                                data = await r.json()
-                                markets = data if isinstance(data, list) else data.get("markets", [])
-                                for m in markets:
-                                    clob_ids = m.get("clobTokenIds", "[]")
-                                    if isinstance(clob_ids, str):
-                                        try: clob_ids = json.loads(clob_ids)
-                                        except: clob_ids = []
-                                    if len(clob_ids) >= 2:
-                                        log.info(f"Marché via /markets slug: {m.get('slug','')}")
-                                        return {
-                                            "token_up":    clob_ids[0],
-                                            "token_down":  clob_ids[1],
-                                            "question":    m.get("question",""),
-                                            "condition_id":m.get("conditionId",""),
-                                            "end_date":    m.get("endDate",""),
-                                            "market_slug": m.get("slug",""),
-                                        }
-                except Exception as e:
-                    log.warning(f"Method3 markets: {e}")
+            try:
+                async with aiohttp.ClientSession(headers=headers) as s:
+                    # Méthode 2 : API markets avec slug
+                    async with s.get(f"{POLY_GAMMA}/markets",
+                                     params={"slug": slug},
+                                     timeout=aiohttp.ClientTimeout(total=10)) as r:
+                        if r.status == 200:
+                            data = await r.json()
+                            markets = data if isinstance(data, list) else data.get("markets", [])
+                            for m in markets:
+                                clob_ids = m.get("clobTokenIds", "[]")
+                                if isinstance(clob_ids, str):
+                                    try: clob_ids = json.loads(clob_ids)
+                                    except: clob_ids = []
+                                if len(clob_ids) >= 2:
+                                    log.info(f"✅ Marché via /markets: {slug}")
+                                    return {
+                                        "token_up":    clob_ids[0],
+                                        "token_down":  clob_ids[1],
+                                        "question":    m.get("question", slug),
+                                        "condition_id":m.get("conditionId", ""),
+                                        "end_date":    m.get("endDate", ""),
+                                        "market_slug": slug,
+                                    }
+            except Exception as e:
+                log.warning(f"Markets {slug}: {e}")
 
-                log.warning("Aucun marché BTC 5min actif trouvé — toutes méthodes épuisées")
-                return None
-        except Exception as e:
-            log.error(f"find_btc_market error: {e}")
-            return None
+        log.warning("Aucun marché BTC 5min trouvé")
+        return None
 
     async def get_token_price(self, token_id):
         """Récupère le prix actuel d'un token (0 à 1)"""
