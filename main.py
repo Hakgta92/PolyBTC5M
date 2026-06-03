@@ -290,37 +290,46 @@ class PolyClient:
             return None
 
     async def get_balance(self):
-        """Récupère le solde USDC via SDK Polymarket"""
+        """Récupère le solde USDC via API publique Polymarket"""
+        if not POLY_PROXY_WALLET:
+            return None
+        headers = {
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15",
+            "Accept": "application/json",
+            "Referer": "https://polymarket.com/",
+        }
         try:
-            if self.ready and self.client:
-                loop = asyncio.get_event_loop()
-                bal = await loop.run_in_executor(None, self.client.get_balance)
-                if bal is not None:
-                    return round(float(bal), 2)
+            # API publique — pas besoin d'auth
+            async with aiohttp.ClientSession(headers=headers) as s:
+                async with s.get(
+                    f"https://data-api.polymarket.com/portfolio?user={POLY_PROXY_WALLET}",
+                    timeout=aiohttp.ClientTimeout(total=8)
+                ) as r:
+                    if r.status == 200:
+                        d = await r.json()
+                        if isinstance(d, dict):
+                            for k in ["cash","balance","usdc","available","portfolioValue"]:
+                                if k in d and d[k] is not None:
+                                    return round(float(d[k]), 2)
+                        elif isinstance(d, (int, float)):
+                            return round(float(d), 2)
         except Exception as e:
-            log.warning(f"Balance SDK: {e}")
+            log.warning(f"Balance portfolio: {e}")
 
-        # Fallback: balance-allowance endpoint avec auth
         try:
-            if self.ready and self.client:
-                loop = asyncio.get_event_loop()
-                def _get_bal():
-                    import requests
-                    headers = self.client._get_headers("GET", "/balance-allowance",
-                                                       params={"asset_type":"USDC"})
-                    r = requests.get(f"{POLY_HOST}/balance-allowance",
-                                     headers=headers,
-                                     params={"asset_type":"USDC"},
-                                     timeout=8)
-                    if r.status_code == 200:
-                        d = r.json()
-                        return d.get("balance", d.get("asset",{}).get("balance"))
-                    return None
-                bal = await loop.run_in_executor(None, _get_bal)
-                if bal is not None:
-                    return round(float(bal), 2)
+            async with aiohttp.ClientSession(headers=headers) as s:
+                async with s.get(
+                    f"https://data-api.polymarket.com/positions?user={POLY_PROXY_WALLET}",
+                    timeout=aiohttp.ClientTimeout(total=8)
+                ) as r:
+                    if r.status == 200:
+                        d = await r.json()
+                        if isinstance(d, dict):
+                            for k in ["cash","balance","usdc"]:
+                                if k in d and d[k] is not None:
+                                    return round(float(d[k]), 2)
         except Exception as e:
-            log.warning(f"Balance endpoint: {e}")
+            log.warning(f"Balance positions: {e}")
 
         return None
 
