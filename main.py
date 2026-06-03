@@ -829,7 +829,7 @@ class State:
         self.skipped=0; self.pass_reasons=[]
         self.last_decision={}; self.last_conf_score={}; self.last_mom_score=0
         self.fg={"value":50,"label":"Neutral"}; self.btc24={}
-        self.tick_job=self.price_job=self.macro_job=self.tp_job=None
+        self.tick_job=self.price_job=self.macro_job=self.tp_job=self.bal_job=None
         # Polymarket
         self.current_market=None   # marché BTC 5min actif
         self.active_order_id=None  # ID ordre Polymarket en cours
@@ -934,6 +934,18 @@ async def job_take_profit(context):
         log.error(f"job_take_profit: {e}")
 
 # ─── JOBS PRINCIPAUX ────────────────────────────────────────────────────────
+async def job_sync_balance(context):
+    """Synchronise la bankroll avec le vrai solde USDC Polygon toutes les 5min"""
+    if st.paper_mode or not poly.ready or st.bet: return
+    try:
+        real_bal = await poly.get_balance()
+        if real_bal and real_bal > 0 and abs(real_bal - st.bankroll) > 0.01:
+            old_bal = st.bankroll
+            st.bankroll = real_bal
+            log.info(f"Bankroll synced: {old_bal:.2f} → {real_bal:.2f} USDC")
+    except Exception as e:
+        log.warning(f"Balance sync: {e}")
+
 async def job_price(context):
     p=await fetch_price()
     if p>0: st.price=p
@@ -1156,35 +1168,39 @@ async def cmd_run(update: Update, context):
             st.paper_mode=True
 
     st.running=True; st.session_start=time.time()
-    st.daily_start=st.bankroll; st.daily_ts=time.time()
+
+    # Sync bankroll avec solde réel Polymarket
+    if not st.paper_mode and poly.ready:
+        real_bal = await poly.get_balance()
+        if real_bal and real_bal > 0:
+            st.bankroll = real_bal
+            st.daily_start = real_bal
+            log.info(f"Bankroll sync: {real_bal:.2f} USDC")
+
+    st.daily_ts=time.time()
     st.price_job=context.job_queue.run_repeating(job_price,interval=30,first=5)
     st.macro_job=context.job_queue.run_repeating(job_macro,interval=300,first=8)
     st.tick_job =context.job_queue.run_repeating(job_tick, interval=300,first=15)
-    # Take profit check toutes les 30s
     st.tp_job=context.job_queue.run_repeating(job_take_profit,interval=TAKE_PROFIT_CHECK,first=10)
+    # Sync bankroll toutes les 5 minutes
+    st.bal_job=context.job_queue.run_repeating(job_sync_balance,interval=300,first=60)
 
     st.fg=await fetch_fear_greed(); st.btc24=await fetch_btc_24h()
     sess=session_ctx()
-
-    # Solde réel
-    balance_txt=""
-    if not st.paper_mode and poly.ready:
-        bal=await poly.get_balance()
-        if bal: balance_txt=f"\nSolde Polymarket: `{bal:.2f} USDC`"
 
     await update.message.reply_text(
         f"▶️ *Bot v10 démarré !*\n"
         f"Mode: *{'📄 PAPER' if st.paper_mode else '💰 RÉEL'}*\n"
         f"F&G:`{st.fg['value']}` | BTC:`{st.btc24.get('change_pct',0):+.2f}%`\n"
         f"Session:`{sess['session']}` — {sess['quality']}\n"
-        f"BR:`{st.bankroll:.2f}$` | TP auto: x{TAKE_PROFIT_MULT}{balance_txt}",
+        f"Solde réel:`{st.bankroll:.2f} USDC` | TP auto: x{TAKE_PROFIT_MULT}",
         parse_mode="Markdown")
     await job_tick(context)
 
 async def cmd_stop(update: Update, context):
     if not auth(update): return
     st.running=False
-    for j in [st.tick_job,st.price_job,st.macro_job,st.tp_job]:
+    for j in [st.tick_job,st.price_job,st.macro_job,st.tp_job,st.bal_job]:
         if j:
             try: j.schedule_removal()
             except: pass
@@ -1410,7 +1426,7 @@ async def cmd_paper(update: Update, context):
 async def cmd_reset(update: Update, context):
     if not auth(update): return
     st.running=False
-    for j in [st.tick_job,st.price_job,st.macro_job,st.tp_job]:
+    for j in [st.tick_job,st.price_job,st.macro_job,st.tp_job,st.bal_job]:
         if j:
             try: j.schedule_removal()
             except: pass
