@@ -1,7 +1,9 @@
 """
-POLYMARKET BTC BOT v10.6
-FIX: update_balance_allowance au démarrage (approve contrats Polymarket)
-FIX: balance '0' string converti correctement
+POLYMARKET BTC BOT v10.7
+FIX FINAL: Balance via API /data/balance de Polymarket (solde interne)
+Le wallet 0xa565 est un contrat Deposit Wallet — la balance
+n'est pas lisible via get_balance_allowance (toujours 0).
+La vraie balance est dans le système interne Polymarket.
 """
 
 import asyncio, logging, os, json, time, math, aiohttp
@@ -10,7 +12,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.6"
+BOT_VERSION = "10.7"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -33,6 +35,7 @@ POLY_PROXY_WALLET  = os.getenv("POLY_PROXY_WALLET", "")
 POLY_FUNDER_WALLET = os.getenv("POLY_FUNDER_WALLET", "")
 POLY_HOST          = "https://clob.polymarket.com"
 POLY_GAMMA         = "https://gamma-api.polymarket.com"
+POLY_DATA          = "https://data-api.polymarket.com"
 POLY_CHAIN_ID      = 137
 MIN_BET_USD=2.0; MID_BET_USD=5.0; MAX_BET_USD=8.0; MAX_BET_PCT=0.06
 TAKE_PROFIT_MULT=2.0; TAKE_PROFIT_CHECK=30
@@ -59,54 +62,104 @@ class PolyClient:
                 signature_type=1, funder=POLY_PROXY_WALLET)
             creds = self.client.create_or_derive_api_creds()
             self.client.set_api_creds(creds)
-            self.ready=True; log.info("✅ Polymarket CLOB initialisé"); return True
+            self.ready=True
+            log.info("✅ Polymarket CLOB initialisé")
+            # Set allowances une fois
+            try:
+                from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
+                self.client.update_balance_allowance(
+                    params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
+                self.allowance_set=True
+                log.info("✅ Allowances set")
+            except Exception as e:
+                log.warning(f"Allowances: {e}")
+            return True
         except ImportError: log.error("py-clob-client non installé"); return False
         except Exception as e: log.error(f"Polymarket init: {e}"); return False
 
-    def set_allowances(self):
-        """
-        ✅ v10.6 — Approve les contrats Polymarket pour accéder aux USDC.
-        Magic.link / email wallet = signature_type=1, les allowances sont
-        normalement auto mais on les force au cas où.
-        """
-        if not self.ready or not self.client or self.allowance_set:
-            return
-        try:
-            from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
-            # Approve USDC (collateral)
-            self.client.update_balance_allowance(
-                params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
-            )
-            log.info("✅ Allowance COLLATERAL mise à jour")
-            self.allowance_set = True
-        except Exception as e:
-            log.warning(f"set_allowances: {e}")
-
     async def get_balance(self):
         """
-        ✅ v10.6 — Lit la balance après avoir forcé les allowances.
-        Le debug montre que v1 (BalanceAllowanceParams) fonctionne
-        mais retourne '0' car allowances pas encore set.
+        ✅ v10.7 — 4 méthodes en cascade pour lire la balance Polymarket.
+        Le wallet proxy est un Deposit Wallet, balance interne Polymarket.
         """
-        if not self.ready or not self.client:
+        wallet = POLY_FUNDER_WALLET or POLY_PROXY_WALLET or ""
+        if not wallet:
             return None
 
-        # S'assure que les allowances sont set
-        if not self.allowance_set:
-            self.set_allowances()
-
+        # Méthode 1: API data Polymarket /profile
         try:
-            from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
-            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
-            result = self.client.get_balance_allowance(params=params)
-            if result:
-                raw = result.get("balance", "0")
-                balance = round(int(raw) / 1_000_000, 2)
-                log.info(f"✅ Balance: {balance} USDC (raw={raw})")
-                return balance
+            async with aiohttp.ClientSession() as s:
+                async with s.get(
+                    f"{POLY_DATA}/profile",
+                    params={"address": wallet},
+                    timeout=aiohttp.ClientTimeout(total=8)
+                ) as r:
+                    if r.status == 200:
+                        d = await r.json()
+                        if isinstance(d, dict):
+                            val = d.get("portfolio_value") or d.get("balance") or d.get("usdc")
+                            if val is not None:
+                                balance = round(float(val), 2)
+                                log.info(f"✅ M1 data/profile: {balance}")
+                                return balance
         except Exception as e:
-            log.warning(f"get_balance: {e}")
+            log.warning(f"M1: {e}")
 
+        # Méthode 2: Gamma API /profile
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get(
+                    f"{POLY_GAMMA}/profile",
+                    params={"address": wallet},
+                    timeout=aiohttp.ClientTimeout(total=8)
+                ) as r:
+                    if r.status == 200:
+                        d = await r.json()
+                        if isinstance(d, dict):
+                            val = d.get("balance") or d.get("usdc") or d.get("portfolio_value")
+                            if val is not None:
+                                balance = round(float(val), 2)
+                                log.info(f"✅ M2 gamma/profile: {balance}")
+                                return balance
+        except Exception as e:
+            log.warning(f"M2: {e}")
+
+        # Méthode 3: CLOB /profile
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get(
+                    f"{POLY_HOST}/profile",
+                    params={"address": wallet},
+                    timeout=aiohttp.ClientTimeout(total=8)
+                ) as r:
+                    if r.status == 200:
+                        d = await r.json()
+                        if isinstance(d, dict):
+                            for key in ["balance", "usdc", "portfolio_value", "collateral"]:
+                                val = d.get(key)
+                                if val is not None:
+                                    balance = round(float(val), 2)
+                                    log.info(f"✅ M3 clob/profile [{key}]: {balance}")
+                                    return balance
+        except Exception as e:
+            log.warning(f"M3: {e}")
+
+        # Méthode 4: CLOB /balance avec auth L1
+        if self.ready and self.client:
+            try:
+                from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
+                result = self.client.get_balance_allowance(
+                    params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
+                if result:
+                    raw = result.get("balance", "0")
+                    balance = round(int(raw) / 1_000_000, 2)
+                    if balance > 0:
+                        log.info(f"✅ M4 get_balance_allowance: {balance}")
+                        return balance
+            except Exception as e:
+                log.warning(f"M4: {e}")
+
+        log.warning("Toutes les méthodes balance ont échoué ou retourné 0")
         return None
 
     async def find_btc_5min_market(self):
@@ -777,9 +830,6 @@ async def cmd_run(update,context):
         if not poly.init_client():
             await update.message.reply_text("⚠️ Polymarket indispo — paper mode activé",parse_mode="Markdown")
             st.paper_mode=True
-        else:
-            # Force les allowances au démarrage
-            poly.set_allowances()
     st.running=True; st.session_start=time.time()
     if not st.paper_mode and poly.ready:
         await update.message.reply_text("⏳ Sync balance Polymarket...")
@@ -1016,39 +1066,34 @@ async def cmd_cooldown(update,context):
 
 async def cmd_debug(update,context):
     if not auth(update): return
-    w=POLY_FUNDER_WALLET or POLY_PROXY_WALLET or "NON CONFIGURÉ"
-    results=[
-        f"🤖 VERSION:{BOT_VERSION}",
-        f"WALLET:{w[:10]}...",
-        f"PAPER_MODE:{st.paper_mode}",
-        f"poly.ready:{poly.ready}",
-        f"allowance_set:{poly.allowance_set}",
-        f"Bankroll:{st.bankroll:.2f}$",
-        f"Dernière balance:{st.last_real_balance or '?'}$"
-    ]
-    if poly.ready and poly.client:
-        # Force set allowances et relit
+    wallet = POLY_FUNDER_WALLET or POLY_PROXY_WALLET or "?"
+    results=[f"🤖 VERSION:{BOT_VERSION}", f"WALLET:{wallet[:10]}..."]
+
+    # Test les 4 endpoints directement
+    for name, url, params in [
+        ("data/profile", f"{POLY_DATA}/profile", {"address": wallet}),
+        ("gamma/profile", f"{POLY_GAMMA}/profile", {"address": wallet}),
+        ("clob/profile",  f"{POLY_HOST}/profile",  {"address": wallet}),
+        ("clob/user",     f"{POLY_HOST}/user",      {"address": wallet}),
+    ]:
         try:
-            from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
-            # Update allowance
-            upd=poly.client.update_balance_allowance(
-                params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
-            results.append(f"update_allowance:{upd}")
-            # Relit après update
-            r=poly.client.get_balance_allowance(
-                params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
-            results.append(f"balance après update:{r}")
-            raw=r.get("balance","0") if r else "0"
-            balance=round(int(raw)/1_000_000,2)
-            results.append(f"USDC calculé:{balance}$")
+            async with aiohttp.ClientSession() as s:
+                async with s.get(url, params=params, timeout=aiohttp.ClientTimeout(total=6)) as r:
+                    txt = await r.text()
+                    results.append(f"{name} [{r.status}]: {txt[:120]}")
         except Exception as e:
-            results.append(f"ERR:{str(e)[:100]}")
+            results.append(f"{name} ERR: {str(e)[:60]}")
 
-    bal=await poly.get_balance()
-    results.append(f"get_balance() final:{bal}")
+    bal = await poly.get_balance()
+    results.append(f"get_balance():{bal}")
 
-    msg="🔍 *DEBUG v10.6*\n"+"\n".join(f"`{r}`" for r in results)
-    await update.message.reply_text(msg,parse_mode="Markdown")
+    # Envoyer en 2 parties si nécessaire
+    msg = "🔍 *DEBUG v10.7*\n" + "\n".join(f"`{r}`" for r in results)
+    if len(msg) > 4000:
+        await update.message.reply_text("🔍 *DEBUG v10.7 (1/2)*\n" + "\n".join(f"`{r}`" for r in results[:4]), parse_mode="Markdown")
+        await update.message.reply_text("🔍 *(2/2)*\n" + "\n".join(f"`{r}`" for r in results[4:]), parse_mode="Markdown")
+    else:
+        await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def cb(update,context):
     q=update.callback_query; await q.answer()
@@ -1058,9 +1103,7 @@ async def cb(update,context):
 
 def main():
     st.load()
-    if not st.paper_mode and POLY_PRIVATE_KEY:
-        poly.init_client()
-        poly.set_allowances()
+    if not st.paper_mode and POLY_PRIVATE_KEY: poly.init_client()
     app=Application.builder().token(TOKEN).build()
     for name,handler in [("start",cmd_start),("run",cmd_run),("stop",cmd_stop),("status",cmd_status),
         ("ai",cmd_ai),("signal",cmd_signal),("score",cmd_score),("trades",cmd_trades),("stats",cmd_stats),
