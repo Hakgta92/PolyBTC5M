@@ -290,46 +290,59 @@ class PolyClient:
             return None
 
     async def get_balance(self):
-        """Récupère le solde USDC via API publique Polymarket"""
+        """
+        Récupère le solde USDC on-chain via PolygonScan API.
+        USDC sur Polygon: 0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174
+        Pas besoin d'auth — lecture publique blockchain.
+        """
         if not POLY_PROXY_WALLET:
             return None
-        headers = {
-            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15",
-            "Accept": "application/json",
-            "Referer": "https://polymarket.com/",
-        }
+        # Adresse USDC sur Polygon
+        USDC_POLYGON = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
         try:
-            # API publique — pas besoin d'auth
-            async with aiohttp.ClientSession(headers=headers) as s:
-                async with s.get(
-                    f"https://data-api.polymarket.com/portfolio?user={POLY_PROXY_WALLET}",
-                    timeout=aiohttp.ClientTimeout(total=8)
-                ) as r:
+            async with aiohttp.ClientSession() as s:
+                # PolygonScan API — gratuit, pas de clé requise pour balanceOf
+                url = "https://api.polygonscan.com/api"
+                params = {
+                    "module": "account",
+                    "action": "tokenbalance",
+                    "contractaddress": USDC_POLYGON,
+                    "address": POLY_PROXY_WALLET,
+                    "tag": "latest",
+                    "apikey": "YourApiKeyToken"  # fonctionne sans clé en mode limité
+                }
+                async with s.get(url, params=params, timeout=aiohttp.ClientTimeout(total=8)) as r:
                     if r.status == 200:
                         d = await r.json()
-                        if isinstance(d, dict):
-                            for k in ["cash","balance","usdc","available","portfolioValue"]:
-                                if k in d and d[k] is not None:
-                                    return round(float(d[k]), 2)
-                        elif isinstance(d, (int, float)):
-                            return round(float(d), 2)
+                        if d.get("status") == "1":
+                            # USDC a 6 décimales sur Polygon
+                            raw = int(d.get("result", 0))
+                            return round(raw / 1_000_000, 2)
         except Exception as e:
-            log.warning(f"Balance portfolio: {e}")
+            log.warning(f"Balance polygonscan: {e}")
 
         try:
-            async with aiohttp.ClientSession(headers=headers) as s:
-                async with s.get(
-                    f"https://data-api.polymarket.com/positions?user={POLY_PROXY_WALLET}",
-                    timeout=aiohttp.ClientTimeout(total=8)
-                ) as r:
+            # Fallback: ankr public RPC
+            async with aiohttp.ClientSession() as s:
+                payload = {
+                    "jsonrpc": "2.0", "method": "eth_call",
+                    "params": [{
+                        "to": "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",
+                        "data": f"0x70a08231000000000000000000000000{POLY_PROXY_WALLET[2:].lower().zfill(64)}"
+                    }, "latest"],
+                    "id": 1
+                }
+                async with s.post("https://rpc.ankr.com/polygon",
+                                  json=payload,
+                                  timeout=aiohttp.ClientTimeout(total=8)) as r:
                     if r.status == 200:
                         d = await r.json()
-                        if isinstance(d, dict):
-                            for k in ["cash","balance","usdc"]:
-                                if k in d and d[k] is not None:
-                                    return round(float(d[k]), 2)
+                        result = d.get("result", "0x0")
+                        if result and result != "0x":
+                            raw = int(result, 16)
+                            return round(raw / 1_000_000, 2)
         except Exception as e:
-            log.warning(f"Balance positions: {e}")
+            log.warning(f"Balance RPC: {e}")
 
         return None
 
