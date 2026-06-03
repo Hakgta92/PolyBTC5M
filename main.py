@@ -31,7 +31,7 @@ MIN_BET_USD     = 1.0
 MAX_BET_PCT     = 0.05
 POLY_FEE        = 0.02
 DAILY_LOSS_MAX  = 0.10
-MAX_CONSEC_LOSS = 3
+MAX_CONSEC_LOSS = 2
 COOLDOWN_MIN    = 30
 
 BINANCE_KLINES  = "https://api.binance.com/api/v3/klines"
@@ -692,7 +692,7 @@ class State:
         self.wins             = 0
         self.losses           = 0
         self.total_pnl        = 0.0
-        self.alerts           = True
+        self.alerts           = True   # toujours True
         self.daily_start_br   = BANKROLL_START
         self.daily_reset_ts   = time.time()
         self.streak           = 0
@@ -703,6 +703,9 @@ class State:
         self.session_start    = time.time()
         self.last_ai_decision = {}
         self.skipped_trades   = 0
+        self.last_trade_dir   = None   # direction du dernier trade
+        self.last_trade_result= None   # WIN ou LOSS
+        self.last_trade_ts    = 0      # timestamp du dernier trade
         self.fear_greed       = {"value": 50, "label": "Neutral"}
         self.btc_24h          = {}
         self.poly_sentiment   = None
@@ -824,17 +827,32 @@ async def tick(context: ContextTypes.DEFAULT_TYPE):
                   "ai_reasoning":bet.get("ai_reasoning",""),
                   "paper":st.paper_mode,"ts":int(time.time())}
         st.trades.append(record)
+        st.last_trade_dir    = bet["dir"]
+        st.last_trade_result = "WIN" if won else "LOSS"
+        st.last_trade_ts     = time.time()
         st.active_bet = None
 
-        if st.alerts:
+        # Toujours notifier — try/catch pour éviter crash
+        try:
             emoji = "✅" if won else "❌"
-            cd_msg = f"\n⏸ Cooldown {COOLDOWN_MIN}min activé" if in_cooldown() else ""
-            await context.bot.send_message(chat_id=ALLOWED_UID,
-                text=(f"{emoji} *Trade clôturé* [{'📄' if st.paper_mode else '💰'}]\n"
-                      f"`{bet['dir']}` | Entrée `${bet['entry_price']:,.0f}` → `${st.current_price:,.0f}`\n"
-                      f"PnL: `{'+' if gross>=0 else ''}{gross:.2f} USDC` | Bankroll: `{st.bankroll:.2f}`\n"
-                      f"Streak: `{st.streak:+d}` | F&G: `{st.fear_greed['value']}`{cd_msg}"),
-                parse_mode="Markdown")
+            cd_msg = f"\n⏸ Cooldown {COOLDOWN_MIN}min" if in_cooldown() else ""
+            mode_tag = "📄" if st.paper_mode else "💰"
+            dir_tag = bet["dir"]
+            entry_p = bet["entry_price"]
+            exit_p = st.current_price
+            pnl_sign = "+" if gross >= 0 else ""
+            await context.bot.send_message(
+                chat_id=ALLOWED_UID,
+                text=(
+                    f"{emoji} *Trade clôturé* [{mode_tag}]\n"
+                    f"`{dir_tag}` | `${entry_p:,.0f}` → `${exit_p:,.0f}`\n"
+                    f"PnL: `{pnl_sign}{gross:.2f} USDC` | Bankroll: `{st.bankroll:.2f}`\n"
+                    f"Streak: `{st.streak:+d}` | Pertes: `{st.consec_losses}`{cd_msg}"
+                ),
+                parse_mode="Markdown"
+            )
+        except Exception as notif_err:
+            log.error(f"Notification erreur: {notif_err}")
         st.save()
 
     if in_cooldown(): return
@@ -853,6 +871,19 @@ async def tick(context: ContextTypes.DEFAULT_TYPE):
         st.skipped_trades += 1
         log.info("Marché en range — pause automatique")
         return
+
+    # Filtre rebond — ne pas rebetter dans la même direction immédiatement après un WIN
+    # et attendre 1 tick (5min) après une perte dans la même direction
+    now = time.time()
+    if st.last_trade_dir and (now - st.last_trade_ts) < 300:
+        if st.last_trade_result == "WIN":
+            log.info(f"Pause après WIN {st.last_trade_dir} — attendre nouveau setup")
+            st.skipped_trades += 1
+            return
+        elif st.last_trade_result == "LOSS" and st.consec_losses >= 2:
+            log.info(f"2 pertes consécutives — cooldown forcé")
+            st.cooldown_until = time.time() + COOLDOWN_MIN * 60
+            return
 
     # Claude AI décide
     decision = await claude_decide(
