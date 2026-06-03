@@ -130,26 +130,39 @@ def support_resistance(candles, lookback=20):
 def is_trending_market(candles_5m, candles_15m, threshold_pct=0.08):
     """Retourne True si le marché est en tendance (pas en range)"""
     if len(candles_5m) < 12 or len(candles_15m) < 6:
-        return True  # pas assez de données, on laisse passer
+        return False  # pas assez de données, on attend
+
+    hour = datetime.utcnow().hour
+    # Session nuit (22h-7h UTC = 0h-9h Paris) : seuil plus strict
+    if 22 <= hour or hour < 7:
+        threshold_pct = 0.15  # besoin de plus de mouvement la nuit
 
     # Vérifier le mouvement sur les 30 dernières minutes (6 bougies 5m)
     recent = candles_5m[-6:]
     high = max(c["high"] for c in recent)
     low  = min(c["low"]  for c in recent)
     price = candles_5m[-1]["close"]
+    if price == 0: return False
     range_pct = (high - low) / price * 100
 
     # Vérifier la pente des EMA sur 15m
     closes_15m = [c["close"] for c in candles_15m[-8:]]
-    ema_slope = (closes_15m[-1] - closes_15m[0]) / closes_15m[0] * 100
+    ema_slope = abs(closes_15m[-1] - closes_15m[0]) / closes_15m[0] * 100
 
-    # Vérifier le momentum sur 5m
+    # Vérifier le momentum sur 5m (12 dernières bougies = 1h)
     closes_5m = [c["close"] for c in candles_5m[-12:]]
     momentum = abs(closes_5m[-1] - closes_5m[0]) / closes_5m[0] * 100
 
-    # Marché en tendance si:
-    # - Range > threshold OU momentum > threshold OU pente EMA significative
-    is_trending = range_pct > threshold_pct or momentum > threshold_pct or abs(ema_slope) > 0.05
+    # Volume moyen suffisant
+    vols = [c["vol"] for c in candles_5m[-6:]]
+    avg_vol = sum(vols) / len(vols) if vols else 0
+    good_volume = avg_vol > 500
+
+    # Marché en tendance si mouvement + volume suffisants
+    is_trending = (range_pct > threshold_pct or momentum > threshold_pct * 0.8) and good_volume
+    
+    if not is_trending:
+        log.info(f"Range détecté: range={range_pct:.3f}% mom={momentum:.3f}% vol={avg_vol:.0f}")
     
     return is_trending
 
@@ -354,12 +367,95 @@ async def fetch_btc_24h():
         pass
     return {"change_pct": 0, "high_24h": 0, "low_24h": 0, "volume_24h": 0}
 
+# ─── POLYMARKET SENTIMENT ──────────────────────────────────────────────────
+async def fetch_poly_btc_sentiment():
+    """
+    Récupère le sentiment du marché Polymarket BTC UP/DOWN.
+    Si 80% parient DOWN → signal fort DOWN (et vice versa).
+    """
+    try:
+        # Chercher marchés BTC actifs
+        async with aiohttp.ClientSession() as s:
+            async with s.get(
+                "https://clob.polymarket.com/markets",
+                params={"active": "true", "closed": "false", "limit": "100"},
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as r:
+                if r.status != 200:
+                    return None
+                data = await r.json()
+                markets = data.get("data", []) if isinstance(data, dict) else data
+
+        # Filtrer marchés BTC UP/DOWN 5min
+        btc_markets = []
+        for m in markets:
+            if not isinstance(m, dict): continue
+            q = m.get("question", "").lower()
+            desc = m.get("description", "").lower()
+            if ("bitcoin" in q or "btc" in q) and ("up" in q or "down" in q or "higher" in q or "lower" in q):
+                btc_markets.append(m)
+
+        if not btc_markets:
+            return None
+
+        # Prendre le marché le plus récent avec volume
+        market = btc_markets[0]
+        tokens = market.get("tokens", [])
+        
+        if len(tokens) < 2:
+            return None
+
+        # Trouver UP et DOWN
+        up_price = down_price = None
+        for token in tokens:
+            outcome = token.get("outcome", "").upper()
+            price = float(token.get("price", 0.5))
+            if "UP" in outcome or "YES" in outcome or "HIGHER" in outcome:
+                up_price = price
+            elif "DOWN" in outcome or "NO" in outcome or "LOWER" in outcome:
+                down_price = price
+
+        if up_price is None or down_price is None:
+            # Fallback: premier token = UP, deuxième = DOWN
+            up_price   = float(tokens[0].get("price", 0.5))
+            down_price = float(tokens[1].get("price", 0.5))
+
+        # Sentiment: prix = probabilité implicite
+        # up_price = 0.30 signifie 30% de chance UP → marché pense DOWN
+        up_pct   = round(up_price   * 100, 1)
+        down_pct = round(down_price * 100, 1)
+
+        # Signal fort si déséquilibre > 65/35
+        bias = None
+        if up_pct >= 65:   bias = "UP"
+        elif down_pct >= 65: bias = "DOWN"
+
+        return {
+            "up_pct":    up_pct,
+            "down_pct":  down_pct,
+            "bias":       bias,
+            "market_q":  market.get("question", "")[:60],
+            "confidence": max(up_pct, down_pct),
+        }
+
+    except Exception as e:
+        log.warning(f"Poly sentiment: {e}")
+        return None
+
 # ─── CLAUDE AI BRAIN v6 ────────────────────────────────────────────────────
-async def claude_decide(ind_1m, ind_5m, ind_15m, ind_1h, recent_trades,
+async def claude_decide(ind_1m, ind_5m, ind_15m, ind_1h, recent_trades, poly_sentiment,
                         bankroll, consec_losses, fear_greed, btc_24h, session):
     if not ANTHROPIC_KEY:
         return {"dir": None, "confidence": 0, "bet_size": 0,
                 "reasoning": "Pas de clé API Claude.", "trade": False}
+
+    # Polymarket sentiment string
+    if poly_sentiment:
+        poly_str = (f"UP: {poly_sentiment['up_pct']}% | DOWN: {poly_sentiment['down_pct']}% | "
+                   f"Biais marché: {poly_sentiment['bias'] or 'NEUTRE'} | "
+                   f"Marché: {poly_sentiment['market_q']}")
+    else:
+        poly_str = "Données Polymarket non disponibles — se baser sur TF uniquement."
 
     # Pattern memory
     pattern_analysis = analyze_patterns(recent_trades) if len(recent_trades) >= 5 else "Moins de 5 trades — pas encore de pattern."
@@ -385,6 +481,17 @@ Fear & Greed Index: {fear_greed['value']}/100 ({fear_greed['label']})
 BTC 24h: {btc_24h['change_pct']:+.2f}% | High: ${btc_24h['high_24h']:,.0f} | Low: ${btc_24h['low_24h']:,.0f}
 Session actuelle: {session['session']} ({session['quality']})
 Heure Paris: {session['hour_paris']}h
+
+═══════════════════════════════
+SENTIMENT POLYMARKET (CRUCIAL)
+═══════════════════════════════
+{poly_str}
+
+⚡ Le sentiment Polymarket = ce que les VRAIS traders parient avec du vrai argent.
+C'est le signal le plus fiable disponible. Accorde-lui un poids MAJEUR.
+Si Poly dit DOWN à 75%+ → forte probabilité DOWN, même si TF mitigés.
+Si Poly dit UP à 75%+ → forte probabilité UP, même si TF mitigés.
+Si Poly est neutre (45-55%) → se baser uniquement sur les TF.
 
 ═══════════════════════════════
 PRIX & NIVEAUX CLÉS
@@ -503,16 +610,23 @@ RÉPONDS UNIQUEMENT EN JSON:
                 if start >= 0 and end > start:
                     raw = raw[start:end]
                 res  = json.loads(raw)
+                def safe_float(val, default=0.0):
+                    try: return float(val) if val is not None else default
+                    except: return default
+
+                direction = res.get("direction")
+                if direction not in ["UP", "DOWN"]: direction = None
+
                 return {
-                    "dir":         res.get("direction"),
-                    "confidence":  float(res.get("confidence", 0)),
-                    "bet_size":    float(res.get("bet_size", 0)),
-                    "reasoning":   res.get("reasoning",""),
-                    "key_signals": res.get("key_signals",[]),
-                    "risk_level":  res.get("risk_level","MEDIUM"),
-                    "session_ok":  res.get("session_ok", True),
-                    "main_concern":res.get("main_concern",""),
-                    "trade":       bool(res.get("trade", False)),
+                    "dir":         direction,
+                    "confidence":  safe_float(res.get("confidence"), 0.0),
+                    "bet_size":    safe_float(res.get("bet_size"), 0.0),
+                    "reasoning":   str(res.get("reasoning","")),
+                    "key_signals": res.get("key_signals",[]) or [],
+                    "risk_level":  res.get("risk_level","MEDIUM") or "MEDIUM",
+                    "session_ok":  bool(res.get("session_ok", True)),
+                    "main_concern":str(res.get("main_concern","")),
+                    "trade":       bool(res.get("trade", False)) and direction is not None,
                 }
     except Exception as e:
         log.error(f"Claude: {e}")
@@ -548,6 +662,7 @@ class State:
         self.skipped_trades   = 0
         self.fear_greed       = {"value": 50, "label": "Neutral"}
         self.btc_24h          = {}
+        self.poly_sentiment   = None
         self.tick_job         = None
         self.price_job        = None
         self.macro_job        = None
@@ -608,10 +723,12 @@ async def price_update(context):
     if p > 0: st.current_price = p
 
 async def macro_update(context):
-    """Met à jour Fear&Greed et données 24h toutes les 30 min"""
-    st.fear_greed = await fetch_fear_greed()
-    st.btc_24h    = await fetch_btc_24h()
-    log.info(f"Macro: F&G={st.fear_greed['value']} BTC24h={st.btc_24h.get('change_pct',0):+.2f}%")
+    """Met à jour Fear&Greed, données 24h et sentiment Polymarket toutes les 5 min"""
+    st.fear_greed     = await fetch_fear_greed()
+    st.btc_24h        = await fetch_btc_24h()
+    st.poly_sentiment = await fetch_poly_btc_sentiment()
+    poly_str = f"Poly={st.poly_sentiment['bias']} {st.poly_sentiment['confidence']:.0f}%" if st.poly_sentiment else "Poly=N/A"
+    log.info(f"Macro: F&G={st.fear_greed['value']} BTC24h={st.btc_24h.get('change_pct',0):+.2f}% {poly_str}")
 
 async def tick(context: ContextTypes.DEFAULT_TYPE):
     if not st.running: return
@@ -697,7 +814,7 @@ async def tick(context: ContextTypes.DEFAULT_TYPE):
     # Claude AI décide
     decision = await claude_decide(
         ind_1m, ind_5m, ind_15m, ind_1h,
-        st.trades[-15:], st.bankroll, st.consec_losses,
+        st.trades[-15:], st.poly_sentiment, st.bankroll, st.consec_losses,
         st.fear_greed, st.btc_24h, session
     )
     st.last_ai_decision = decision
@@ -790,13 +907,14 @@ async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
     st.daily_start_br = st.bankroll
 
     st.price_job = context.job_queue.run_repeating(price_update, interval=30,   first=5)
-    st.macro_job = context.job_queue.run_repeating(macro_update, interval=1800, first=10)
+    st.macro_job = context.job_queue.run_repeating(macro_update, interval=300,  first=10)
     st.tick_job  = context.job_queue.run_repeating(tick,         interval=300,  first=15)
 
     # Fetch macro immédiat
-    st.fear_greed = await fetch_fear_greed()
-    st.btc_24h    = await fetch_btc_24h()
-    session       = get_session_context()
+    st.fear_greed     = await fetch_fear_greed()
+    st.btc_24h        = await fetch_btc_24h()
+    st.poly_sentiment = await fetch_poly_btc_sentiment()
+    session           = get_session_context()
 
     await update.message.reply_text(
         f"▶️ *Bot v6 AI démarré !*\n"
@@ -925,7 +1043,7 @@ async def cmd_signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ind_15m=compute_indicators(list(st.candles_15m))
     ind_1h=compute_indicators(list(st.candles_1h))
     d = await claude_decide(ind_1m,ind_5m,ind_15m,ind_1h,st.trades[-15:],
-                            st.bankroll,st.consec_losses,fg,btc24,session)
+                            st.poly_sentiment,st.bankroll,st.consec_losses,fg,btc24,session)
     st.last_ai_decision = d
     dir_e="🟢" if d["dir"]=="UP" else "🔴" if d["dir"]=="DOWN" else "⚪"
     risk_e={"LOW":"🟢","MEDIUM":"🟡","HIGH":"🔴"}.get(d.get("risk_level","MEDIUM"),"🟡")
