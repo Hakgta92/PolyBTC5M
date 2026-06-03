@@ -153,16 +153,11 @@ def is_trending_market(candles_5m, candles_15m, threshold_pct=0.08):
     closes_5m = [c["close"] for c in candles_5m[-12:]]
     momentum = abs(closes_5m[-1] - closes_5m[0]) / closes_5m[0] * 100
 
-    # Volume moyen suffisant
-    vols = [c["vol"] for c in candles_5m[-6:]]
-    avg_vol = sum(vols) / len(vols) if vols else 0
-    good_volume = avg_vol > 500
-
-    # Marché en tendance si mouvement + volume suffisants
-    is_trending = (range_pct > threshold_pct or momentum > threshold_pct * 0.8) and good_volume
+    # Marché en tendance si mouvement de prix suffisant (volume pas requis)
+    is_trending = range_pct > threshold_pct or momentum > threshold_pct * 0.7 or abs(ema_slope) > 0.04
     
     if not is_trending:
-        log.info(f"Range détecté: range={range_pct:.3f}% mom={momentum:.3f}% vol={avg_vol:.0f}")
+        log.info(f"Range détecté: range={range_pct:.3f}% mom={momentum:.3f}% ema_slope={ema_slope:.3f}%")
     
     return is_trending
 
