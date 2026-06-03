@@ -126,60 +126,73 @@ class PolyClient:
     async def find_btc_5min_market(self):
         """
         Cherche le marché BTC UP/DOWN 5min actif via l'API Gamma.
-        Retourne (token_id_up, token_id_down, market_info) ou None.
+        Slug pattern: btc-updown-5m-XXXXXXXXXX
         """
         try:
             async with aiohttp.ClientSession() as s:
-                # Cherche les marchés BTC actifs
-                params = {
-                    "active": "true",
-                    "closed": "false", 
-                    "tag_slug": "btc",
-                    "limit": 50
-                }
-                async with s.get(f"{POLY_GAMMA}/markets", params=params,
-                                 timeout=aiohttp.ClientTimeout(total=10)) as r:
-                    if r.status != 200:
-                        log.error(f"Gamma API: {r.status}")
-                        return None
-                    markets = await r.json()
-                    if isinstance(markets, dict):
-                        markets = markets.get("markets", [])
-                    
-                    # Cherche "BTC up or down" 5 minutes
-                    keywords = ["up or down", "5 min", "5min", "vers le haut", "vers le bas"]
-                    now = time.time()
-                    
-                    for m in markets:
-                        question = m.get("question", "").lower()
-                        slug     = m.get("slug", "").lower()
-                        
-                        # Vérifie si c'est le bon marché
-                        is_btc   = "btc" in question or "bitcoin" in question
-                        is_5min  = any(k in question or k in slug for k in keywords)
-                        is_active= m.get("active", False) and not m.get("closed", False)
-                        
-                        if is_btc and is_5min and is_active:
-                            # Récupère les token IDs
-                            clob_ids = m.get("clobTokenIds", "[]")
-                            if isinstance(clob_ids, str):
-                                clob_ids = json.loads(clob_ids)
-                            
-                            if len(clob_ids) >= 2:
-                                # Vérifie qu'il reste du temps (> 1 minute)
-                                end_date = m.get("endDate", "")
-                                log.info(f"Marché BTC 5min trouvé: {m.get('question','')}")
-                                return {
-                                    "token_up":   clob_ids[0],
-                                    "token_down":  clob_ids[1],
-                                    "question":    m.get("question",""),
-                                    "condition_id":m.get("conditionId",""),
-                                    "end_date":    end_date,
-                                    "market_slug": m.get("slug",""),
-                                }
-                    
-                    log.warning("Aucun marché BTC 5min actif trouvé")
-                    return None
+                # Méthode 1 : recherche par slug direct
+                for params in [
+                    {"slug_contains": "btc-updown-5m", "active": "true", "closed": "false", "limit": 10},
+                    {"active": "true", "closed": "false", "tag_slug": "btc", "limit": 100},
+                ]:
+                    async with s.get(f"{POLY_GAMMA}/markets", params=params,
+                                     timeout=aiohttp.ClientTimeout(total=10)) as r:
+                        if r.status != 200:
+                            continue
+                        markets = await r.json()
+                        if isinstance(markets, dict):
+                            markets = markets.get("markets", [])
+                        if not markets:
+                            continue
+
+                        for m in markets:
+                            slug     = m.get("slug", "").lower()
+                            question = m.get("question", "").lower()
+                            is_active= m.get("active", False) and not m.get("closed", False)
+
+                            # Slug pattern: btc-updown-5m-XXXXXXXXXX
+                            is_match = (
+                                "btc-updown-5m" in slug or
+                                "btc-up-down-5m" in slug or
+                                ("btc" in slug and "updown" in slug) or
+                                ("btc" in question and "updown" in question)
+                            )
+
+                            if is_match and is_active:
+                                clob_ids = m.get("clobTokenIds", "[]")
+                                if isinstance(clob_ids, str):
+                                    try: clob_ids = json.loads(clob_ids)
+                                    except: clob_ids = []
+                                if len(clob_ids) >= 2:
+                                    log.info(f"Marché trouvé: {m.get('question','')} slug={slug}")
+                                    return {
+                                        "token_up":    clob_ids[0],
+                                        "token_down":  clob_ids[1],
+                                        "question":    m.get("question",""),
+                                        "condition_id":m.get("conditionId",""),
+                                        "end_date":    m.get("endDate",""),
+                                        "market_slug": slug,
+                                    }
+
+                # Méthode 2 : URL directe avec slug connu
+                try:
+                    async with s.get(f"{POLY_GAMMA}/markets",
+                                     params={"slug": "btc-updown-5m"},
+                                     timeout=aiohttp.ClientTimeout(total=8)) as r:
+                        if r.status == 200:
+                            data = await r.json()
+                            if isinstance(data, list) and data:
+                                m = data[0]
+                                clob_ids = m.get("clobTokenIds", "[]")
+                                if isinstance(clob_ids, str): clob_ids = json.loads(clob_ids)
+                                if len(clob_ids) >= 2:
+                                    return {"token_up":clob_ids[0],"token_down":clob_ids[1],
+                                            "question":m.get("question",""),"condition_id":m.get("conditionId",""),
+                                            "end_date":m.get("endDate",""),"market_slug":m.get("slug","")}
+                except: pass
+
+                log.warning("Aucun marché BTC 5min actif trouvé")
+                return None
         except Exception as e:
             log.error(f"find_btc_market error: {e}")
             return None
@@ -256,15 +269,59 @@ class PolyClient:
             return None
 
     async def get_balance(self):
-        """Récupère le solde USDC disponible"""
-        if not self.ready or not self.client:
+        """Récupère le solde USDC via API REST async"""
+        if not POLY_PROXY_WALLET:
             return None
         try:
-            bal = self.client.get_balance()
-            return float(bal) if bal else None
+            # Méthode 1 : API Polymarket data
+            url = f"https://data-api.polymarket.com/balance?user={POLY_PROXY_WALLET}"
+            async with aiohttp.ClientSession() as s:
+                async with s.get(url, timeout=aiohttp.ClientTimeout(total=8)) as r:
+                    if r.status == 200:
+                        d = await r.json()
+                        # Différents formats possibles
+                        if isinstance(d, (int, float)):
+                            return round(float(d), 2)
+                        if isinstance(d, dict):
+                            for key in ["balance", "usdc", "cash", "amount"]:
+                                if key in d:
+                                    return round(float(d[key]), 2)
         except Exception as e:
-            log.error(f"get_balance: {e}")
-            return None
+            log.warning(f"get_balance method1: {e}")
+
+        try:
+            # Méthode 2 : CLOB API positions
+            url = f"{POLY_HOST}/positions"
+            headers = {}
+            if self.client:
+                try:
+                    headers = self.client._get_headers()
+                except: pass
+            async with aiohttp.ClientSession() as s:
+                async with s.get(url, headers=headers,
+                                 params={"user": POLY_PROXY_WALLET},
+                                 timeout=aiohttp.ClientTimeout(total=8)) as r:
+                    if r.status == 200:
+                        d = await r.json()
+                        cash = d.get("cash", d.get("balance", None))
+                        if cash is not None:
+                            return round(float(cash), 2)
+        except Exception as e:
+            log.warning(f"get_balance method2: {e}")
+
+        try:
+            # Méthode 3 : SDK sync dans thread
+            if self.ready and self.client:
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as pool:
+                    future = pool.submit(self.client.get_balance)
+                    bal = future.result(timeout=8)
+                    if bal is not None:
+                        return round(float(bal), 2)
+        except Exception as e:
+            log.warning(f"get_balance method3: {e}")
+
+        return None
 
 poly = PolyClient()
 
