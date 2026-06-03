@@ -290,57 +290,52 @@ class PolyClient:
             return None
 
     async def get_balance(self):
-        """Récupère le solde USDC via API REST async"""
+        """Récupère le solde USDC via plusieurs APIs"""
         if not POLY_PROXY_WALLET:
             return None
+        headers = {
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15",
+            "Accept": "application/json",
+        }
+        # Méthode 1 : CLOB API balance directe
         try:
-            # Méthode 1 : API Polymarket data
-            url = f"https://data-api.polymarket.com/balance?user={POLY_PROXY_WALLET}"
-            async with aiohttp.ClientSession() as s:
-                async with s.get(url, timeout=aiohttp.ClientTimeout(total=8)) as r:
+            async with aiohttp.ClientSession(headers=headers) as s:
+                async with s.get(f"{POLY_HOST}/balance-allowance",
+                                 params={"asset_type": "USDC", "user_address": POLY_PROXY_WALLET},
+                                 timeout=aiohttp.ClientTimeout(total=8)) as r:
                     if r.status == 200:
                         d = await r.json()
-                        # Différents formats possibles
-                        if isinstance(d, (int, float)):
-                            return round(float(d), 2)
-                        if isinstance(d, dict):
-                            for key in ["balance", "usdc", "cash", "amount"]:
-                                if key in d:
-                                    return round(float(d[key]), 2)
+                        bal = d.get("balance", d.get("asset", {}).get("balance"))
+                        if bal is not None:
+                            return round(float(bal), 2)
         except Exception as e:
-            log.warning(f"get_balance method1: {e}")
+            log.warning(f"Balance M1: {e}")
 
+        # Méthode 2 : data-api positions
         try:
-            # Méthode 2 : CLOB API positions
-            url = f"{POLY_HOST}/positions"
-            headers = {}
-            if self.client:
-                try:
-                    headers = self.client._get_headers()
-                except: pass
-            async with aiohttp.ClientSession() as s:
-                async with s.get(url, headers=headers,
+            async with aiohttp.ClientSession(headers=headers) as s:
+                async with s.get(f"https://data-api.polymarket.com/portfolio",
                                  params={"user": POLY_PROXY_WALLET},
                                  timeout=aiohttp.ClientTimeout(total=8)) as r:
                     if r.status == 200:
                         d = await r.json()
-                        cash = d.get("cash", d.get("balance", None))
-                        if cash is not None:
-                            return round(float(cash), 2)
+                        if isinstance(d, dict):
+                            for k in ["cash", "balance", "usdc", "available"]:
+                                if k in d:
+                                    return round(float(d[k]), 2)
         except Exception as e:
-            log.warning(f"get_balance method2: {e}")
+            log.warning(f"Balance M2: {e}")
 
+        # Méthode 3 : SDK dans thread
         try:
-            # Méthode 3 : SDK sync dans thread
             if self.ready and self.client:
                 import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor() as pool:
-                    future = pool.submit(self.client.get_balance)
-                    bal = future.result(timeout=8)
-                    if bal is not None:
-                        return round(float(bal), 2)
+                loop = asyncio.get_event_loop()
+                bal = await loop.run_in_executor(None, self.client.get_balance)
+                if bal is not None:
+                    return round(float(bal), 2)
         except Exception as e:
-            log.warning(f"get_balance method3: {e}")
+            log.warning(f"Balance M3: {e}")
 
         return None
 
