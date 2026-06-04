@@ -15,7 +15,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.12c"
+BOT_VERSION = "10.12d"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -1365,10 +1365,11 @@ async def cmd_score(update,context):
     i1h=compute_ind(list(st.c1h)); i4h=compute_ind(list(st.c4h)) if st.c4h else {}
     sess=session_ctx(); adv=compute_advanced_signals(list(st.c5),list(st.c1))
     direction_guess="UP" if i5.get("ema_bull") else "DOWN"
-    eth_bonus,eth_desc=compute_eth_correlation(eth_klines,direction_guess) if eth_klines else (0,"N/A")
+    eth_bonus,eth_desc=compute_eth_correlation(eth_klines,direction_guess) if eth_klines else (0,"ETH N/A")
     cs=compute_confluence_score(i1,i5,i15,i1h,i4h,st.fg,sess,adv,ob,liq,eth_bonus,eth_desc)
     mom=compute_momentum_score(i1,i5,i15)
     st.last_conf_score=cs; st.last_mom_score=mom; st.last_ob=ob; st.last_liq=liq
+    st.last_eth_klines=eth_klines  # ✅ Cache
     _,_,min_mom=get_session_thresholds(sess["session"])
     token_txt=""
     if not st.paper_mode and poly.ready:
@@ -1399,11 +1400,12 @@ async def cmd_signal(update,context):
     st.fg=await fetch_fear_greed(); st.btc24=await fetch_btc_24h()
     ob=await fetch_orderbook_imbalance(); liq=await fetch_liquidations()
     eth_klines=await fetch_eth_klines("5m",30)
+    st.last_eth_klines=eth_klines  # ✅ Met à jour le cache
     i1=compute_ind(list(st.c1)); i5=compute_ind(list(st.c5)); i15=compute_ind(list(st.c15))
     i1h=compute_ind(list(st.c1h)); i4h=compute_ind(list(st.c4h)) if st.c4h else {}
     sess=session_ctx(); adv=compute_advanced_signals(list(st.c5),list(st.c1))
     direction_guess="UP" if i5.get("ema_bull") else "DOWN"
-    eth_bonus,eth_desc=compute_eth_correlation(eth_klines,direction_guess) if eth_klines else (0,"N/A")
+    eth_bonus,eth_desc=compute_eth_correlation(eth_klines,direction_guess) if eth_klines else (0,"ETH N/A")
     cs=compute_confluence_score(i1,i5,i15,i1h,i4h,st.fg,sess,adv,ob,liq,eth_bonus,eth_desc)
     mom=compute_momentum_score(i1,i5,i15)
     st.last_conf_score=cs; st.last_mom_score=mom; st.last_ob=ob; st.last_liq=liq
@@ -1418,11 +1420,12 @@ async def cmd_signal(update,context):
     risk_e={"LOW":"🟢","MEDIUM":"🟡","HIGH":"🔴"}.get(d.get("risk","MEDIUM"),"🟡")
     payout=round(1/(tu if d["dir"]=="UP" else td),2) if d["dir"] else 0
     kelly_info=f" Kelly:`{d.get('kelly_pct',0):.1f}%`(`{d.get('size',0):.2f}$`)" if d.get("trade") else ""
+    eth_e="✅" if eth_bonus>0 else "⚠️" if eth_bonus<0 else "➖"
     await update.message.reply_text(
         f"🧠 *ANALYSE v{BOT_VERSION}*\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{dir_e} *{d['dir'] or 'PASS'}* | {risk_e} | `{d['conf']*100:.0f}%`\n"
         f"Score:`{cs['score']:.1f}` Mom:`{mom}/10` Payout:x`{payout}`{kelly_info}\n"
-        f"`{eth_desc}` | `{ob['desc'] if ob else 'N/A'}`\n"
+        f"Ξ{eth_e}`{eth_desc}` | `{ob['desc'] if ob else 'N/A'}`\n"
         f"₿`${i5.get('price',0):,.2f}` | F&G:`{st.fg['value']}` | `{sess['session']}`\n\n"
         f"💭 _{d['reasoning']}_",parse_mode="Markdown")
 
