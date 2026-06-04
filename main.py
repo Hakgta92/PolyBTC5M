@@ -15,7 +15,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.14j"
+BOT_VERSION = "10.14k"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -35,6 +35,9 @@ PAPER_MODE      = os.getenv("PAPER_MODE", "true").lower() == "true"
 POLY_PRIVATE_KEY   = os.getenv("POLY_PRIVATE_KEY", "")
 POLY_PROXY_WALLET  = os.getenv("POLY_PROXY_WALLET", "")
 POLY_FUNDER_WALLET = os.getenv("POLY_FUNDER_WALLET", "")
+POLY_API_KEY       = os.getenv("POLY_API_KEY", "")
+POLY_API_SECRET    = os.getenv("POLY_API_SECRET", "")
+POLY_API_PASSPHRASE= os.getenv("POLY_API_PASSPHRASE", "")
 POLY_HOST          = "https://clob.polymarket.com"
 POLY_GAMMA         = "https://gamma-api.polymarket.com"
 POLY_CHAIN_ID      = 137
@@ -367,31 +370,45 @@ class PolyClient:
         # ✅ v10.14 — Migration vers py-clob-client-v2 (CLOB V2 depuis avril 2026)
         try:
             from py_clob_client_v2 import ClobClient as ClobClientV2, ApiCreds
-            from eth_account import Account
-            # ✅ v10.14j — Dériver l'adresse EOA depuis POLY_PRIVATE_KEY
-            # C'est cette adresse (0xf7c6...) qui doit être le maker, pas le proxy magic wallet
-            eoa_address = Account.from_key(POLY_PRIVATE_KEY).address
-            log.info(f"EOA address: {eoa_address[:10]}...")
-            self.client = ClobClientV2(
-                host=POLY_HOST,
-                key=POLY_PRIVATE_KEY,
-                chain_id=POLY_CHAIN_ID,
-                signature_type=0,  # 0=EOA direct
-                funder=eoa_address
-            )
-            creds = self.client.create_or_derive_api_key()
-            self.client = ClobClientV2(
-                host=POLY_HOST,
-                key=POLY_PRIVATE_KEY,
-                chain_id=POLY_CHAIN_ID,
-                signature_type=0,
-                funder=eoa_address,
-                creds=creds
-            )
-            self.ready = True
-            self.client_version = "v2"
-            self.eoa_address = eoa_address
-            log.info(f"✅ Polymarket CLOB V2 initialisé (EOA={eoa_address[:10]}...)"); return True
+            # ✅ v10.14k — Utiliser les clés API directement depuis Railway
+            if POLY_API_KEY and POLY_API_SECRET and POLY_API_PASSPHRASE:
+                creds = ApiCreds(
+                    api_key=POLY_API_KEY,
+                    api_secret=POLY_API_SECRET,
+                    api_passphrase=POLY_API_PASSPHRASE
+                )
+                self.client = ClobClientV2(
+                    host=POLY_HOST,
+                    key=POLY_PRIVATE_KEY,
+                    chain_id=POLY_CHAIN_ID,
+                    signature_type=1,
+                    funder=POLY_PROXY_WALLET,
+                    creds=creds
+                )
+                self.ready = True
+                self.client_version = "v2"
+                log.info(f"✅ Polymarket CLOB V2 initialisé (API key: {POLY_API_KEY[:8]}...)"); return True
+            else:
+                log.warning("POLY_API_KEY manquant, tentative dérivation...")
+                self.client = ClobClientV2(
+                    host=POLY_HOST,
+                    key=POLY_PRIVATE_KEY,
+                    chain_id=POLY_CHAIN_ID,
+                    signature_type=1,
+                    funder=POLY_PROXY_WALLET
+                )
+                creds = self.client.create_or_derive_api_key()
+                self.client = ClobClientV2(
+                    host=POLY_HOST,
+                    key=POLY_PRIVATE_KEY,
+                    chain_id=POLY_CHAIN_ID,
+                    signature_type=1,
+                    funder=POLY_PROXY_WALLET,
+                    creds=creds
+                )
+                self.ready = True
+                self.client_version = "v2"
+                log.info(f"✅ Polymarket CLOB V2 initialisé (dérivé)"); return True
         except ImportError:
             log.warning("py-clob-client-v2 non installé, fallback v1")
         except Exception as e:
