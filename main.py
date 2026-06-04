@@ -15,7 +15,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.12d"
+BOT_VERSION = "10.12e"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -172,7 +172,7 @@ async def fetch_liquidations():
 
 
 async def fetch_eth_klines(interval="5m", limit=30):
-    """✅ v10.12c — Kraken directement (Binance bloqué 451 sur Railway US West)"""
+    """✅ v10.12d — Kraken ETH avec toutes les clés possibles"""
     headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
     km = {"1m": 1, "5m": 5, "15m": 15, "1h": 60, "4h": 240}
     try:
@@ -184,11 +184,27 @@ async def fetch_eth_klines(interval="5m", limit=30):
             ) as r:
                 if r.status == 200:
                     data = await r.json()
-                    ohlc = data.get("result", {}).get("XETHUSD",
-                           data.get("result", {}).get("ETHUSD", []))
+                    result = data.get("result", {})
+                    # Kraken peut retourner XETHUSD ou ETHUSD selon la version
+                    ohlc = None
+                    for key in ["XETHUSD", "ETHUSD", "ETHUSDT"]:
+                        if key in result:
+                            ohlc = result[key]
+                            break
+                    if not ohlc:
+                        # Prendre le premier résultat non-last (Kraken inclut "last" dans result)
+                        for key, val in result.items():
+                            if key != "last" and isinstance(val, list) and len(val) > 5:
+                                ohlc = val
+                                break
                     if ohlc:
-                        return [{"close": float(k[4]), "open": float(k[1]),
-                                 "high": float(k[2]), "low": float(k[3]), "vol": float(k[6])} for k in ohlc[-limit:]]
+                        candles = [{"close": float(k[4]), "open": float(k[1]),
+                                   "high": float(k[2]), "low": float(k[3]), "vol": float(k[6])}
+                                   for k in ohlc[-limit:]]
+                        log.info(f"ETH klines OK: {len(candles)} candles, last close={candles[-1]['close']:.2f}")
+                        return candles
+                    else:
+                        log.warning(f"ETH klines: keys={list(result.keys())}")
     except Exception as e:
         log.warning(f"ETH klines Kraken: {e}")
     return []
