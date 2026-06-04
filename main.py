@@ -15,7 +15,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.13f"
+BOT_VERSION = "10.13g"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -416,16 +416,47 @@ class PolyClient:
 
     async def place_market_order(self,token_id,amount_usdc,side="BUY"):
         if not self.ready or not self.client: return None
+        from py_clob_client.clob_types import MarketOrderArgs,OrderType
+        from py_clob_client.order_builder.constants import BUY,SELL
+        side_val = BUY if side=="BUY" else SELL
+
+        # Essai 1: FOK (Fill or Kill)
         try:
-            from py_clob_client.clob_types import MarketOrderArgs,OrderType
-            from py_clob_client.order_builder.constants import BUY,SELL
             mo=MarketOrderArgs(token_id=token_id,amount=amount_usdc,
-                side=BUY if side=="BUY" else SELL,order_type=OrderType.FOK)
+                side=side_val,order_type=OrderType.FOK)
             resp=self.client.post_order(self.client.create_market_order(mo),OrderType.FOK)
             if resp and resp.get("success"):
+                log.info(f"✅ Ordre FOK placé: {resp.get('orderID',resp.get('id','?'))}")
                 return resp.get("orderID",resp.get("id","unknown"))
-            log.error(f"Ordre refusé: {resp}"); return None
-        except Exception as e: log.error(f"place_order: {e}"); return None
+            log.warning(f"FOK refusé: {resp}")
+        except Exception as e:
+            log.warning(f"FOK erreur: {e}")
+
+        # Essai 2: GTC (Good Till Cancelled)
+        try:
+            mo=MarketOrderArgs(token_id=token_id,amount=amount_usdc,
+                side=side_val,order_type=OrderType.GTC)
+            resp=self.client.post_order(self.client.create_market_order(mo),OrderType.GTC)
+            if resp and resp.get("success"):
+                log.info(f"✅ Ordre GTC placé: {resp.get('orderID',resp.get('id','?'))}")
+                return resp.get("orderID",resp.get("id","unknown"))
+            log.warning(f"GTC refusé: {resp}")
+        except Exception as e:
+            log.warning(f"GTC erreur: {e}")
+
+        # Essai 3: Sans order_type (défaut de la lib)
+        try:
+            mo=MarketOrderArgs(token_id=token_id,amount=amount_usdc,side=side_val)
+            signed=self.client.create_market_order(mo)
+            resp=self.client.post_order(signed)
+            if resp and resp.get("success"):
+                log.info(f"✅ Ordre default placé: {resp.get('orderID',resp.get('id','?'))}")
+                return resp.get("orderID",resp.get("id","unknown"))
+            log.error(f"Ordre default refusé: {resp}")
+        except Exception as e:
+            log.error(f"Ordre default erreur: {e}")
+
+        return None
 
     async def sell_position(self,token_id,shares):
         if not self.ready or not self.client: return None
