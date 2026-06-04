@@ -15,7 +15,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.14i"
+BOT_VERSION = "10.14j"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -367,16 +367,17 @@ class PolyClient:
         # ✅ v10.14 — Migration vers py-clob-client-v2 (CLOB V2 depuis avril 2026)
         try:
             from py_clob_client_v2 import ClobClient as ClobClientV2, ApiCreds
-            # ✅ v10.14i — En CLOB V2, utiliser le FUNDER wallet (deposit wallet) comme maker
-            # POLY_FUNDER_WALLET = adresse qui détient les fonds (0xf7c68...)
-            # POLY_PROXY_WALLET = proxy/magic wallet (0xa565...)
-            funder_addr = POLY_FUNDER_WALLET or POLY_PROXY_WALLET
+            from eth_account import Account
+            # ✅ v10.14j — Dériver l'adresse EOA depuis POLY_PRIVATE_KEY
+            # C'est cette adresse (0xf7c6...) qui doit être le maker, pas le proxy magic wallet
+            eoa_address = Account.from_key(POLY_PRIVATE_KEY).address
+            log.info(f"EOA address: {eoa_address[:10]}...")
             self.client = ClobClientV2(
                 host=POLY_HOST,
                 key=POLY_PRIVATE_KEY,
                 chain_id=POLY_CHAIN_ID,
-                signature_type=0,  # 0=EOA pour le funder wallet
-                funder=funder_addr
+                signature_type=0,  # 0=EOA direct
+                funder=eoa_address
             )
             creds = self.client.create_or_derive_api_key()
             self.client = ClobClientV2(
@@ -384,12 +385,13 @@ class PolyClient:
                 key=POLY_PRIVATE_KEY,
                 chain_id=POLY_CHAIN_ID,
                 signature_type=0,
-                funder=funder_addr,
+                funder=eoa_address,
                 creds=creds
             )
             self.ready = True
             self.client_version = "v2"
-            log.info(f"✅ Polymarket CLOB V2 initialisé (funder={funder_addr[:8]}...)"); return True
+            self.eoa_address = eoa_address
+            log.info(f"✅ Polymarket CLOB V2 initialisé (EOA={eoa_address[:10]}...)"); return True
         except ImportError:
             log.warning("py-clob-client-v2 non installé, fallback v1")
         except Exception as e:
