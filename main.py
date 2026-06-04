@@ -15,7 +15,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.14d"
+BOT_VERSION = "10.14e"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -452,32 +452,44 @@ class PolyClient:
         if client_version == "v2":
             try:
                 from py_clob_client_v2 import OrderArgs, OrderType, PartialCreateOrderOptions, Side
-                # V2: on place un limit order au prix du marché
-                # Pour BUY: price proche de 1.0, pour SELL: price proche de 0.0
                 side_v2 = Side.BUY if side == "BUY" else Side.SELL
-                # Calcule price depuis token_price (amount en USDC / shares)
-                price_val = 0.97 if side == "BUY" else 0.03  # Légèrement moins agressif pour éviter reject
-                size_val = round(amount_float / price_val, 4) if price_val > 0 else amount_float
-                resp = self.client.create_and_post_order(
-                    order_args=OrderArgs(
-                        token_id=token_id,
-                        price=price_val,
-                        side=side_v2,
-                        size=size_val,
-                    ),
-                    options=PartialCreateOrderOptions(tick_size="0.01"),
-                    order_type=OrderType.FOK,
-                )
-                log.info(f"V2 order réponse: {resp}")
-                if resp:
-                    success = resp.get("success", False) or resp.get("orderID") or resp.get("id")
-                    if success:
-                        oid = resp.get("orderID", resp.get("id", "unknown"))
-                        log.info(f"✅ Ordre V2 placé: {oid}")
-                        return oid
-                    log.warning(f"V2 ordre refusé: {resp}")
+
+                # Essai GTC puis FOK avec différents prix
+                for order_type_v2, price_offset in [
+                    (OrderType.GTC, 0.02),   # GTC + léger slippage
+                    (OrderType.FOK, 0.05),   # FOK + plus de slippage
+                    (OrderType.GTC, 0.10),   # GTC + gros slippage
+                ]:
+                    try:
+                        # Prix: pour BUY on accepte jusqu'à token_price + offset
+                        # tick_size 0.01 = arrondi au centime
+                        price_val = round(min(0.99, amount_float / max(amount_float * 0.5, 1) + price_offset), 2)
+                        # En pratique: BUY à 0.99 (accepte tout prix ≤ 0.99)
+                        price_val = 0.99 if side == "BUY" else 0.01
+                        size_val = round(amount_float / price_val, 2) if price_val > 0 else amount_float
+
+                        resp = self.client.create_and_post_order(
+                            order_args=OrderArgs(
+                                token_id=token_id,
+                                price=price_val,
+                                side=side_v2,
+                                size=size_val,
+                            ),
+                            options=PartialCreateOrderOptions(tick_size="0.01"),
+                            order_type=order_type_v2,
+                        )
+                        log.info(f"V2 {order_type_v2} price={price_val} size={size_val} réponse: {resp}")
+                        if resp:
+                            success = resp.get("success", False) or resp.get("orderID") or resp.get("id")
+                            if success:
+                                oid = resp.get("orderID", resp.get("id", "unknown"))
+                                log.info(f"✅ Ordre V2 {order_type_v2} placé: {oid}")
+                                return oid
+                        log.warning(f"V2 {order_type_v2} refusé: {resp}")
+                    except Exception as e:
+                        log.warning(f"V2 {order_type_v2} erreur: {e}")
             except Exception as e:
-                log.error(f"V2 order erreur: {e}")
+                log.error(f"V2 import erreur: {e}")
             return None
 
         # Fallback V1
