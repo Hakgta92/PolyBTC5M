@@ -1,16 +1,20 @@
 """
-POLYMARKET BTC BOT v10.10
-FIX: BANKROLL_START dynamique — /setbalance met à jour le point de référence ROI
-Plus besoin de changer la variable BANKROLL dans Railway.
+POLYMARKET BTC BOT v10.11
+NOUVEAUTÉS:
+  • /recap — stats des dernières 24h
+  • Trailing stop loss (x1.5 peak → vend à x1.3)
+  • Corrélation BTC/ETH — bonus score si ETH confirme
+  • Liquidations Coinglass — signal fort si grosses liquidations
+  • Orderbook imbalance Binance — biais UP/DOWN selon pression achat/vente
 """
 
 import asyncio, logging, os, json, time, math, aiohttp
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.10"
+BOT_VERSION = "10.11"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -34,23 +38,22 @@ POLY_HOST          = "https://clob.polymarket.com"
 POLY_GAMMA         = "https://gamma-api.polymarket.com"
 POLY_CHAIN_ID      = 137
 
-# ── Mises ──
 MIN_BET_USD     = 1.5
 MAX_BET_USD     = 10.0
 MAX_BET_PCT     = 0.08
 KELLY_FRACTION  = 0.25
 
-# ── Filtres ──
-TAKE_PROFIT_MULT  = 2.0
-TAKE_PROFIT_CHECK = 30
-POLY_FEE          = 0.02
-MAX_CONSEC_LOSS   = 2
-COOLDOWN_MIN      = 25
-MAX_TRADES_PER_H  = 3
-DAILY_LOSS_MAX    = 0.15
-DAILY_PAUSE_H     = 2
+TAKE_PROFIT_MULT    = 2.0
+TRAILING_PEAK_MULT  = 1.5   # Active trailing stop quand token x1.5
+TRAILING_STOP_MULT  = 1.3   # Vend si retombe sous x1.3 depuis peak
+TAKE_PROFIT_CHECK   = 30
+POLY_FEE            = 0.02
+MAX_CONSEC_LOSS     = 2
+COOLDOWN_MIN        = 25
+MAX_TRADES_PER_H    = 3
+DAILY_LOSS_MAX      = 0.15
+DAILY_PAUSE_H       = 2
 
-# ── Seuils adaptatifs ──
 SESSION_THRESHOLDS = {
     "US_OPEN":      (8,  2.5, 3),
     "US_AFTERNOON": (8,  2.5, 3),
@@ -71,13 +74,138 @@ logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logg
 log = logging.getLogger(__name__)
 
 def kelly_bet(bankroll, win_prob, payout_mult):
-    if win_prob <= 0 or payout_mult <= 1: return MIN_BET_USD
-    b = payout_mult - 1; q = 1 - win_prob
-    kelly_pct = (win_prob * b - q) / b
-    if kelly_pct <= 0: return 0.0
-    bet = bankroll * min(kelly_pct * KELLY_FRACTION, MAX_BET_PCT)
-    return round(max(MIN_BET_USD, min(bet, MAX_BET_USD)), 2)
+    if win_prob<=0 or payout_mult<=1: return MIN_BET_USD
+    b=payout_mult-1; q=1-win_prob
+    kp=(win_prob*b-q)/b
+    if kp<=0: return 0.0
+    return round(max(MIN_BET_USD, min(bankroll*min(kp*KELLY_FRACTION, MAX_BET_PCT), MAX_BET_USD)), 2)
 
+# ─── DONNÉES AVANCÉES ──────────────────────────────────────────────────────
+async def fetch_eth_price():
+    """Prix ETH pour corrélation"""
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get("https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT",
+                             timeout=aiohttp.ClientTimeout(total=5)) as r:
+                if r.status==200:
+                    return float((await r.json())["price"])
+    except: pass
+    return 0.0
+
+async def fetch_eth_klines(interval="5m", limit=30):
+    """Klines ETH pour confirmer direction"""
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(f"https://api.binance.com/api/v3/klines?symbol=ETHUSDT&interval={interval}&limit={limit}",
+                             timeout=aiohttp.ClientTimeout(total=8)) as r:
+                if r.status==200:
+                    data=await r.json()
+                    if isinstance(data,list) and len(data)>5:
+                        return [{"close":float(k[4]),"open":float(k[1]),"high":float(k[2]),"low":float(k[3]),"vol":float(k[5])} for k in data]
+    except: pass
+    return []
+
+async def fetch_orderbook_imbalance():
+    """
+    Orderbook imbalance BTC via Binance.
+    Retourne: {"bias": "UP"/"DOWN"/None, "ratio": 0.0-1.0, "desc": str}
+    ratio > 0.6 = biais UP, < 0.4 = biais DOWN
+    """
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get("https://api.binance.com/api/v3/depth?symbol=BTCUSDT&limit=20",
+                             timeout=aiohttp.ClientTimeout(total=6)) as r:
+                if r.status==200:
+                    data=await r.json()
+                    bids=sum(float(b[1]) for b in data.get("bids",[]))  # volume achat
+                    asks=sum(float(a[1]) for a in data.get("asks",[]))  # volume vente
+                    total=bids+asks
+                    if total>0:
+                        ratio=round(bids/total,3)
+                        if ratio>0.62:
+                            return {"bias":"UP","ratio":ratio,"desc":f"OB achat {ratio*100:.0f}%"}
+                        elif ratio<0.38:
+                            return {"bias":"DOWN","ratio":ratio,"desc":f"OB vente {(1-ratio)*100:.0f}%"}
+                        else:
+                            return {"bias":None,"ratio":ratio,"desc":f"OB neutre {ratio*100:.0f}%"}
+    except Exception as e:
+        log.warning(f"Orderbook: {e}")
+    return {"bias":None,"ratio":0.5,"desc":"OB indispo"}
+
+async def fetch_liquidations():
+    """
+    Liquidations BTC via Coinglass (pas d'API key requise pour les données basiques).
+    Retourne: {"bias": "UP"/"DOWN"/None, "liq_usd": float, "desc": str}
+    Grosses liquidations SHORT → biais UP (short squeeze)
+    Grosses liquidations LONG → biais DOWN (long liquidation)
+    """
+    try:
+        async with aiohttp.ClientSession() as s:
+            # API publique Coinglass
+            async with s.get(
+                "https://open-api.coinglass.com/public/v2/liquidation_history",
+                params={"symbol":"BTC","interval":"1h","limit":1},
+                headers={"accept":"application/json"},
+                timeout=aiohttp.ClientTimeout(total=8)
+            ) as r:
+                if r.status==200:
+                    d=await r.json()
+                    data=d.get("data",[])
+                    if data:
+                        item=data[0]
+                        long_liq=float(item.get("longLiquidationUsd",0))
+                        short_liq=float(item.get("shortLiquidationUsd",0))
+                        total=long_liq+short_liq
+                        if total>5_000_000:  # > 5M$ de liquidations = signal fort
+                            if short_liq>long_liq*1.5:
+                                return {"bias":"UP","liq_usd":total,
+                                        "desc":f"🔥 Short squeeze ${total/1e6:.1f}M"}
+                            elif long_liq>short_liq*1.5:
+                                return {"bias":"DOWN","liq_usd":total,
+                                        "desc":f"🔥 Long liq ${total/1e6:.1f}M"}
+    except Exception as e:
+        log.warning(f"Liquidations Coinglass: {e}")
+
+    # Fallback: futures funding rate Binance comme proxy
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get("https://fapi.binance.com/fapi/v1/fundingRate?symbol=BTCUSDT&limit=1",
+                             timeout=aiohttp.ClientTimeout(total=6)) as r:
+                if r.status==200:
+                    data=await r.json()
+                    if data:
+                        fr=float(data[0].get("fundingRate",0))*100
+                        if fr>0.05:
+                            return {"bias":"DOWN","liq_usd":0,"desc":f"Funding +{fr:.3f}% (longs surpayés)"}
+                        elif fr<-0.05:
+                            return {"bias":"UP","liq_usd":0,"desc":f"Funding {fr:.3f}% (shorts surpayés)"}
+    except Exception as e:
+        log.warning(f"Funding rate: {e}")
+
+    return {"bias":None,"liq_usd":0,"desc":"Liquidations indispo"}
+
+def compute_eth_correlation(eth_klines, btc_direction):
+    """
+    Compare la direction ETH avec BTC pour confirmer ou infirmer.
+    Retourne bonus score (+1.5 si confirme, -1 si diverge, 0 si neutre)
+    """
+    if not eth_klines or len(eth_klines)<5:
+        return 0, "ETH: données indispo"
+    closes=[c["close"] for c in eth_klines]
+    e9=sum(closes[-9:])/min(9,len(closes))
+    e21=sum(closes[-21:])/min(21,len(closes)) if len(closes)>=21 else closes[0]
+    eth_bull=e9>e21
+    change_pct=(closes[-1]-closes[-5])/closes[-5]*100 if closes[-5]>0 else 0
+    eth_dir="UP" if eth_bull else "DOWN"
+    if eth_dir==btc_direction:
+        bonus=1.5
+        desc=f"ETH confirme {eth_dir} ({change_pct:+.2f}%)"
+    else:
+        bonus=-1.0
+        desc=f"ETH diverge {eth_dir} vs BTC {btc_direction}"
+    return bonus, desc
+
+# ─── POLYMARKET CLIENT ─────────────────────────────────────────────────────
 class PolyClient:
     def __init__(self):
         self.client=None; self.ready=False
@@ -87,9 +215,9 @@ class PolyClient:
             log.warning("Clés Polymarket manquantes"); return False
         try:
             from py_clob_client.client import ClobClient
-            self.client = ClobClient(POLY_HOST, key=POLY_PRIVATE_KEY, chain_id=POLY_CHAIN_ID,
-                signature_type=1, funder=POLY_PROXY_WALLET)
-            creds = self.client.create_or_derive_api_creds()
+            self.client=ClobClient(POLY_HOST,key=POLY_PRIVATE_KEY,chain_id=POLY_CHAIN_ID,
+                signature_type=1,funder=POLY_PROXY_WALLET)
+            creds=self.client.create_or_derive_api_creds()
             self.client.set_api_creds(creds)
             self.ready=True; log.info("✅ Polymarket CLOB initialisé"); return True
         except ImportError: log.error("py-clob-client non installé"); return False
@@ -99,12 +227,12 @@ class PolyClient:
         now=int(time.time()); current_ts=(now//300)*300
         headers={"User-Agent":"Mozilla/5.0","Accept":"application/json",
                  "Referer":"https://polymarket.com/","Origin":"https://polymarket.com"}
-        for ts in [current_ts, current_ts+300, current_ts-300]:
+        for ts in [current_ts,current_ts+300,current_ts-300]:
             slug=f"btc-updown-5m-{ts}"
-            for endpoint in ["/events", "/markets"]:
+            for endpoint in ["/events","/markets"]:
                 try:
                     async with aiohttp.ClientSession(headers=headers) as s:
-                        async with s.get(f"{POLY_GAMMA}{endpoint}", params={"slug":slug},
+                        async with s.get(f"{POLY_GAMMA}{endpoint}",params={"slug":slug},
                                          timeout=aiohttp.ClientTimeout(total=10)) as r:
                             if r.status==200:
                                 data=await r.json()
@@ -125,55 +253,55 @@ class PolyClient:
                 except Exception as e: log.warning(f"{slug}{endpoint}: {e}")
         return None
 
-    async def get_token_price(self, token_id):
+    async def get_token_price(self,token_id):
         try:
             async with aiohttp.ClientSession() as s:
-                async with s.get(f"{POLY_HOST}/price", params={"token_id":token_id,"side":"buy"},
+                async with s.get(f"{POLY_HOST}/price",params={"token_id":token_id,"side":"buy"},
                                  timeout=aiohttp.ClientTimeout(total=5)) as r:
                     if r.status==200:
                         return float((await r.json()).get("price",0.5))
         except: pass
         return 0.5
 
-    async def place_market_order(self, token_id, amount_usdc, side="BUY"):
+    async def place_market_order(self,token_id,amount_usdc,side="BUY"):
         if not self.ready or not self.client: return None
         try:
-            from py_clob_client.clob_types import MarketOrderArgs, OrderType
-            from py_clob_client.order_builder.constants import BUY, SELL
-            mo=MarketOrderArgs(token_id=token_id, amount=amount_usdc,
-                side=BUY if side=="BUY" else SELL, order_type=OrderType.FOK)
-            resp=self.client.post_order(self.client.create_market_order(mo), OrderType.FOK)
+            from py_clob_client.clob_types import MarketOrderArgs,OrderType
+            from py_clob_client.order_builder.constants import BUY,SELL
+            mo=MarketOrderArgs(token_id=token_id,amount=amount_usdc,
+                side=BUY if side=="BUY" else SELL,order_type=OrderType.FOK)
+            resp=self.client.post_order(self.client.create_market_order(mo),OrderType.FOK)
             if resp and resp.get("success"):
-                return resp.get("orderID", resp.get("id","unknown"))
+                return resp.get("orderID",resp.get("id","unknown"))
             log.error(f"Ordre refusé: {resp}"); return None
         except Exception as e: log.error(f"place_order: {e}"); return None
 
-    async def sell_position(self, token_id, shares):
+    async def sell_position(self,token_id,shares):
         if not self.ready or not self.client: return None
         try:
-            from py_clob_client.clob_types import MarketOrderArgs, OrderType
+            from py_clob_client.clob_types import MarketOrderArgs,OrderType
             from py_clob_client.order_builder.constants import SELL
-            mo=MarketOrderArgs(token_id=token_id, amount=shares, side=SELL, order_type=OrderType.FOK)
-            resp=self.client.post_order(self.client.create_market_order(mo), OrderType.FOK)
+            mo=MarketOrderArgs(token_id=token_id,amount=shares,side=SELL,order_type=OrderType.FOK)
+            resp=self.client.post_order(self.client.create_market_order(mo),OrderType.FOK)
             return resp if resp and resp.get("success") else None
         except Exception as e: log.error(f"sell_position: {e}"); return None
 
 poly=PolyClient()
 
 # ─── INDICATEURS ───────────────────────────────────────────────────────────
-def ema(values, period):
+def ema(values,period):
     if not values: return 0
     if len(values)<period: return values[-1]
     k=2/(period+1); e=sum(values[:period])/period
     for v in values[period:]: e=v*k+e*(1-k)
     return e
 
-def ema_slope(values, period, lookback=3):
+def ema_slope(values,period,lookback=3):
     if len(values)<period+lookback: return 0.0
     e_now=ema(values,period); e_prev=ema(values[:-lookback],period)
     return round((e_now-e_prev)/e_prev*100,4) if e_prev else 0.0
 
-def rsi(closes, period=14):
+def rsi(closes,period=14):
     if len(closes)<period+1: return 50.0
     gains=losses=0.0
     for i in range(len(closes)-period,len(closes)):
@@ -192,27 +320,27 @@ def macd_calc(closes):
     cross=((ml_prev<sig)and(ml>sig))or((ml_prev>sig)and(ml<sig))
     return round(ml,4),round(sig,4),round(hist,4),cross
 
-def bollinger(closes, period=20):
+def bollinger(closes,period=20):
     if len(closes)<period: return None,None,None,False
     w=closes[-period:]; mid=sum(w)/period
     std=math.sqrt(sum((x-mid)**2 for x in w)/period)
     bb_l=round(mid-2*std,2); bb_h=round(mid+2*std,2)
     return bb_l,round(mid,2),bb_h,(bb_h-bb_l)/mid*100<0.8 if mid else False
 
-def atr_calc(candles, period=14):
+def atr_calc(candles,period=14):
     if len(candles)<2: return 0.0
     trs=[max(c["high"]-c["low"],abs(c["high"]-candles[i-1]["close"]),
              abs(c["low"]-candles[i-1]["close"])) for i,c in enumerate(candles) if i>0]
     return round(sum(trs[-period:])/min(len(trs),period),2) if trs else 0.0
 
-def stoch(closes, highs, lows, period=14):
+def stoch(closes,highs,lows,period=14):
     if len(closes)<period: return 50.0,50.0
     lo,hi=min(lows[-period:]),max(highs[-period:])
     if hi==lo: return 50.0,50.0
     k=(closes[-1]-lo)/(hi-lo)*100; d=(closes[-2]-lo)/(hi-lo)*100 if len(closes)>period else k
     return round(k,1),round(d,1)
 
-def williams_r(closes, highs, lows, period=14):
+def williams_r(closes,highs,lows,period=14):
     if len(closes)<period: return -50.0
     hi,lo=max(highs[-period:]),min(lows[-period:])
     return round(-100*(hi-closes[-1])/(hi-lo),1) if hi!=lo else -50.0
@@ -222,12 +350,12 @@ def vwap_calc(candles):
     tv=sum(c["vol"] for c in candles)
     return round(sum(((c["high"]+c["low"]+c["close"])/3)*c["vol"] for c in candles)/tv,2) if tv else candles[-1]["close"]
 
-def detect_volume_spike(candles, lookback=20):
+def detect_volume_spike(candles,lookback=20):
     if len(candles)<lookback: return False
     vols=[c["vol"] for c in candles[-lookback:-1]]; avg=sum(vols)/len(vols) if vols else 1
     return candles[-1]["vol"]>avg*2.0
 
-def detect_consolidation(candles, period=6):
+def detect_consolidation(candles,period=6):
     if len(candles)<period: return False
     highs=[c["high"] for c in candles[-period:]]; lows=[c["low"] for c in candles[-period:]]
     price=candles[-1]["close"] or 1
@@ -251,7 +379,7 @@ def detect_engulfing(candles):
     if prev["close"]>prev["open"] and curr["close"]<curr["open"] and curr["open"]>prev["close"] and curr["close"]<prev["open"] and cb>pb*1.3: return "BEARISH"
     return None
 
-def detect_vwap_break(candles, lookback=6):
+def detect_vwap_break(candles,lookback=6):
     if len(candles)<lookback+2: return None
     vw=vwap_calc(candles[-20:]); pp,cp=candles[-2]["close"],candles[-1]["close"]
     vols=[c["vol"] for c in candles[-lookback:]]; avg_v=sum(vols)/len(vols) if vols else 1
@@ -260,7 +388,7 @@ def detect_vwap_break(candles, lookback=6):
     if pp>vw and cp<vw and vol_ok: return "BEARISH"
     return None
 
-def pivot_sr(candles, lookback=20):
+def pivot_sr(candles,lookback=20):
     if len(candles)<lookback: return [],[]
     highs=[c["high"] for c in candles[-lookback:]]; lows=[c["low"] for c in candles[-lookback:]]
     price=candles[-1]["close"]; atr=atr_calc(candles)*3; res,sup=[],[]
@@ -290,7 +418,7 @@ def compute_ind(candles):
         "consolidation":detect_consolidation(candles),"momentum":round(mom,2),
         "ema_bull":e9>e21,"ema_bull_strong":e9>e21 and e21>e50,"supports":sup,"resistances":res}
 
-def compute_advanced_signals(candles_5m, candles_1m):
+def compute_advanced_signals(candles_5m,candles_1m):
     div=detect_divergence(candles_5m)
     eng=detect_engulfing(candles_5m[-3:]) if len(candles_5m)>=3 else None
     vb=detect_vwap_break(candles_5m)
@@ -315,9 +443,9 @@ def session_ctx():
     else:          return {"session":"OVERNIGHT",   "quality":"LOW",      "score_bonus":-2}
 
 def get_session_thresholds(session_name):
-    return SESSION_THRESHOLDS.get(session_name, (10, 3.5, 4))
+    return SESSION_THRESHOLDS.get(session_name,(10,3.5,4))
 
-def compute_confluence_score(i1,i5,i15,i1h,i4h,fg,sess,adv):
+def compute_confluence_score(i1,i5,i15,i1h,i4h,fg,sess,adv,ob=None,liq=None,eth_bonus=0,eth_desc=""):
     up=0.0; dn=0.0; signals=[]
     if i4h:
         if i4h.get("ema_bull"): up+=2.0; signals.append("4h EMA ↑")
@@ -381,11 +509,32 @@ def compute_confluence_score(i1,i5,i15,i1h,i4h,fg,sess,adv):
         else: dn+=0.5
     if i5.get("consolidation"):
         up*=0.8; dn*=0.8; signals.append("⚠️ Consolidation")
+
+    # ✅ Orderbook imbalance
+    if ob and ob.get("bias"):
+        if ob["bias"]=="UP": up+=1.5; signals.append(f"📗 {ob['desc']}")
+        elif ob["bias"]=="DOWN": dn+=1.5; signals.append(f"📕 {ob['desc']}")
+
+    # ✅ Liquidations
+    if liq and liq.get("bias"):
+        if liq["bias"]=="UP": up+=2.0; signals.append(f"💥 {liq['desc']}")
+        elif liq["bias"]=="DOWN": dn+=2.0; signals.append(f"💥 {liq['desc']}")
+
+    # ✅ Corrélation ETH
+    if eth_bonus!=0:
+        if eth_bonus>0:
+            if up>dn: up+=eth_bonus
+            else: dn+=eth_bonus  # confirme la direction dominante
+        else:
+            if up>dn: up+=eth_bonus  # pénalise si ETH diverge
+            else: dn+=eth_bonus
+        if eth_desc: signals.append(f"Ξ {eth_desc}")
+
     direction="UP" if up>=dn else "DOWN"
     score=round(up if up>=dn else dn,1); diff=round(abs(up-dn),1)
     min_score,min_diff,min_mom=get_session_thresholds(sess.get("session","OVERNIGHT"))
     return {"score_up":round(up,1),"score_dn":round(dn,1),"score":score,"diff":diff,
-            "direction":direction,"signals":signals[:8],"min_score":min_score,
+            "direction":direction,"signals":signals[:10],"min_score":min_score,
             "min_diff":min_diff,"min_mom":min_mom,
             "tradeable":score>=min_score and diff>=min_diff}
 
@@ -497,7 +646,7 @@ async def fetch_btc_24h():
     except: pass
     return {"change_pct":0,"high_24h":0,"low_24h":0,"volume":0}
 
-async def claude_decide(i1,i5,i15,i1h,i4h,adv,trades,bankroll,consec,fg,btc24,sess,conf_score,mom_score,tpu,tpd):
+async def claude_decide(i1,i5,i15,i1h,i4h,adv,trades,bankroll,consec,fg,btc24,sess,conf_score,mom_score,tpu,tpd,ob=None,liq=None,eth_desc=""):
     if not ANTHROPIC_KEY: return {"dir":None,"conf":0,"size":0,"reasoning":"Pas de clé API.","trade":False}
     loss_analysis=analyze_losses(trades); patterns=pattern_mem(trades)
     same_up=recent_same_setup_loss(trades,"UP"); same_dn=recent_same_setup_loss(trades,"DOWN")
@@ -508,11 +657,14 @@ async def claude_decide(i1,i5,i15,i1h,i4h,adv,trades,bankroll,consec,fg,btc24,se
     i4h_txt=f"4h RSI:{i4h.get('rsi_14',50)} EMA:{'↑' if i4h.get('ema_bull') else '↓'}" if i4h else ""
     h_paris=(datetime.utcnow().hour+2)%24
     min_score,min_diff,min_mom=get_session_thresholds(sess.get("session","OVERNIGHT"))
+    ob_txt=f"OB:{ob['desc']}" if ob else "OB:indispo"
+    liq_txt=f"LIQ:{liq['desc']}" if liq else "LIQ:indispo"
     prompt=f"""Expert trading binaire BTC UP/DOWN 5min Polymarket. Bets RÉELS.
 BTC:${i5.get('price',0):,.2f} | 24h:{btc24.get('change_pct',0):+.2f}% | F&G:{fg['value']}/100 | {sess['session']} {h_paris}h
-UP:{tpu:.3f}$→x{ppu} (Kelly≈{kelly_up:.2f}$) | DOWN:{tpd:.3f}$→x{ppd} (Kelly≈{kelly_dn:.2f}$)
+UP:{tpu:.3f}$→x{ppu}(Kelly≈{kelly_up:.2f}$) | DOWN:{tpd:.3f}$→x{ppd}(Kelly≈{kelly_dn:.2f}$)
 Score:{conf_score['direction']} {conf_score['score']:.1f}/{min_score} Diff:{conf_score['diff']}/{min_diff} Tradeable:{'OUI' if conf_score['tradeable'] else 'NON'}
-Mom:{mom_score}/10 (seuil:{min_mom}) | {sigs_txt}
+Mom:{mom_score}/10(seuil:{min_mom}) | ETH:{eth_desc} | {ob_txt} | {liq_txt}
+Signaux:{sigs_txt}
 5m RSI:{i5.get('rsi_14',50)} MACD:{i5.get('macd_hist',0):+.4f} Stoch:{i5.get('stoch_k',50)} Vol:x{i5.get('vol_ratio',1):.1f}
 15m RSI:{i15.get('rsi_14',50)} EMA:{'↑' if i15.get('ema_bull') else '↓'} | 1h:{'↑' if i1h.get('ema_bull') else '↓'} | {i4h_txt}
 {patterns} | {loss_analysis}
@@ -551,8 +703,7 @@ JSON:{{"trade":true/false,"direction":"UP"/"DOWN"/null,"confidence":0.0-1.0,"bet
 class State:
     def __init__(self):
         self.running=False; self.paper_mode=PAPER_MODE
-        self.bankroll=50.0          # sera écrasé au load()
-        self.bankroll_ref=50.0      # ✅ point de référence ROI — mis à jour par /setbalance
+        self.bankroll=50.0; self.bankroll_ref=50.0
         self.c1=deque(maxlen=100); self.c5=deque(maxlen=100); self.c15=deque(maxlen=100)
         self.c1h=deque(maxlen=100); self.c4h=deque(maxlen=50)
         self.price=0.0; self.trades=[]; self.bet=None
@@ -567,20 +718,19 @@ class State:
         self.tick_job=self.price_job=self.macro_job=self.tp_job=self.backup_job=None
         self.current_market=None; self.active_order_id=None; self.active_token_id=None
         self.entry_token_price=0.0; self.shares_bought=0.0
+        self.token_price_peak=0.0    # ✅ Peak pour trailing stop
+        self.trailing_active=False   # ✅ Trailing stop activé?
+        # Cache données avancées
+        self.last_ob=None; self.last_liq=None; self.last_eth_klines=[]
 
     def save(self):
-        data={
-            "bankroll":self.bankroll,
-            "bankroll_ref":self.bankroll_ref,   # ✅ sauvegardé
-            "trades":self.trades[-200:],"wins":self.wins,
-            "losses":self.losses,"pnl":self.pnl,"best_streak":self.best_streak,
-            "worst_streak":self.worst_streak,"consec":self.consec,
+        data={"bankroll":self.bankroll,"bankroll_ref":self.bankroll_ref,
+            "trades":self.trades[-200:],"wins":self.wins,"losses":self.losses,"pnl":self.pnl,
+            "best_streak":self.best_streak,"worst_streak":self.worst_streak,"consec":self.consec,
             "daily_start":self.daily_start,"daily_ts":self.daily_ts,
-            "daily_pause_until":self.daily_pause_until,
-            "paper_mode":self.paper_mode,"skipped":self.skipped,
-            "pass_reasons":self.pass_reasons[-50:],"version":BOT_VERSION,
-            "saved_at":int(time.time())
-        }
+            "daily_pause_until":self.daily_pause_until,"paper_mode":self.paper_mode,
+            "skipped":self.skipped,"pass_reasons":self.pass_reasons[-50:],
+            "version":BOT_VERSION,"saved_at":int(time.time())}
         try:
             with open(DATA_FILE,"w") as f: json.dump(data,f,indent=2)
         except Exception as e: log.error(f"Save: {e}")
@@ -590,17 +740,16 @@ class State:
         try:
             data=self.save()
             with open(BACKUP_FILE,"w") as f: json.dump(data,f,indent=2)
-            log.info(f"✅ Backup — BR:{self.bankroll:.2f} ref:{self.bankroll_ref:.2f}")
-            return True
+            log.info(f"✅ Backup — BR:{self.bankroll:.2f}"); return True
         except Exception as e: log.error(f"Backup: {e}"); return False
 
     def load(self):
-        for filepath in [DATA_FILE, BACKUP_FILE]:
+        for filepath in [DATA_FILE,BACKUP_FILE]:
             try:
                 if os.path.exists(filepath):
                     with open(filepath) as f: d=json.load(f)
                     self.bankroll=d.get("bankroll",50.0)
-                    self.bankroll_ref=d.get("bankroll_ref", self.bankroll)  # ✅ restauré
+                    self.bankroll_ref=d.get("bankroll_ref",self.bankroll)
                     self.trades=d.get("trades",[]); self.wins=d.get("wins",0)
                     self.losses=d.get("losses",0); self.pnl=d.get("pnl",0.0)
                     self.best_streak=d.get("best_streak",0); self.worst_streak=d.get("worst_streak",0)
@@ -610,14 +759,12 @@ class State:
                     self.paper_mode=d.get("paper_mode",PAPER_MODE)
                     self.skipped=d.get("skipped",0); self.pass_reasons=d.get("pass_reasons",[])
                     age=int((time.time()-d.get("saved_at",0))/60)
-                    log.info(f"✅ State chargé depuis {filepath} ({age}min) BR:{self.bankroll:.2f} ref:{self.bankroll_ref:.2f}")
-                    return
+                    log.info(f"✅ State chargé {filepath} ({age}min) BR:{self.bankroll:.2f}"); return
             except Exception as e: log.error(f"Load {filepath}: {e}")
 
 st=State()
 
 def roi():
-    """ROI calculé depuis bankroll_ref (mis à jour par /setbalance)"""
     if st.bankroll_ref<=0: return "+0.00%"
     pct=(st.bankroll-st.bankroll_ref)/st.bankroll_ref*100
     return f"+{pct:.2f}%" if pct>=0 else f"{pct:.2f}%"
@@ -628,11 +775,9 @@ def check_daily():
         st.daily_start=st.bankroll; st.daily_ts=now; st.daily_pause_until=0; return False
     if st.daily_pause_until>0 and now<st.daily_pause_until: return True
     if st.daily_pause_until>0 and now>=st.daily_pause_until:
-        st.daily_pause_until=0; st.daily_start=st.bankroll
-        log.info("✅ Pause terminée — reprise"); return False
+        st.daily_pause_until=0; st.daily_start=st.bankroll; return False
     if st.daily_start>0 and (st.daily_start-st.bankroll)/st.daily_start>=DAILY_LOSS_MAX:
-        st.daily_pause_until=now+(DAILY_PAUSE_H*3600)
-        log.warning(f"⏸ Pause {DAILY_PAUSE_H}h"); return True
+        st.daily_pause_until=now+(DAILY_PAUSE_H*3600); return True
     return False
 
 def in_cd(): return time.time()<st.cooldown_until
@@ -648,12 +793,34 @@ async def job_backup(context):
     st.backup()
 
 async def job_take_profit(context):
+    """
+    ✅ v10.11 — Trailing stop loss.
+    - Si token atteint x1.5 (TRAILING_PEAK_MULT) → active le trailing
+    - Si retombe sous x1.3 (TRAILING_STOP_MULT) depuis le peak → vend
+    - Si atteint x2.0 (TAKE_PROFIT_MULT) → vend directement
+    """
     if not st.bet or not st.active_token_id or st.paper_mode: return
     try:
         current_price=await poly.get_token_price(st.active_token_id)
         if current_price<=0 or st.entry_token_price<=0: return
         gain_mult=current_price/st.entry_token_price
+
+        # Met à jour le peak
+        if gain_mult>st.token_price_peak:
+            st.token_price_peak=gain_mult
+            if gain_mult>=TRAILING_PEAK_MULT and not st.trailing_active:
+                st.trailing_active=True
+                log.info(f"🎯 Trailing stop activé à x{gain_mult:.2f}")
+
+        # Take profit direct
+        sell_reason=None
         if gain_mult>=TAKE_PROFIT_MULT:
+            sell_reason=f"Take profit x{gain_mult:.2f}"
+        # Trailing stop
+        elif st.trailing_active and gain_mult<st.token_price_peak*TRAILING_STOP_MULT/TRAILING_PEAK_MULT:
+            sell_reason=f"Trailing stop (peak x{st.token_price_peak:.2f} → x{gain_mult:.2f})"
+
+        if sell_reason:
             result=await poly.sell_position(st.active_token_id,st.shares_bought)
             if result:
                 gross=round((current_price-st.entry_token_price)*st.shares_bought,2)
@@ -663,11 +830,14 @@ async def job_take_profit(context):
                 bet=st.bet
                 st.trades.append({"dir":bet["dir"],"amount":bet["amount"],"pnl":round(gross,4),
                     "conf":bet["conf"],"result":"WIN","entry":bet["entry"],"exit":st.price,
-                    "reasoning":f"TP x{gain_mult:.2f}","paper":False,"ts":int(time.time()),
+                    "reasoning":sell_reason,"paper":False,"ts":int(time.time()),
                     "score":bet.get("score",0),"fg_value":st.fg.get("value",50),"aligned_15h1h":True})
                 st.bet=None; st.active_token_id=None; st.active_order_id=None
                 st.shares_bought=0; st.entry_token_price=0
-                await send(context.bot,f"🎯 *TAKE PROFIT* x{gain_mult:.2f}\n`{bet['dir']}` | `+{gross:.2f} USDC`\nBR:`{st.bankroll:.2f}` | ROI:`{roi()}`")
+                st.token_price_peak=0; st.trailing_active=False
+                await send(context.bot,
+                    f"🎯 *VENTE POSITION*\n`{sell_reason}`\n"
+                    f"`{bet['dir']}` | `+{gross:.2f} USDC`\nBR:`{st.bankroll:.2f}` | ROI:`{roi()}`")
                 st.backup()
     except Exception as e: log.error(f"job_take_profit: {e}")
 
@@ -677,6 +847,13 @@ async def job_price(context):
 
 async def job_macro(context):
     st.fg=await fetch_fear_greed(); st.btc24=await fetch_btc_24h()
+    # Refresh données avancées toutes les 5min avec le macro
+    try: st.last_ob=await fetch_orderbook_imbalance()
+    except: pass
+    try: st.last_liq=await fetch_liquidations()
+    except: pass
+    try: st.last_eth_klines=await fetch_eth_klines("5m",30)
+    except: pass
 
 async def job_tick(context):
     if not st.running: return
@@ -711,7 +888,7 @@ async def job_tick(context):
                 "reasoning":bet.get("reasoning",""),"paper":True,"ts":int(time.time()),
                 "score":bet.get("score",0),"fg_value":st.fg.get("value",50),
                 "aligned_15h1h":i15_n.get("ema_bull")==i1h_n.get("ema_bull")})
-            st.bet=None
+            st.bet=None; st.token_price_peak=0; st.trailing_active=False
             cd_msg=f"\n⏸ Cooldown {COOLDOWN_MIN}min" if in_cd() else ""
             await send(context.bot,f"{'✅' if won else '❌'} *Trade clôturé* [📄]\n`{bet['dir']}` `${bet['entry']:,.0f}`→`${st.price:,.0f}`\nPnL:`{'+' if gross>=0 else ''}{gross:.2f}$` BR:`{st.bankroll:.2f}` ROI:`{roi()}`{cd_msg}")
             st.backup()
@@ -722,7 +899,13 @@ async def job_tick(context):
     sess=session_ctx()
     if not i5: return
     adv=compute_advanced_signals(list(st.c5),list(st.c1))
-    conf_score=compute_confluence_score(i1,i5,i15,i1h,i4h,st.fg,sess,adv)
+    # ETH corrélation
+    eth_bonus=0; eth_desc="N/A"
+    direction_guess="UP" if i5.get("ema_bull") else "DOWN"
+    if st.last_eth_klines:
+        eth_bonus,eth_desc=compute_eth_correlation(st.last_eth_klines,direction_guess)
+    conf_score=compute_confluence_score(i1,i5,i15,i1h,i4h,st.fg,sess,adv,
+                                        st.last_ob,st.last_liq,eth_bonus,eth_desc)
     mom_score=compute_momentum_score(i1,i5,i15)
     st.last_conf_score=conf_score; st.last_mom_score=mom_score
     _,_,min_mom=get_session_thresholds(sess.get("session","OVERNIGHT"))
@@ -741,7 +924,9 @@ async def job_tick(context):
             tpd=await poly.get_token_price(market["token_down"])
         else:
             st.skipped+=1; st.pass_reasons.append({"ts":int(time.time()),"reason":"Aucun marché actif"}); return
-    dec=await claude_decide(i1,i5,i15,i1h,i4h,adv,st.trades[-15:],st.bankroll,st.consec,st.fg,st.btc24,sess,conf_score,mom_score,tpu,tpd)
+    dec=await claude_decide(i1,i5,i15,i1h,i4h,adv,st.trades[-15:],st.bankroll,st.consec,
+                            st.fg,st.btc24,sess,conf_score,mom_score,tpu,tpd,
+                            st.last_ob,st.last_liq,eth_desc)
     st.last_decision=dec
     if dec["trade"] and dec["dir"] and not st.bet:
         amount=dec["size"]
@@ -757,19 +942,20 @@ async def job_tick(context):
                 await send(context.bot,"⚠️ *Ordre Polymarket refusé*"); return
             st.active_order_id=order_id; st.active_token_id=token_used
             st.entry_token_price=entry_tp; st.shares_bought=round(amount/entry_tp,4) if entry_tp>0 else 0
+            st.token_price_peak=1.0; st.trailing_active=False  # Reset trailing
         st.bet={"dir":dec["dir"],"amount":amount,"conf":dec["conf"],"entry":st.price,
                 "reasoning":dec["reasoning"],"ts":int(time.time()),"score":conf_score["score"],"session":sess["session"]}
         mode="💰 RÉEL" if not st.paper_mode else "📄 paper"
         risk_e={"LOW":"🟢","MEDIUM":"🟡","HIGH":"🔴"}.get(dec["risk"],"🟡")
-        sigs="\n".join(f"  • {s}" for s in conf_score["signals"][:4])
-        pinfo=f"\nToken:`{entry_tp:.3f}$`→x`{round(1/entry_tp,2) if entry_tp>0 else '?'}` TP:x`{TAKE_PROFIT_MULT}`" if not st.paper_mode else ""
+        sigs="\n".join(f"  • {s}" for s in conf_score["signals"][:5])
+        pinfo=f"\nToken:`{entry_tp:.3f}$`→x`{round(1/entry_tp,2) if entry_tp>0 else '?'}` TP:x`{TAKE_PROFIT_MULT}` Trail:x`{TRAILING_PEAK_MULT}`→x`{TRAILING_STOP_MULT}`" if not st.paper_mode else ""
+        ob_info=f"\n📊 {st.last_ob['desc']}" if st.last_ob else ""
+        liq_info=f"\n💥 {st.last_liq['desc']}" if st.last_liq and st.last_liq.get("bias") else ""
         await send(context.bot,
             f"🧠 *Bet placé* [{mode}]\n━━━━━━━━━━━━━━━\n"
             f"*{dec['dir']}* | `{amount:.2f}$` Kelly:`{dec.get('kelly_pct',0):.1f}%` | `{dec['conf']*100:.0f}%` | {risk_e}\n"
             f"Score:`{conf_score['score']:.1f}` Mom:`{mom_score}/10`{pinfo}\n"
-            f"BTC:`${st.price:,.2f}` | `{sess['session']}`\n"
-            f"F&G:`{st.fg['value']}` 4h:`{'↑' if i4h.get('ema_bull') else '↓' if i4h else '?'}` "
-            f"15m:`{'↑' if i15.get('ema_bull') else '↓'}` 1h:`{'↑' if i1h.get('ema_bull') else '↓'}`\n\n"
+            f"BTC:`${st.price:,.2f}` | ETH:`{eth_desc}`{ob_info}{liq_info}\n\n"
             f"💭 _{dec['reasoning']}_\n🔑 Signaux:\n{sigs}")
     else:
         st.skipped+=1; st.pass_reasons.append({"ts":int(time.time()),"reason":f"Claude PASS:{dec['reasoning'][:50]}"})
@@ -797,8 +983,13 @@ async def cmd_start(update,context):
         f"🧠 *POLYMARKET BOT v{BOT_VERSION}*\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"Mode:*{'📄 PAPER' if st.paper_mode else '💰 RÉEL'}* | API:{'✅' if poly.ready else '❌'}\n"
         f"Wallet:`{w[:6]}...{w[-4:]}`\n\n"
+        f"🆕 v10.11:\n"
+        f"  ✅ Trailing stop (x1.5→x1.3)\n"
+        f"  ✅ Corrélation ETH bonus score\n"
+        f"  ✅ Liquidations + Orderbook\n"
+        f"  ✅ /recap stats 24h\n\n"
         f"*/run* */stop* */status* */signal* */score*\n"
-        f"*/market* */balance* */trades* */stats*\n"
+        f"*/market* */balance* */trades* */recap*\n"
         f"*/setbalance 55.11* • */backup*",
         parse_mode="Markdown",reply_markup=kb())
 
@@ -817,12 +1008,18 @@ async def cmd_run(update,context):
     st.tp_job=context.job_queue.run_repeating(job_take_profit,interval=TAKE_PROFIT_CHECK,first=10)
     st.backup_job=context.job_queue.run_repeating(job_backup,interval=600,first=60)
     st.fg=await fetch_fear_greed(); st.btc24=await fetch_btc_24h(); sess=session_ctx()
+    # Init données avancées
+    st.last_ob=await fetch_orderbook_imbalance()
+    st.last_liq=await fetch_liquidations()
+    st.last_eth_klines=await fetch_eth_klines("5m",30)
     min_score,min_diff,min_mom=get_session_thresholds(sess["session"])
+    ob_txt=st.last_ob["desc"] if st.last_ob else "N/A"
+    liq_txt=st.last_liq["desc"] if st.last_liq else "N/A"
     await update.message.reply_text(
         f"▶️ *Bot v{BOT_VERSION} démarré !*\nMode:*{'📄 PAPER' if st.paper_mode else '💰 RÉEL'}*\n"
-        f"F&G:`{st.fg['value']}` | Session:`{sess['session']}`\n"
-        f"Seuils: score≥`{min_score}` mom≥`{min_mom}`\n"
-        f"BR:`{st.bankroll:.2f}$` | Réf ROI:`{st.bankroll_ref:.2f}$` | ROI:`{roi()}`",
+        f"Session:`{sess['session']}` | Seuils: score≥`{min_score}` mom≥`{min_mom}`\n"
+        f"BR:`{st.bankroll:.2f}$` | ROI:`{roi()}`\n"
+        f"📊 OB:`{ob_txt}` | 💥 Liq:`{liq_txt}`",
         parse_mode="Markdown")
     await job_tick(context)
 
@@ -839,36 +1036,58 @@ async def cmd_stop(update,context):
         f"⏹ *Arrêté* | `{upt()}` | BR:`{st.bankroll:.2f}` | ROI:`{roi()}` | WR:`{wr()}`\n💾 Backup sauvegardé.",
         parse_mode="Markdown")
 
+async def cmd_recap(update,context):
+    """✅ v10.11 — Stats des dernières 24h"""
+    if not auth(update): return
+    now=time.time(); cutoff=now-86400
+    trades_24h=[t for t in st.trades if t.get("ts",0)>=cutoff]
+    if not trades_24h:
+        await update.message.reply_text("📊 Aucun trade dans les dernières 24h."); return
+    wins=[t for t in trades_24h if t["result"]=="WIN"]
+    losses=[t for t in trades_24h if t["result"]=="LOSS"]
+    pnl_24h=sum(t["pnl"] for t in trades_24h)
+    wr_24h=len(wins)/len(trades_24h)*100
+    avg_win=sum(t["pnl"] for t in wins)/len(wins) if wins else 0
+    avg_loss=abs(sum(t["pnl"] for t in losses)/len(losses)) if losses else 0
+    best=max(trades_24h,key=lambda t:t["pnl"])
+    worst=min(trades_24h,key=lambda t:t["pnl"])
+    up_t=[t for t in trades_24h if t["dir"]=="UP"]
+    dn_t=[t for t in trades_24h if t["dir"]=="DOWN"]
+    up_wr=sum(1 for t in up_t if t["result"]=="WIN")/len(up_t)*100 if up_t else 0
+    dn_wr=sum(1 for t in dn_t if t["result"]=="WIN")/len(dn_t)*100 if dn_t else 0
+    sessions={}
+    for t in trades_24h:
+        s=t.get("session","?")
+        if s not in sessions: sessions[s]={"w":0,"l":0}
+        if t["result"]=="WIN": sessions[s]["w"]+=1
+        else: sessions[s]["l"]+=1
+    sess_txt="\n".join(f"  `{s}`: ✅{v['w']} ❌{v['l']}" for s,v in sessions.items())
+    await update.message.reply_text(
+        f"📊 *RECAP 24H*\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"Trades:`{len(trades_24h)}` (✅{len(wins)} ❌{len(losses)})\n"
+        f"WR:`{wr_24h:.1f}%` | PnL:`{fmt(pnl_24h)}$`\n"
+        f"Gain moy:`+{avg_win:.2f}$` | Perte moy:`-{avg_loss:.2f}$`\n\n"
+        f"🟢 UP:`{up_wr:.0f}%`({len(up_t)}) 🔴 DOWN:`{dn_wr:.0f}%`({len(dn_t)})\n\n"
+        f"🏆 Meilleur:`{fmt(best['pnl'])}$` {best['dir']}\n"
+        f"💀 Pire:`{fmt(worst['pnl'])}$` {worst['dir']}\n\n"
+        f"Par session:\n{sess_txt}",
+        parse_mode="Markdown")
+
 async def cmd_setbalance(update,context):
-    """
-    ✅ v10.10 — Met à jour bankroll ET bankroll_ref (point de référence ROI).
-    Plus besoin de changer BANKROLL dans Railway.
-    """
     if not auth(update): return
     args=context.args
     if not args:
-        await update.message.reply_text(
-            "💡 *Usage:* `/setbalance 55.11`\n\nMet à jour ton solde ET remet le ROI à 0%.",
-            parse_mode="Markdown"); return
+        await update.message.reply_text("💡 *Usage:* `/setbalance 55.11`",parse_mode="Markdown"); return
     try:
         new_bal=round(float(args[0].replace(",",".")),2)
         if new_bal<0 or new_bal>100000:
             await update.message.reply_text("❌ Montant invalide."); return
-        old=st.bankroll
-        st.bankroll=new_bal
-        st.bankroll_ref=new_bal      # ✅ ROI repart de 0%
-        st.daily_start=new_bal
-        st.daily_ts=time.time()
-        st.daily_pause_until=0
-        st.pnl=0.0                   # ✅ Reset PnL session aussi
-        st.backup()
+        old=st.bankroll; st.bankroll=new_bal; st.bankroll_ref=new_bal
+        st.daily_start=new_bal; st.daily_ts=time.time()
+        st.daily_pause_until=0; st.pnl=0.0; st.backup()
         await update.message.reply_text(
-            f"✅ *Balance mise à jour*\n"
-            f"`{old:.2f}$` → `{new_bal:.2f}$`\n"
-            f"📊 ROI repart de `0%` — réf:`{new_bal:.2f}$`\n"
-            f"📈 PnL session reset.",
+            f"✅ *Balance mise à jour*\n`{old:.2f}$` → `{new_bal:.2f}$`\nROI repart de `0%`",
             parse_mode="Markdown")
-        log.info(f"setbalance: {old:.2f}→{new_bal:.2f} (ref={new_bal:.2f})")
     except ValueError:
         await update.message.reply_text("❌ Format invalide. Ex: `/setbalance 55.11`",parse_mode="Markdown")
 
@@ -876,9 +1095,7 @@ async def cmd_backup(update,context):
     if not auth(update): return
     ok=st.backup()
     if ok:
-        await update.message.reply_text(
-            f"💾 *Backup effectué*\nBR:`{st.bankroll:.2f}$` | Trades:`{len(st.trades)}` | ROI:`{roi()}`",
-            parse_mode="Markdown")
+        await update.message.reply_text(f"💾 *Backup*\nBR:`{st.bankroll:.2f}$` | ROI:`{roi()}` | Trades:`{len(st.trades)}`",parse_mode="Markdown")
     else:
         await update.message.reply_text("❌ Backup échoué.")
 
@@ -892,20 +1109,23 @@ async def cmd_status(update,context):
     if st.bet:
         elapsed=int((time.time()-st.bet["ts"])/60)
         bet_info=f"{st.bet['dir']} {st.bet['amount']:.2f}$ ({elapsed}min)"
-        if st.entry_token_price>0: bet_info+=f" token@{st.entry_token_price:.3f}"
+        if st.entry_token_price>0: bet_info+=f" peak:x{st.token_price_peak:.2f}"
+        if st.trailing_active: bet_info+=" 🎯TRAIL"
     pause_info=""
     if st.daily_pause_until>time.time():
         remaining=int((st.daily_pause_until-time.time())/60)
-        pause_info=f"\n⏸ Pause: `{remaining}min` restant"
+        pause_info=f"\n⏸ Pause:`{remaining}min`"
+    ob_txt=st.last_ob["desc"] if st.last_ob else "N/A"
+    liq_txt=st.last_liq["desc"] if st.last_liq and st.last_liq.get("bias") else "normal"
     min_score,min_diff,min_mom=get_session_thresholds(sess["session"])
     await update.message.reply_text(
         f"📊 *STATUS v{BOT_VERSION}* [{'📄' if st.paper_mode else '💰'}]\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{'🟢 EN COURS' if st.running else '🔴 ARRÊTÉ'} | {'✅ CLOB' if poly.ready else '❌ CLOB'}\n\n"
         f"₿`${st.price:,.2f}` | F&G:`{st.fg['value']}` | `{sess['session']}`\n"
-        f"Seuils: score≥`{min_score}` diff≥`{min_diff}` mom≥`{min_mom}`\n"
+        f"Seuils: score≥`{min_score}` mom≥`{min_mom}`\n"
+        f"📊 OB:`{ob_txt}` | 💥 Liq:`{liq_txt}`\n"
         f"🎯 {score_info}\n\n"
         f"💰 BR:`{st.bankroll:.2f}$` | ROI:`{roi()}` | PnL:`{fmt(st.pnl)}`\n"
-        f"📊 Réf ROI:`{st.bankroll_ref:.2f}$`\n"
         f"📅 Perte jour:`{dl:.1f}%/{DAILY_LOSS_MAX*100:.0f}%`{pause_info}\n"
         f"🎲 Bet:`{bet_info}` | 🚫 Refusés:`{st.skipped}` | ⏱`{upt()}`",
         parse_mode="Markdown",reply_markup=kb())
@@ -917,9 +1137,8 @@ async def cmd_balance(update,context):
     await update.message.reply_text(
         f"💰 *Balance Bot*\n━━━━━━━━━━━━━━\n"
         f"🔑 `{short}`\n"
-        f"📊 BR: `{st.bankroll:.2f}$`\n"
-        f"📈 ROI: `{roi()}`  (réf:`{st.bankroll_ref:.2f}$`)\n"
-        f"💹 PnL session: `{fmt(st.pnl)}$`\n\n"
+        f"📊 BR:`{st.bankroll:.2f}$` | ROI:`{roi()}`\n"
+        f"📈 PnL:`{fmt(st.pnl)}$` | Réf:`{st.bankroll_ref:.2f}$`\n\n"
         f"💡 `/setbalance <montant>` pour sync + reset ROI",
         parse_mode="Markdown")
 
@@ -947,11 +1166,16 @@ async def cmd_score(update,context):
         st.c1h=deque(c1h,maxlen=100); st.c1=deque(c1,maxlen=100); st.c4h=deque(c4h,maxlen=50)
         st.price=c5[-1]["close"]
     st.fg=await fetch_fear_greed()
+    ob=await fetch_orderbook_imbalance(); liq=await fetch_liquidations()
+    eth_klines=await fetch_eth_klines("5m",30)
     i1=compute_ind(list(st.c1)); i5=compute_ind(list(st.c5)); i15=compute_ind(list(st.c15))
     i1h=compute_ind(list(st.c1h)); i4h=compute_ind(list(st.c4h)) if st.c4h else {}
     sess=session_ctx(); adv=compute_advanced_signals(list(st.c5),list(st.c1))
-    cs=compute_confluence_score(i1,i5,i15,i1h,i4h,st.fg,sess,adv); mom=compute_momentum_score(i1,i5,i15)
-    st.last_conf_score=cs; st.last_mom_score=mom
+    direction_guess="UP" if i5.get("ema_bull") else "DOWN"
+    eth_bonus,eth_desc=compute_eth_correlation(eth_klines,direction_guess) if eth_klines else (0,"N/A")
+    cs=compute_confluence_score(i1,i5,i15,i1h,i4h,st.fg,sess,adv,ob,liq,eth_bonus,eth_desc)
+    mom=compute_momentum_score(i1,i5,i15)
+    st.last_conf_score=cs; st.last_mom_score=mom; st.last_ob=ob; st.last_liq=liq
     _,_,min_mom=get_session_thresholds(sess["session"])
     token_txt=""
     if not st.paper_mode and poly.ready:
@@ -962,11 +1186,14 @@ async def cmd_score(update,context):
     mom_e="🔥" if mom>=7 else "⚡" if mom>=4 else "💤"
     sigs="\n".join(f"  • {s}" for s in cs["signals"])
     await update.message.reply_text(
-        f"🎯 *SCORE*\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"₿`${st.price:,.2f}` | `{sess['session']}`{token_txt}\n\n"
+        f"🎯 *SCORE v{BOT_VERSION}*\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"₿`${st.price:,.2f}` | `{sess['session']}`{token_txt}\n"
+        f"Ξ ETH:`{eth_desc}` | 📊`{ob['desc'] if ob else 'N/A'}`\n"
+        f"💥`{liq['desc'] if liq else 'N/A'}`\n\n"
         f"🟢 UP:`{cs['score_up']:.1f}` 🔴 DOWN:`{cs['score_dn']:.1f}`\n"
         f"Diff:`{cs['diff']:.1f}/{cs['min_diff']}` → {'✅ TRADEABLE' if cs['tradeable'] else '❌ PASS'}\n"
-        f"⚡ Mom:`{mom}/10` (seuil:`{min_mom}`) {mom_e}\n\nSignaux:\n{sigs or '  Aucun'}",parse_mode="Markdown")
+        f"⚡ Mom:`{mom}/10`(seuil:`{min_mom}`) {mom_e}\n\nSignaux:\n{sigs or '  Aucun'}",
+        parse_mode="Markdown")
 
 async def cmd_signal(update,context):
     if not auth(update): return
@@ -977,25 +1204,33 @@ async def cmd_signal(update,context):
         st.c1=deque(c1,maxlen=100); st.c5=deque(c5,maxlen=100); st.c15=deque(c15,maxlen=100)
         st.c1h=deque(c1h,maxlen=100); st.c4h=deque(c4h,maxlen=50); st.price=c5[-1]["close"]
     st.fg=await fetch_fear_greed(); st.btc24=await fetch_btc_24h()
+    ob=await fetch_orderbook_imbalance(); liq=await fetch_liquidations()
+    eth_klines=await fetch_eth_klines("5m",30)
     i1=compute_ind(list(st.c1)); i5=compute_ind(list(st.c5)); i15=compute_ind(list(st.c15))
     i1h=compute_ind(list(st.c1h)); i4h=compute_ind(list(st.c4h)) if st.c4h else {}
     sess=session_ctx(); adv=compute_advanced_signals(list(st.c5),list(st.c1))
-    cs=compute_confluence_score(i1,i5,i15,i1h,i4h,st.fg,sess,adv); mom=compute_momentum_score(i1,i5,i15)
-    st.last_conf_score=cs; st.last_mom_score=mom
+    direction_guess="UP" if i5.get("ema_bull") else "DOWN"
+    eth_bonus,eth_desc=compute_eth_correlation(eth_klines,direction_guess) if eth_klines else (0,"N/A")
+    cs=compute_confluence_score(i1,i5,i15,i1h,i4h,st.fg,sess,adv,ob,liq,eth_bonus,eth_desc)
+    mom=compute_momentum_score(i1,i5,i15)
+    st.last_conf_score=cs; st.last_mom_score=mom; st.last_ob=ob; st.last_liq=liq
     tu=0.5; td=0.5
     if not st.paper_mode and poly.ready:
         m=await poly.find_btc_5min_market()
         if m: tu=await poly.get_token_price(m["token_up"]); td=await poly.get_token_price(m["token_down"])
-    d=await claude_decide(i1,i5,i15,i1h,i4h,adv,st.trades[-15:],st.bankroll,st.consec,st.fg,st.btc24,sess,cs,mom,tu,td)
+    d=await claude_decide(i1,i5,i15,i1h,i4h,adv,st.trades[-15:],st.bankroll,st.consec,
+                          st.fg,st.btc24,sess,cs,mom,tu,td,ob,liq,eth_desc)
     st.last_decision=d
     dir_e="🟢" if d["dir"]=="UP" else "🔴" if d["dir"]=="DOWN" else "⚪"
     risk_e={"LOW":"🟢","MEDIUM":"🟡","HIGH":"🔴"}.get(d.get("risk","MEDIUM"),"🟡")
+    payout=round
     payout=round(1/(tu if d["dir"]=="UP" else td),2) if d["dir"] else 0
     kelly_info=f" Kelly:`{d.get('kelly_pct',0):.1f}%`(`{d.get('size',0):.2f}$`)" if d.get("trade") else ""
     await update.message.reply_text(
-        f"🧠 *ANALYSE*\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🧠 *ANALYSE v{BOT_VERSION}*\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{dir_e} *{d['dir'] or 'PASS'}* | {risk_e} | `{d['conf']*100:.0f}%`\n"
         f"Score:`{cs['score']:.1f}` Mom:`{mom}/10` Payout:x`{payout}`{kelly_info}\n"
+        f"Ξ `{eth_desc}` | 📊`{ob['desc'] if ob else 'N/A'}`\n"
         f"₿`${i5.get('price',0):,.2f}` | F&G:`{st.fg['value']}` | `{sess['session']}`\n\n"
         f"💭 _{d['reasoning']}_",parse_mode="Markdown")
 
@@ -1021,7 +1256,8 @@ async def cmd_trades(update,context):
         lines.append(f"{'✅' if t['result']=='WIN' else '❌'}{'💰' if not t.get('paper',True) else '📄'} `{t['dir']}` `{fmt(t['pnl'])}$` `{ts}`")
     if st.bet:
         elapsed=int((time.time()-st.bet["ts"])/60)
-        lines.append(f"\n🔄 *Actif:* `{st.bet['dir']}` `{st.bet['amount']:.2f}$` ({elapsed}min)")
+        trail_info=" 🎯TRAIL" if st.trailing_active else ""
+        lines.append(f"\n🔄 *Actif:* `{st.bet['dir']}` `{st.bet['amount']:.2f}$` ({elapsed}min){trail_info}")
     await update.message.reply_text("\n".join(lines),parse_mode="Markdown")
 
 async def cmd_stats(update,context):
@@ -1035,10 +1271,9 @@ async def cmd_stats(update,context):
     await update.message.reply_text(
         f"📉 *STATS v{BOT_VERSION}*\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"Total:`{total}` (✅{st.wins} ❌{st.losses})\nWR:`{wr()}` | ROI:`{roi()}` | R:R:`{rr:.2f}`\n"
-        f"PnL:`{fmt(st.pnl)}$` | BR:`{st.bankroll:.2f}$`\n"
-        f"Réf ROI:`{st.bankroll_ref:.2f}$`\n\n"
-        f"💰 Réels:`{len(real_t)}` WR:`{real_wr:.0f}%`\nGain moy:`+{aw:.2f}$` | Perte moy:`-{al:.2f}$`",
-        parse_mode="Markdown")
+        f"PnL:`{fmt(st.pnl)}$` | BR:`{st.bankroll:.2f}$`\n\n"
+        f"💰 Réels:`{len(real_t)}` WR:`{real_wr:.0f}%`\nGain moy:`+{aw:.2f}$` | Perte moy:`-{al:.2f}$`\n\n"
+        f"💡 `/recap` pour les stats 24h",parse_mode="Markdown")
 
 async def cmd_passes(update,context):
     if not auth(update): return
@@ -1077,8 +1312,9 @@ async def cmd_reset(update,context):
     st.cooldown_until=0; st.daily_pause_until=0; st.session_start=time.time(); st.pass_reasons=[]
     st.last_conf_score={}; st.last_mom_score=0; st.active_order_id=None
     st.active_token_id=None; st.shares_bought=0; st.entry_token_price=0
+    st.token_price_peak=0; st.trailing_active=False
     st.c1.clear(); st.c5.clear(); st.c15.clear(); st.c1h.clear(); st.c4h.clear()
-    for f in [DATA_FILE, BACKUP_FILE]:
+    for f in [DATA_FILE,BACKUP_FILE]:
         if os.path.exists(f): os.remove(f)
     await update.message.reply_text("🔄 *Reset complet.*",parse_mode="Markdown")
 
@@ -1102,7 +1338,7 @@ def main():
         ("ai",cmd_ai),("signal",cmd_signal),("score",cmd_score),("trades",cmd_trades),
         ("stats",cmd_stats),("fear",cmd_fear),("passes",cmd_passes),("market",cmd_market),
         ("balance",cmd_balance),("paper",cmd_paper),("cooldown",cmd_cooldown),("reset",cmd_reset),
-        ("setbalance",cmd_setbalance),("backup",cmd_backup)]:
+        ("setbalance",cmd_setbalance),("backup",cmd_backup),("recap",cmd_recap)]:
         app.add_handler(CommandHandler(name,handler))
     app.add_handler(CallbackQueryHandler(cb))
     log.info(f"🧠 PolyBot v{BOT_VERSION} démarré")
