@@ -15,7 +15,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.13e"
+BOT_VERSION = "10.13f"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -1440,10 +1440,12 @@ async def cmd_score(update,context):
     st.last_conf_score=cs; st.last_mom_score=mom; st.last_ob=ob; st.last_liq=liq
     st.last_eth_klines=eth_klines  # ✅ Cache
     _,_,min_mom=get_session_thresholds(sess["session"], cs.get("score",0) if "cs" in dir() else 0)
-    # ✅ v10.13d — Cherche le marché pour afficher le vrai payout
+    # ✅ v10.13f — Cherche le marché, fallback sur cache
     tu=0.5; td=0.5; token_txt=""
     if not st.paper_mode and poly.ready:
         m=await poly.find_btc_5min_market()
+        if not m and st.current_market:
+            m=st.current_market
         if m:
             tu=await poly.get_token_price(m["token_up"])
             td=await poly.get_token_price(m["token_down"])
@@ -1480,10 +1482,12 @@ async def cmd_signal(update,context):
     cs=compute_confluence_score(i1,i5,i15,i1h,i4h,st.fg,sess,adv,ob,liq,eth_bonus,eth_desc)
     mom=compute_momentum_score(i1,i5,i15)
     st.last_conf_score=cs; st.last_mom_score=mom; st.last_ob=ob; st.last_liq=liq
-    # ✅ v10.13d — Cherche le marché AVANT Claude pour avoir le vrai payout
+    # ✅ v10.13f — Cherche le marché, fallback sur le cache du dernier tick
     tu=0.5; td=0.5
     if not st.paper_mode and poly.ready:
         m=await poly.find_btc_5min_market()
+        if not m and st.current_market:
+            m=st.current_market  # Utilise le dernier marché connu
         if m:
             tu=await poly.get_token_price(m["token_up"])
             td=await poly.get_token_price(m["token_down"])
