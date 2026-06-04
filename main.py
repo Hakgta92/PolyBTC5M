@@ -15,7 +15,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.13c"
+BOT_VERSION = "10.13d"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -1432,11 +1432,13 @@ async def cmd_score(update,context):
     st.last_conf_score=cs; st.last_mom_score=mom; st.last_ob=ob; st.last_liq=liq
     st.last_eth_klines=eth_klines  # ✅ Cache
     _,_,min_mom=get_session_thresholds(sess["session"], cs.get("score",0) if "cs" in dir() else 0)
-    token_txt=""
+    # ✅ v10.13d — Cherche le marché pour afficher le vrai payout
+    tu=0.5; td=0.5; token_txt=""
     if not st.paper_mode and poly.ready:
         m=await poly.find_btc_5min_market()
         if m:
-            tu=await poly.get_token_price(m["token_up"]); td=await poly.get_token_price(m["token_down"])
+            tu=await poly.get_token_price(m["token_up"])
+            td=await poly.get_token_price(m["token_down"])
             token_txt=f"\n🟢 UP:`{tu:.3f}$` x{round(1/tu,2) if tu>0 else '?'} | 🔴 DOWN:`{td:.3f}$` x{round(1/td,2) if td>0 else '?'}"
     mom_e="🔥" if mom>=7 else "⚡" if mom>=4 else "💤"
     sigs="\n".join(f"  • {s}" for s in cs["signals"])
@@ -1470,10 +1472,14 @@ async def cmd_signal(update,context):
     cs=compute_confluence_score(i1,i5,i15,i1h,i4h,st.fg,sess,adv,ob,liq,eth_bonus,eth_desc)
     mom=compute_momentum_score(i1,i5,i15)
     st.last_conf_score=cs; st.last_mom_score=mom; st.last_ob=ob; st.last_liq=liq
+    # ✅ v10.13d — Cherche le marché AVANT Claude pour avoir le vrai payout
     tu=0.5; td=0.5
     if not st.paper_mode and poly.ready:
         m=await poly.find_btc_5min_market()
-        if m: tu=await poly.get_token_price(m["token_up"]); td=await poly.get_token_price(m["token_down"])
+        if m:
+            tu=await poly.get_token_price(m["token_up"])
+            td=await poly.get_token_price(m["token_down"])
+            st.current_market=m
     d=await claude_decide(i1,i5,i15,i1h,i4h,adv,st.trades[-15:],st.bankroll,st.consec,
                           st.fg,st.btc24,sess,cs,mom,tu,td,ob,liq,eth_desc)
     st.last_decision=d
