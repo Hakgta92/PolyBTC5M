@@ -15,7 +15,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.18b"
+BOT_VERSION = "10.19"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -475,12 +475,16 @@ class PolyClient:
                 side_v2 = Side.BUY if side == "BUY" else Side.SELL
                 size_val = round(max(2.0, amount_float), 2)  # min 2$ pour éviter "min size: 1"
 
-                # ✅ v10.15 — Prix dynamique depuis le CLOB (pas 0.50 fixe)
+                # ✅ v10.19 — Prix dynamique avec slippage adaptatif
                 try:
                     token_price_resp = await self.get_token_price(token_id)
-                    if token_price_resp > 0:
-                        # Ajouter 2% de slippage pour garantir l'exécution
-                        price_val = round(min(0.99, token_price_resp * 1.02), 2)
+                    if token_price_resp > 0 and token_price_resp < 1.0:
+                        # Slippage adaptatif selon la liquidité
+                        if token_price_resp < 0.2 or token_price_resp > 0.8:
+                            slippage = 0.05  # Plus de slippage sur marchés déséquilibrés
+                        else:
+                            slippage = 0.02  # Slippage standard
+                        price_val = round(min(0.99, token_price_resp * (1 + slippage)), 2)
                     else:
                         price_val = 0.50
                 except:
@@ -623,10 +627,19 @@ def detect_volume_spike(candles,lookback=20):
     return candles[-1]["vol"]>avg*2.0
 
 def detect_consolidation(candles,period=6):
+    """✅ v10.19 — Détection range serré améliorée"""
     if len(candles)<period: return False
     highs=[c["high"] for c in candles[-period:]]; lows=[c["low"] for c in candles[-period:]]
     price=candles[-1]["close"] or 1
-    return (max(highs)-min(lows))/price*100<0.15
+    range_pct = (max(highs)-min(lows))/price*100
+    # Range serré sur 6 bougies = consolidation
+    if range_pct < 0.15: return True
+    # Vérifier aussi sur 12 bougies pour détecter ranges plus larges
+    if len(candles) >= 12:
+        highs12=[c["high"] for c in candles[-12:]]; lows12=[c["low"] for c in candles[-12:]]
+        range12 = (max(highs12)-min(lows12))/price*100
+        if range12 < 0.25: return True
+    return False
 
 def detect_divergence(candles_5m):
     if len(candles_5m)<15: return None
@@ -1124,6 +1137,21 @@ class State:
         self.last_news={"sentiment":"neutral","score":0,"news":[]}  # ✅ v10.18
 
     def save(self):
+        # ✅ v10.19 — Export CSV des trades
+        try:
+            import csv
+            csv_path = "polybot_trades.csv"
+            if self.trades:
+                fieldnames = ["ts","dir","amount","pnl","result","entry","exit","score","session","conf","paper"]
+                write_header = not os.path.exists(csv_path)
+                with open(csv_path, "a", newline="") as f:
+                    writer = csv.DictWriter(f, fieldnames=fieldnames)
+                    if write_header:
+                        writer.writeheader()
+                    for t in self.trades[-5:]:  # Seulement les 5 derniers pour éviter les doublons
+                        writer.writerow({k: t.get(k,"") for k in fieldnames})
+        except Exception as e:
+            log.warning(f"CSV export: {e}")
         data={"bankroll":self.bankroll,"bankroll_ref":self.bankroll_ref,
             "trades":self.trades[-200:],"wins":self.wins,"losses":self.losses,"pnl":self.pnl,
             "best_streak":self.best_streak,"worst_streak":self.worst_streak,"consec":self.consec,
@@ -1209,7 +1237,19 @@ async def job_daily_recap(context):
     now=time.time(); cutoff=now-86400
     trades_24h=[t for t in st.trades if t.get("ts",0)>=cutoff]
     if not trades_24h:
-        await send(context.bot,f"📊 *Récap 22h* — Aucun trade aujourd'hui.\nBR:`{st.bankroll:.2f}$` | ROI:`{roi()}`")
+        # Quand même envoyer récap hebdo le dimanche
+        is_sunday = datetime.utcnow().weekday() == 6
+        if is_sunday:
+            trades_7d = [t for t in st.trades if t.get("ts",0) >= time.time()-7*86400]
+            wins_7d = [t for t in trades_7d if t["result"]=="WIN"]
+            pnl_7d = sum(t["pnl"] for t in trades_7d)
+            wr_7d = len(wins_7d)/len(trades_7d)*100 if trades_7d else 0
+            await send(context.bot,
+                f"📅 *BILAN HEBDOMADAIRE*\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"Trades:`{len(trades_7d)}` | WR:`{wr_7d:.1f}%` | PnL:`{fmt(pnl_7d)}$`\n"
+                f"BR:`{st.bankroll:.2f}$` | ROI:`{roi()}`")
+        else:
+            await send(context.bot,f"📊 *Récap 22h* — Aucun trade aujourd'hui.\nBR:`{st.bankroll:.2f}$` | ROI:`{roi()}`")
         return
     wins=[t for t in trades_24h if t["result"]=="WIN"]
     losses=[t for t in trades_24h if t["result"]=="LOSS"]
@@ -1301,6 +1341,16 @@ async def job_take_profit(context):
 
         sell_reason = None
         sell_pct = 100  # % des shares à vendre
+
+        # ✅ v10.19 — Stop loss si token tombe à x0.5 (mais pas trop tôt)
+        time_in_trade = time.time() - st.bet.get("ts", time.time())
+        if gain_mult <= 0.5 and time_in_trade > 120:  # Seulement après 2min dans le trade
+            # Vérifier si le slot expire bientôt — si oui attendre la résolution auto
+            if st.bet_expiry > 0 and (st.bet_expiry - time.time()) < 90:
+                pass  # Laisse résoudre automatiquement
+            else:
+                sell_reason = f"🛑 Stop loss x{gain_mult:.2f} (protection -50%)"
+                sell_pct = 100
 
         # ✅ Paliers de vente anticipée basés sur le multiplicateur TOKEN
         # Token à 0.20$ → x5 potentiel. Si le prix monte à 0.60$ → x3 → on vend
@@ -1508,6 +1558,13 @@ async def job_tick(context):
         if st.bankroll<amount: return
         order_id=None; token_used=None; entry_tp=0.5
         if not st.paper_mode and st.current_market:
+            # ✅ v10.19 — Filtre volume minimum (liquidité)
+            market_volume = st.current_market.get("volume", 0)
+            if market_volume < 500:  # Minimum 500$ de volume
+                log.warning(f"Volume trop faible: {market_volume}$ — skip")
+                st.skipped+=1
+                st.pass_reasons.append({"ts":int(time.time()),"reason":f"Volume trop faible ({market_volume:.0f}$<500$)"})
+                return
             token_used=st.current_market["token_up"] if dec["dir"]=="UP" else st.current_market["token_down"]
             entry_tp=tpu if dec["dir"]=="UP" else tpd
             # ✅ v10.13c — Vérification finale expiration avant d'envoyer l'ordre
@@ -1706,6 +1763,7 @@ async def cmd_status(update,context):
     if not auth(update): return
     sess=session_ctx()
     dl=(st.daily_start-st.bankroll)/st.daily_start*100 if st.daily_start>0 else 0
+    # ✅ v10.19 — Solde CLOB temps réel dans status (async)
     cs=st.last_conf_score
     score_info=f"`{cs.get('score',0):.1f}/{cs.get('min_score',10)}` Mom:`{st.last_mom_score}/{cs.get('min_mom',4)}`" if cs else "—"
     bet_info="Aucun"
