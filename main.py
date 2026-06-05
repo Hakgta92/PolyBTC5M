@@ -15,7 +15,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.17"
+BOT_VERSION = "10.18"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -849,11 +849,32 @@ def trades_last_hour(trades):
     now=time.time(); return sum(1 for t in trades if now-t.get("ts",0)<3600)
 
 def pattern_mem(trades):
+    """✅ v10.18 — Mémoire patterns par direction ET par session"""
     if len(trades)<5: return "Moins de 5 trades."
     up_t=[t for t in trades if t["dir"]=="UP"]; dn_t=[t for t in trades if t["dir"]=="DOWN"]
     up_wr=sum(1 for t in up_t if t["result"]=="WIN")/len(up_t)*100 if up_t else 0
     dn_wr=sum(1 for t in dn_t if t["result"]=="WIN")/len(dn_t)*100 if dn_t else 0
-    return f"UP:{up_wr:.0f}%({len(up_t)}) DOWN:{dn_wr:.0f}%({len(dn_t)})"
+    # Pattern par session (30 derniers trades)
+    recent=trades[-30:]
+    sessions={}
+    for t in recent:
+        s=t.get("session","?")
+        if s not in sessions: sessions[s]={"w":0,"l":0}
+        if t["result"]=="WIN": sessions[s]["w"]+=1
+        else: sessions[s]["l"]+=1
+    # Trouver meilleure et pire session
+    best_sess=worst_sess=""
+    best_wr=0; worst_wr=100
+    for s,v in sessions.items():
+        total=v["w"]+v["l"]
+        if total>=2:
+            wr=v["w"]/total*100
+            if wr>best_wr: best_wr=wr; best_sess=s
+            if wr<worst_wr: worst_wr=wr; worst_sess=s
+    sess_info=""
+    if best_sess: sess_info=f" | Best:{best_sess}({best_wr:.0f}%)"
+    if worst_sess and worst_sess!=best_sess: sess_info+=f" Worst:{worst_sess}({worst_wr:.0f}%)"
+    return f"UP:{up_wr:.0f}%({len(up_t)}) DOWN:{dn_wr:.0f}%({len(dn_t)}){sess_info}"
 
 def is_trending(c5,c15):
     if len(c5)<12: return False
@@ -938,6 +959,58 @@ async def fetch_fear_greed():
     except: pass
     return {"value":50,"label":"Neutral"}
 
+async def fetch_btc_news():
+    """
+    ✅ v10.18 — News BTC en temps réel via CryptoPanic (gratuit, pas de clé)
+    Détecte les news importantes qui peuvent causer un spike de volatilité
+    """
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(
+                "https://cryptopanic.com/api/free/v1/posts/",
+                params={"auth_token":"free","currencies":"BTC","filter":"hot","public":"true"},
+                timeout=aiohttp.ClientTimeout(total=8)
+            ) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    results = data.get("results", [])
+                    if not results:
+                        return {"sentiment": "neutral", "score": 0, "news": []}
+                    # Analyser le sentiment des dernières news
+                    positive_words = ["bull", "surge", "rally", "pump", "ath", "break", "high", "gain", "up", "buy"]
+                    negative_words = ["bear", "crash", "dump", "fall", "low", "drop", "down", "sell", "fear", "ban"]
+                    pos = neg = 0
+                    recent_news = []
+                    for item in results[:5]:
+                        title = item.get("title", "").lower()
+                        votes = item.get("votes", {})
+                        bullish = votes.get("positive", 0)
+                        bearish = votes.get("negative", 0)
+                        pos += bullish
+                        neg += bearish
+                        for w in positive_words:
+                            if w in title: pos += 2
+                        for w in negative_words:
+                            if w in title: neg += 2
+                        recent_news.append(item.get("title", "")[:60])
+                    total = pos + neg
+                    if total == 0:
+                        sentiment = "neutral"
+                        score = 0
+                    elif pos > neg * 1.5:
+                        sentiment = "bullish"
+                        score = min(3, round((pos - neg) / max(total, 1) * 5, 1))
+                    elif neg > pos * 1.5:
+                        sentiment = "bearish"
+                        score = -min(3, round((neg - pos) / max(total, 1) * 5, 1))
+                    else:
+                        sentiment = "neutral"
+                        score = 0
+                    return {"sentiment": sentiment, "score": score, "news": recent_news[:3]}
+    except Exception as e:
+        log.warning(f"fetch_btc_news: {e}")
+    return {"sentiment": "neutral", "score": 0, "news": []}
+
 async def fetch_btc_24h():
     try:
         async with aiohttp.ClientSession() as s:
@@ -964,8 +1037,12 @@ async def claude_decide(i1,i5,i15,i1h,i4h,adv,trades,bankroll,consec,fg,btc24,se
     min_score,min_diff,min_mom=get_session_thresholds(sess.get("session","OVERNIGHT"))
     ob_txt=ob["desc"] if ob else "OB N/A"
     liq_txt=liq["desc"] if liq else "Liq N/A"
+    # ✅ v10.18 — News et patterns dans le prompt
+    news_data=st.last_news if hasattr(st,'last_news') else {"sentiment":"neutral","score":0,"news":[]}
+    news_txt=f"News:{news_data['sentiment']}(score:{news_data['score']:+.1f})" if news_data['news'] else "News:N/A"
+    if news_data['news']: news_txt+=f" [{news_data['news'][0][:40]}...]"
     prompt=f"""Expert trading binaire BTC UP/DOWN 5min Polymarket. Bets RÉELS.
-BTC:${i5.get('price',0):,.2f} | 24h:{btc24.get('change_pct',0):+.2f}% | F&G:{fg['value']}/100 | {sess['session']} {h_paris}h
+BTC:${i5.get('price',0):,.2f} | 24h:{btc24.get('change_pct',0):+.2f}% | F&G:{fg['value']}/100 | {sess['session']} {h_paris}h | {news_txt}
 UP:{tpu:.3f}$→x{ppu}(Kelly≈{kelly_up:.2f}$) | DOWN:{tpd:.3f}$→x{ppd}(Kelly≈{kelly_dn:.2f}$)
 Score:{conf_score['direction']} {conf_score['score']:.1f}/{min_score} Diff:{conf_score['diff']}/{min_diff} Tradeable:{'OUI' if conf_score['tradeable'] else 'NON'}
 Mom:{mom_score}/10(seuil:{min_mom}) | ETH:{eth_desc} | {ob_txt} | {liq_txt}
@@ -1033,6 +1110,7 @@ class State:
         self.token_price_peak=0.0; self.trailing_active=False
         self.bet_expiry=0  # timestamp expiration du bet réel
         self.last_ob=None; self.last_liq=None; self.last_eth_klines=[]
+        self.last_news={"sentiment":"neutral","score":0,"news":[]}  # ✅ v10.18
 
     def save(self):
         data={"bankroll":self.bankroll,"bankroll_ref":self.bankroll_ref,
@@ -1255,6 +1333,8 @@ async def job_macro(context):
     try: st.last_liq=await fetch_liquidations()
     except: pass
     try: st.last_eth_klines=await fetch_eth_klines("5m",30)
+    except: pass
+    try: st.last_news=await fetch_btc_news()
     except: pass
 
 async def job_tick(context):
