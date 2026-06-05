@@ -15,7 +15,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.19d"
+BOT_VERSION = "10.19e"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -1646,7 +1646,7 @@ async def cmd_run(update,context):
     st.running=True; st.session_start=time.time(); st.daily_ts=time.time()
     st.price_job=context.job_queue.run_repeating(job_price,interval=30,first=5)
     st.macro_job=context.job_queue.run_repeating(job_macro,interval=300,first=8)
-    st.tick_job=context.job_queue.run_repeating(job_tick,interval=60,first=10)   # ✅ v10.13: 1min
+    st.tick_job=context.job_queue.run_repeating(job_tick,interval=30,first=10)   # ✅ v10.19e: 30s
     st.tp_job=context.job_queue.run_repeating(job_take_profit,interval=TAKE_PROFIT_CHECK,first=10)
     st.backup_job=context.job_queue.run_repeating(job_backup,interval=600,first=60)
     st.recap_job=context.job_queue.run_repeating(job_daily_recap,interval=3600,first=60)
