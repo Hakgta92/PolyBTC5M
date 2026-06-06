@@ -15,7 +15,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.19e"
+BOT_VERSION = "10.19f"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -1633,7 +1633,7 @@ async def cmd_start(update,context):
         f"*/run* */stop* */status* */signal* */score*\n"
         f"*/market* */balance* */trades* */recap* */dashboard*\n"
         f"*/setbalance 55.11* • */backup*",
-        parse_mode="Markdown",reply_markup=kb())
+        parse_mode="Markdown")
 
 async def cmd_run(update,context):
     if not auth(update): return
@@ -1799,7 +1799,7 @@ async def cmd_status(update,context):
         f"💰 BR:`{st.bankroll:.2f}$` | ROI:`{roi()}` | PnL:`{fmt(st.pnl)}`\n"
         f"📅 Perte jour:`{dl:.1f}%/{DAILY_LOSS_MAX*100:.0f}%`{pause_info}\n"
         f"🎲 Bet:`{bet_info}` | 🚫 Refusés:`{st.skipped}` | ⏱`{upt()}`",
-        parse_mode="Markdown",reply_markup=kb())
+        parse_mode="Markdown")
 
 async def cmd_balance(update,context):
     if not auth(update): return
