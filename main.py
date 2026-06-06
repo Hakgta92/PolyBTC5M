@@ -15,7 +15,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.20"
+BOT_VERSION = "10.20b"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -692,6 +692,20 @@ def detect_divergence(candles_5m):
     if closes[-1]>closes[-4]>closes[-7] and rsis[-1]<rsis[-4]<rsis[-7] and rsis[-1]>55: return "BEARISH"
     return None
 
+def detect_rsi_divergence_4h(candles_4h):
+    """✅ v10.20b — Divergence RSI sur 4h — signal fort de retournement"""
+    if len(candles_4h) < 10: return None
+    closes = [c["close"] for c in candles_4h[-10:]]
+    rsis = [rsi(closes[max(0,i-7):i+1]) for i in range(3, 10)]
+    if len(rsis) < 4: return None
+    # Divergence haussière: prix fait lower low mais RSI fait higher low
+    if closes[-1] < closes[-4] and rsis[-1] > rsis[-4] and rsis[-1] < 40:
+        return "BULLISH"
+    # Divergence baissière: prix fait higher high mais RSI fait lower high
+    if closes[-1] > closes[-4] and rsis[-1] < rsis[-4] and rsis[-1] > 60:
+        return "BEARISH"
+    return None
+
 def detect_engulfing(candles):
     if len(candles)<3: return None
     prev,curr=candles[-2],candles[-1]
@@ -742,8 +756,9 @@ def compute_ind(candles):
         "ema_bull":e9>e21,"ema_bull_strong":e9>e21 and e21>e50,"supports":sup,"resistances":res,
         "adx":adx_v,"pdi":pdi_v,"mdi":mdi_v}
 
-def compute_advanced_signals(candles_5m,candles_1m):
+def compute_advanced_signals(candles_5m,candles_1m,candles_4h=None):
     div=detect_divergence(candles_5m)
+    div_4h=detect_rsi_divergence_4h(candles_4h) if candles_4h else None
     eng=detect_engulfing(candles_5m[-3:]) if len(candles_5m)>=3 else None
     vb=detect_vwap_break(candles_5m)
     signals=[]; score=0
@@ -753,7 +768,10 @@ def compute_advanced_signals(candles_5m,candles_1m):
     elif eng=="BEARISH": signals.append("🕯️ Engulfing baissier"); score-=2
     if vb=="BULLISH": signals.append("📊 VWAP break ↑"); score+=1.5
     elif vb=="BEARISH": signals.append("📊 VWAP break ↓"); score-=1.5
-    return {"divergence":div,"engulfing":eng,"vwap_break":vb,"signals":signals,"score":score,
+    # Divergence 4h = signal très fort (+3)
+    if div_4h=="BULLISH": signals.append("🔄 Div RSI 4h haussière ⚡"); score+=3.0
+    elif div_4h=="BEARISH": signals.append("🔄 Div RSI 4h baissière ⚡"); score-=3.0
+    return {"divergence":div,"divergence_4h":div_4h,"engulfing":eng,"vwap_break":vb,"signals":signals,"score":score,
             "bias":"UP" if score>0 else "DOWN" if score<0 else None}
 
 # ✅ v10.16 — Watchdog: timestamp du dernier tick actif
@@ -974,6 +992,26 @@ def wr_by_session(trades, days=7):
         sessions[s]["pnl"]+=t["pnl"]
     return sessions
 
+def wr_by_hour(trades, days=30):
+    """✅ v10.20b — WR par heure Paris sur les N derniers jours"""
+    cutoff=time.time()-days*86400
+    recent=[t for t in trades if t.get("ts",0)>=cutoff]
+    hours={}
+    for t in recent:
+        h=(datetime.fromtimestamp(t["ts"]).hour+2)%24  # Heure Paris
+        if h not in hours: hours[h]={"w":0,"l":0}
+        if t["result"]=="WIN": hours[h]["w"]+=1
+        else: hours[h]["l"]+=1
+    # Trouver meilleure et pire heure
+    best_h=worst_h=None; best_wr=0; worst_wr=100
+    for h,v in hours.items():
+        total=v["w"]+v["l"]
+        if total>=3:
+            wr=v["w"]/total*100
+            if wr>best_wr: best_wr=wr; best_h=h
+            if wr<worst_wr: worst_wr=wr; worst_h=h
+    return hours, best_h, worst_h, best_wr, worst_wr
+
 async def fetch_clob_balance():
     """✅ v10.15c — Lit le solde réel depuis Polymarket CLOB V2"""
     if not poly.ready or poly.client_version != "v2":
@@ -1192,6 +1230,7 @@ class State:
         self.bet_expiry=0  # timestamp expiration du bet réel
         self.last_ob=None; self.last_liq=None; self.last_eth_klines=[]
         self.last_news={"sentiment":"neutral","score":0,"news":[]}  # ✅ v10.18
+        self.price_history=[]  # ✅ v10.20b historique prix pour détecter moves rapides
 
     def save(self):
         # ✅ v10.19 — Export CSV des trades
@@ -1477,7 +1516,13 @@ async def job_take_profit(context):
 async def job_price(context):
     p=await fetch_price()
     if p>0:
-        # ✅ v10.17 — Détection move brutal BTC
+        # ✅ v10.20b — Historique prix + détection moves rapides
+        now=time.time()
+        st.price_history.append({"price":p,"ts":now})
+        # Garder 10min d'historique
+        st.price_history=[x for x in st.price_history if now-x["ts"]<600]
+
+        # Move brutal en 30s
         if st.price>0 and not st.bet:
             move_pct = (p - st.price) / st.price * 100
             if abs(move_pct) >= 1.0:
@@ -1486,6 +1531,15 @@ async def job_price(context):
                     f"⚡ *Move BTC détecté*\n"
                     f"{direction} `{move_pct:+.2f}%` en ~30s\n"
                     f"₿`${p:,.2f}` | Lance `/signal` pour analyser")
+
+        # Move de 0.5% en 2min (120s)
+        prices_2min=[x for x in st.price_history if now-x["ts"]<=120]
+        if len(prices_2min)>=2 and not st.bet:
+            p_old=prices_2min[0]["price"]
+            move_2min=(p-p_old)/p_old*100 if p_old>0 else 0
+            if abs(move_2min)>=0.5 and abs(move_2min)<1.0:  # Entre 0.5% et 1% (le 1%+ est déjà couvert)
+                log.info(f"Move 2min: {move_2min:+.2f}%")
+                # Pas de notification pour éviter le spam, juste log
         st.price=p
 
 async def job_macro(context):
@@ -1577,7 +1631,7 @@ async def job_tick(context):
     i1h=compute_ind(list(st.c1h)); i4h=compute_ind(list(st.c4h)) if st.c4h else {}
     sess=session_ctx()
     if not i5: return
-    adv=compute_advanced_signals(list(st.c5),list(st.c1))
+    adv=compute_advanced_signals(list(st.c5),list(st.c1),list(st.c4h) if st.c4h else None)
     direction_guess="UP" if i5.get("ema_bull") else "DOWN"
     eth_bonus,eth_desc=compute_eth_correlation(st.last_eth_klines,direction_guess) if st.last_eth_klines else (0,"N/A")
     conf_score=compute_confluence_score(i1,i5,i15,i1h,i4h,st.fg,sess,adv,st.last_ob,st.last_liq,eth_bonus,eth_desc,st.btc24)
@@ -1932,7 +1986,7 @@ async def cmd_score(update,context):
     eth_klines=await fetch_eth_klines("5m",30)
     i1=compute_ind(list(st.c1)); i5=compute_ind(list(st.c5)); i15=compute_ind(list(st.c15))
     i1h=compute_ind(list(st.c1h)); i4h=compute_ind(list(st.c4h)) if st.c4h else {}
-    sess=session_ctx(); adv=compute_advanced_signals(list(st.c5),list(st.c1))
+    sess=session_ctx(); adv=compute_advanced_signals(list(st.c5),list(st.c1),list(st.c4h) if st.c4h else None)
     direction_guess="UP" if i5.get("ema_bull") else "DOWN"
     eth_bonus,eth_desc=compute_eth_correlation(eth_klines,direction_guess) if eth_klines else (0,"ETH N/A")
     cs=compute_confluence_score(i1,i5,i15,i1h,i4h,st.fg,sess,adv,ob,liq,eth_bonus,eth_desc,st.btc24)
@@ -1976,7 +2030,7 @@ async def cmd_signal(update,context):
     st.last_eth_klines=eth_klines  # ✅ Met à jour le cache
     i1=compute_ind(list(st.c1)); i5=compute_ind(list(st.c5)); i15=compute_ind(list(st.c15))
     i1h=compute_ind(list(st.c1h)); i4h=compute_ind(list(st.c4h)) if st.c4h else {}
-    sess=session_ctx(); adv=compute_advanced_signals(list(st.c5),list(st.c1))
+    sess=session_ctx(); adv=compute_advanced_signals(list(st.c5),list(st.c1),list(st.c4h) if st.c4h else None)
     direction_guess="UP" if i5.get("ema_bull") else "DOWN"
     eth_bonus,eth_desc=compute_eth_correlation(eth_klines,direction_guess) if eth_klines else (0,"ETH N/A")
     cs=compute_confluence_score(i1,i5,i15,i1h,i4h,st.fg,sess,adv,ob,liq,eth_bonus,eth_desc,st.btc24)
@@ -2101,13 +2155,20 @@ async def cmd_stats(update,context):
         wr_s=round(v["w"]/tot*100) if tot>0 else 0
         pnl_s=round(v["pnl"],2)
         sess_txt+=f"\n  `{s}`: {wr_s}% ({v['w']}W/{v['l']}L) `{fmt(pnl_s)}$`"
+    # Meilleure/pire heure
+    hours_data, best_h, worst_h, best_wr_h, worst_wr_h = wr_by_hour(st.trades)
+    hour_txt = ""
+    if best_h is not None:
+        hour_txt = f"\n⏰ Meilleure heure: `{best_h}h` Paris (`{best_wr_h:.0f}%`)"
+    if worst_h is not None and worst_h != best_h:
+        hour_txt += f" | Pire: `{worst_h}h` (`{worst_wr_h:.0f}%`)"
     await update.message.reply_text(
         f"📉 *STATS v{BOT_VERSION}*\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"Total:`{total}` (✅{st.wins} ❌{st.losses})\nWR:`{wr()}` | ROI:`{roi()}` | R:R:`{rr:.2f}`\n"
         f"PnL:`{fmt(st.pnl)}$` | BR:`{st.bankroll:.2f}$`\n\n"
         f"💰 Réels:`{len(real_t)}` WR:`{real_wr:.0f}%`\n"
         f"Gain moy:`+{aw:.2f}$` | Perte moy:`-{al:.2f}$`\n\n"
-        f"📊 WR par session (7j):{sess_txt or ' Pas assez de données'}\n\n"
+        f"📊 WR par session (7j):{sess_txt or ' Pas assez de données'}{hour_txt}\n\n"
         f"💡 `/recap` 24h | `/dashboard` HTML",
         parse_mode="Markdown")
 
