@@ -15,7 +15,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.20e"
+BOT_VERSION = "10.20f"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -1639,15 +1639,47 @@ async def job_tick(context):
     st.last_conf_score=conf_score; st.last_mom_score=mom_score
     _,_,min_mom=get_session_thresholds(sess.get("session","OVERNIGHT"), conf_score.get("score",0))
     if not conf_score["tradeable"]:
-        st.skipped+=1
-        # Message précis selon la vraie raison
-        if conf_score["score"] < conf_score["min_score"]:
-            reason = f"Score {conf_score['score']:.1f}<{conf_score['min_score']}"
-        elif conf_score["diff"] < conf_score["min_diff"]:
-            reason = f"Diff {conf_score['diff']:.1f}<{conf_score['min_diff']} (UP:{conf_score['score_up']:.1f} DN:{conf_score['score_dn']:.1f})"
+        # ✅ v10.20f — Retry rapide si score proche du seuil (dans les 2 points)
+        score_gap = conf_score["min_score"] - conf_score["score"]
+        diff_gap = conf_score["min_diff"] - conf_score["diff"]
+        slot_remaining_now = 300 - (time.time() % 300)
+        
+        if (score_gap <= 2 or diff_gap <= 1) and slot_remaining_now > 150:
+            # Score presque bon — refetcher les klines 10s plus tard
+            await asyncio.sleep(10)
+            c1=await fetch_klines("1m",60); c5=await fetch_klines("5m",50)
+            c15=await fetch_klines("15m",40); c1h=await fetch_klines("1h",30); c4h=await fetch_klines("4h",20)
+            if c5:
+                st.c1=deque(c1,maxlen=100); st.c5=deque(c5,maxlen=100)
+                st.c15=deque(c15,maxlen=100); st.c1h=deque(c1h,maxlen=100)
+                st.c4h=deque(c4h,maxlen=50); st.price=c5[-1]["close"]
+                i1=compute_ind(list(st.c1)); i5=compute_ind(list(st.c5))
+                i15=compute_ind(list(st.c15)); i1h=compute_ind(list(st.c1h))
+                i4h=compute_ind(list(st.c4h)) if st.c4h else {}
+                adv=compute_advanced_signals(list(st.c5),list(st.c1),list(st.c4h) if st.c4h else None)
+                eth_bonus2,eth_desc2=compute_eth_correlation(st.last_eth_klines,direction_guess) if st.last_eth_klines else (0,"N/A")
+                conf_score2=compute_confluence_score(i1,i5,i15,i1h,i4h,st.fg,sess,adv,st.last_ob,st.last_liq,eth_bonus2,eth_desc2,st.btc24)
+                mom_score2=compute_momentum_score(i1,i5,i15)
+                if conf_score2["tradeable"] and mom_score2>=min_mom:
+                    log.info(f"✅ Retry réussi — score {conf_score2['score']:.1f} mom {mom_score2}")
+                    conf_score=conf_score2; mom_score=mom_score2; eth_desc=eth_desc2
+                    # Continuer avec les nouvelles données
+                else:
+                    st.skipped+=1
+                    reason = f"Score {conf_score2['score']:.1f}<{conf_score2['min_score']} (après retry)"
+                    st.pass_reasons.append({"ts":int(time.time()),"reason":reason}); return
+            else:
+                st.skipped+=1; return
         else:
-            reason = f"Tradeable=NON score:{conf_score['score']:.1f} diff:{conf_score['diff']:.1f}"
-        st.pass_reasons.append({"ts":int(time.time()),"reason":reason}); return
+            st.skipped+=1
+            # Message précis selon la vraie raison
+            if conf_score["score"] < conf_score["min_score"]:
+                reason = f"Score {conf_score['score']:.1f}<{conf_score['min_score']}"
+            elif conf_score["diff"] < conf_score["min_diff"]:
+                reason = f"Diff {conf_score['diff']:.1f}<{conf_score['min_diff']} (UP:{conf_score['score_up']:.1f} DN:{conf_score['score_dn']:.1f})"
+            else:
+                reason = f"Tradeable=NON score:{conf_score['score']:.1f} diff:{conf_score['diff']:.1f}"
+            st.pass_reasons.append({"ts":int(time.time()),"reason":reason}); return
     if mom_score<min_mom:
         st.skipped+=1; st.pass_reasons.append({"ts":int(time.time()),"reason":f"Mom {mom_score}<{min_mom}"}); return
     if i5.get("atr_pct",0)<0.03: st.skipped+=1; return
