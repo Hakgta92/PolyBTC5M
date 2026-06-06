@@ -15,7 +15,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.20d"
+BOT_VERSION = "10.20e"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -1653,11 +1653,9 @@ async def job_tick(context):
     if i5.get("atr_pct",0)<0.03: st.skipped+=1; return
     if i5.get("vol_ratio",1)<0.4: st.skipped+=1; return
     # ✅ v10.20 — Filtre ADX: éviter les marchés sans tendance
+    # ADX gardé comme info dans le score mais pas comme filtre bloquant
     adx_val = i5.get("adx", 20)
-    if adx_val < 12:  # Marché en range très serré = éviter
-        st.skipped+=1
-        st.pass_reasons.append({"ts":int(time.time()),"reason":f"ADX trop faible ({adx_val:.0f}<12) = range"})
-        return
+    log.debug(f"ADX: {adx_val}")
     tpu=0.5; tpd=0.5; market_end=0
     if not st.paper_mode:
         market=await poly.find_btc_5min_market()
