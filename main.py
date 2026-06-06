@@ -15,7 +15,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.20b"
+BOT_VERSION = "10.20c"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -1654,9 +1654,9 @@ async def job_tick(context):
     if i5.get("vol_ratio",1)<0.4: st.skipped+=1; return
     # ✅ v10.20 — Filtre ADX: éviter les marchés sans tendance
     adx_val = i5.get("adx", 20)
-    if adx_val < 15:  # Marché en range serré = éviter
+    if adx_val < 12:  # Marché en range très serré = éviter
         st.skipped+=1
-        st.pass_reasons.append({"ts":int(time.time()),"reason":f"ADX trop faible ({adx_val:.0f}<15) = range"})
+        st.pass_reasons.append({"ts":int(time.time()),"reason":f"ADX trop faible ({adx_val:.0f}<12) = range"})
         return
     tpu=0.5; tpd=0.5; market_end=0
     if not st.paper_mode:
@@ -1693,13 +1693,6 @@ async def job_tick(context):
         if st.bankroll<amount: return
         order_id=None; token_used=None; entry_tp=0.5
         if not st.paper_mode and st.current_market:
-            # ✅ v10.19 — Filtre volume minimum (liquidité)
-            market_volume = st.current_market.get("volume", 0)
-            if market_volume < 500:  # Minimum 500$ de volume
-                log.warning(f"Volume trop faible: {market_volume}$ — skip")
-                st.skipped+=1
-                st.pass_reasons.append({"ts":int(time.time()),"reason":f"Volume trop faible ({market_volume:.0f}$<500$)"})
-                return
             token_used=st.current_market["token_up"] if dec["dir"]=="UP" else st.current_market["token_down"]
             entry_tp=tpu if dec["dir"]=="UP" else tpd
             # ✅ v10.13c — Vérification finale expiration avant d'envoyer l'ordre
