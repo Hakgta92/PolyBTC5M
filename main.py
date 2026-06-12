@@ -15,7 +15,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.21b"
+BOT_VERSION = "10.21c"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -1631,13 +1631,18 @@ def realized_vol():
     var = sum((r - m) ** 2 for r in rets) / len(rets)
     return math.sqrt(var)
 
+VOL_SAFETY = 1.5   # ✅ v10.21c — Marge sur σ: BTC a des sauts que le Brownien sous-estime
+P_CAP      = 0.95  # ✅ v10.21c — Jamais plus confiant que 95% (15-20% des slots flippent en fin)
+
 def fair_prob_up(delta_pct, t_remaining_s, sigma):
     """P(BTC finit UP) — modèle Brownien: N(delta / (sigma * √T))
-    Même principe que Black-Scholes binaire (bot référence: 86% de précision)"""
+    σ gonflé de 50% (calibration: le bot référence a dû doubler son paramètre vol)
+    et probabilité plafonnée à 95% (jamais de certitude sur 5min)"""
     if t_remaining_s <= 0: return 1.0 if delta_pct > 0 else 0.0
     if sigma <= 0: return 0.5
-    z = delta_pct / (sigma * math.sqrt(t_remaining_s))
-    return 0.5 * (1.0 + math.erf(z / math.sqrt(2)))
+    z = delta_pct / (sigma * VOL_SAFETY * math.sqrt(t_remaining_s))
+    p = 0.5 * (1.0 + math.erf(z / math.sqrt(2)))
+    return max(1.0 - P_CAP, min(P_CAP, p))
 
 async def job_price(context):
     p=await fetch_price()
