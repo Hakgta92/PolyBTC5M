@@ -15,7 +15,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.20f"
+BOT_VERSION = "10.20g"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -812,22 +812,36 @@ def get_session_thresholds(session_name, score=0):
         min_mom = max(2, min_mom - 1)
     return min_score, min_diff, min_mom
 
-def compute_confluence_score(i1,i5,i15,i1h,i4h,fg,sess,adv,ob=None,liq=None,eth_bonus=0,eth_desc="",btc24=None):
+def compute_confluence_score(i1,i5,i15,i1h,i4h,fg,sess,adv,ob=None,liq=None,eth_bonus=0,eth_desc="",btc24=None,window_delta=0.0,window_delta_pct=0.0):
     up=0.0; dn=0.0; signals=[]
-    if i4h:
-        if i4h.get("ema_bull"): up+=2.0; signals.append("4h EMA ↑")
-        else: dn+=2.0; signals.append("4h EMA ↓")
-        r4=i4h.get("rsi_14",50)
-        if r4>55: up+=0.5
-        elif r4<45: dn+=0.5
-    if i15.get("ema_bull"): up+=2.0; signals.append("15m EMA ↑")
-    else: dn+=2.0; signals.append("15m EMA ↓")
-    if i1h.get("ema_bull"): up+=1.5; signals.append("1h EMA ↑")
-    else: dn+=1.5; signals.append("1h EMA ↓")
+
+    # ✅ v10.20g — WINDOW DELTA: signal dominant (poids x6)
+    # C'est le seul signal qui répond directement à la question du marché
+    if window_delta > 0:
+        up += abs(window_delta)
+        signals.append(f"📈 Window delta +{window_delta_pct:+.3f}% (score +{abs(window_delta):.0f})")
+    elif window_delta < 0:
+        dn += abs(window_delta)
+        signals.append(f"📉 Window delta {window_delta_pct:+.3f}% (score +{abs(window_delta):.0f})")
+    else:
+        signals.append(f"↔️ Window delta ~0% (indécis)")
+
+    # EMA 5m et 1m (utiles sur court terme, gardés à poids réduit)
     if i5.get("ema_bull"): up+=1.0; signals.append("5m EMA ↑")
     else: dn+=1.0; signals.append("5m EMA ↓")
     if i1.get("ema_bull"): up+=0.5
     else: dn+=0.5
+
+    # EMA 15m (gardé à poids réduit — moins de bruit que 1h/4h)
+    if i15.get("ema_bull"): up+=1.0; signals.append("15m EMA ↑")
+    else: dn+=1.0; signals.append("15m EMA ↓")
+
+    # EMA 1h et 4h — poids réduit car trop lents pour 5min
+    if i1h.get("ema_bull"): up+=0.5; signals.append("1h EMA ↑")
+    else: dn+=0.5; signals.append("1h EMA ↓")
+    if i4h:
+        if i4h.get("ema_bull"): up+=0.5; signals.append("4h EMA ↑")
+        else: dn+=0.5; signals.append("4h EMA ↓")
     s9=i5.get("slope_e9",0)
     if s9>0.03: up+=1.0; signals.append(f"EMA slope ↑ ({s9:+.3f}%)")
     elif s9<-0.03: dn+=1.0; signals.append(f"EMA slope ↓ ({s9:+.3f}%)")
@@ -1221,6 +1235,8 @@ class State:
         self.turbo_until=0  # ✅ v10.17 Mode turbo timestamp
         self.conservative_until=0  # ✅ v10.20 Mode conservateur après pertes
         self.win_streak_count=0  # ✅ v10.20 Compteur wins consécutifs
+        self.window_delta_pct=0.0  # ✅ v10.20g Window delta BTC depuis début slot
+        self.window_delta=0.0
         self.last_decision={}; self.last_conf_score={}; self.last_mom_score=0
         self.fg={"value":50,"label":"Neutral"}; self.btc24={}
         self.tick_job=self.price_job=self.macro_job=self.tp_job=self.backup_job=self.recap_job=None
@@ -1563,12 +1579,15 @@ async def job_tick(context):
     slot_pos = now_ts % 300  # Position dans le slot actuel (0-299 secondes)
     slot_remaining = 300 - slot_pos  # Temps restant dans ce slot
 
-    # Skip si on est trop loin dans le slot (< 120s restantes = trop tard pour placer)
-    # La séquence analyse+Claude+ordre prend ~10-15s, 120s de marge = sécurité
-    if slot_remaining < 120:
+    # ✅ v10.20g — Entrer à T-30s à T-60s avant la fin du slot (sweet spot optimal)
+    # Trop tôt (T-150s+) = direction pas encore claire, token pas cher mais trop incertain
+    # T-30s à T-60s = direction BTC quasi lockée, bon ratio précision/payout
+    # T-10s = trop tard pour placer l'ordre blockchain (latence 2-5s)
+    if slot_remaining < 35:  # Trop tard — moins de 35s restantes
         return
-
-    # Skip si on est en tout début de slot (< 15s = marché pas encore ouvert)
+    if slot_remaining > 90:  # Trop tôt — plus de 90s restantes, attendre
+        return
+    # Skip si tout début du slot
     if slot_pos < 15:
         return
 
@@ -1584,6 +1603,34 @@ async def job_tick(context):
     c1=await fetch_klines("1m",60); c5=await fetch_klines("5m",50)
     c15=await fetch_klines("15m",40); c1h=await fetch_klines("1h",30); c4h=await fetch_klines("4h",20)
     if not c5: return
+
+    # ✅ v10.20g — WINDOW DELTA: signal dominant
+    # Prix BTC au début du slot actuel (il y a slot_pos secondes)
+    now_price = c5[-1]["close"] if c5 else 0
+    # Le slot a commencé il y a slot_pos secondes
+    # On cherche le prix au début du slot dans les klines 1min
+    slot_open_price = 0
+    slot_open_minutes = int(slot_pos / 60) + 1  # Combien de bougies 1min depuis le début du slot
+    if c1 and len(c1) >= slot_open_minutes:
+        slot_open_price = c1[-slot_open_minutes]["open"]
+    elif c5 and len(c5) >= 1:
+        slot_open_price = c5[-1]["open"]  # Fallback: ouverture de la bougie 5min actuelle
+    
+    window_delta = 0.0
+    window_delta_pct = 0.0
+    if slot_open_price > 0 and now_price > 0:
+        window_delta_pct = (now_price - slot_open_price) / slot_open_price * 100
+        # Poids x6 sur le window delta selon les meilleures pratiques
+        if window_delta_pct > 0.15: window_delta = 6.0    # Direction très claire UP
+        elif window_delta_pct > 0.05: window_delta = 4.0  # Direction claire UP
+        elif window_delta_pct > 0.01: window_delta = 2.0  # Légère tendance UP
+        elif window_delta_pct < -0.15: window_delta = -6.0  # Direction très claire DOWN
+        elif window_delta_pct < -0.05: window_delta = -4.0  # Direction claire DOWN
+        elif window_delta_pct < -0.01: window_delta = -2.0  # Légère tendance DOWN
+    
+    st.window_delta_pct = window_delta_pct
+    st.window_delta = window_delta
+    log.info(f"Window delta: {window_delta_pct:+.3f}% → score {window_delta:+.1f}")
     st.c1=deque(c1,maxlen=100); st.c5=deque(c5,maxlen=100); st.c15=deque(c15,maxlen=100)
     st.c1h=deque(c1h,maxlen=100); st.c4h=deque(c4h,maxlen=50); st.price=c5[-1]["close"]
     if trades_last_hour(st.trades)>=MAX_TRADES_PER_H: return
@@ -1634,7 +1681,7 @@ async def job_tick(context):
     adv=compute_advanced_signals(list(st.c5),list(st.c1),list(st.c4h) if st.c4h else None)
     direction_guess="UP" if i5.get("ema_bull") else "DOWN"
     eth_bonus,eth_desc=compute_eth_correlation(st.last_eth_klines,direction_guess) if st.last_eth_klines else (0,"N/A")
-    conf_score=compute_confluence_score(i1,i5,i15,i1h,i4h,st.fg,sess,adv,st.last_ob,st.last_liq,eth_bonus,eth_desc,st.btc24)
+    conf_score=compute_confluence_score(i1,i5,i15,i1h,i4h,st.fg,sess,adv,st.last_ob,st.last_liq,eth_bonus,eth_desc,st.btc24,st.window_delta,st.window_delta_pct)
     mom_score=compute_momentum_score(i1,i5,i15)
     st.last_conf_score=conf_score; st.last_mom_score=mom_score
     _,_,min_mom=get_session_thresholds(sess.get("session","OVERNIGHT"), conf_score.get("score",0))
@@ -1713,11 +1760,17 @@ async def job_tick(context):
         st.skipped+=1
         st.pass_reasons.append({"ts":int(time.time()),"reason":f"Payout {best_payout:.2f}<1.3 (skip Claude)"})
         return
-    # ✅ v10.20d — Payout MAX: token < 0.20$ = marché trop déséquilibré (>80% contre toi)
+    # ✅ v10.20g — Zone token optimale: 0.40$ à 0.88$
+    # < 0.40$ = marché trop déséquilibré (>60% contre toi)
+    # > 0.88$ = quasi résolu, plus de marge de profit
     token_price_dir = tpu if conf_score["direction"]=="UP" else tpd
-    if token_price_dir < 0.20 and not st.paper_mode:
+    if token_price_dir < 0.40 and not st.paper_mode:
         st.skipped+=1
-        st.pass_reasons.append({"ts":int(time.time()),"reason":f"Token trop bas ({token_price_dir:.2f}$<0.20$) = payout x{best_payout:.1f} trop risqué"})
+        st.pass_reasons.append({"ts":int(time.time()),"reason":f"Token trop bas ({token_price_dir:.2f}$<0.40$) = risque trop élevé"})
+        return
+    if token_price_dir > 0.88 and not st.paper_mode:
+        st.skipped+=1
+        st.pass_reasons.append({"ts":int(time.time()),"reason":f"Token trop haut ({token_price_dir:.2f}$>0.88$) = plus de marge profit"})
         return
     dec=await claude_decide(i1,i5,i15,i1h,i4h,adv,st.trades[-15:],st.bankroll,st.consec,
                             st.fg,st.btc24,sess,conf_score,mom_score,tpu,tpd,st.last_ob,st.last_liq,eth_desc)
@@ -2018,7 +2071,7 @@ async def cmd_score(update,context):
     sess=session_ctx(); adv=compute_advanced_signals(list(st.c5),list(st.c1),list(st.c4h) if st.c4h else None)
     direction_guess="UP" if i5.get("ema_bull") else "DOWN"
     eth_bonus,eth_desc=compute_eth_correlation(eth_klines,direction_guess) if eth_klines else (0,"ETH N/A")
-    cs=compute_confluence_score(i1,i5,i15,i1h,i4h,st.fg,sess,adv,ob,liq,eth_bonus,eth_desc,st.btc24)
+    cs=compute_confluence_score(i1,i5,i15,i1h,i4h,st.fg,sess,adv,ob,liq,eth_bonus,eth_desc,st.btc24,st.window_delta,st.window_delta_pct)
     mom=compute_momentum_score(i1,i5,i15)
     st.last_conf_score=cs; st.last_mom_score=mom; st.last_ob=ob; st.last_liq=liq
     st.last_eth_klines=eth_klines  # ✅ Cache
@@ -2062,7 +2115,7 @@ async def cmd_signal(update,context):
     sess=session_ctx(); adv=compute_advanced_signals(list(st.c5),list(st.c1),list(st.c4h) if st.c4h else None)
     direction_guess="UP" if i5.get("ema_bull") else "DOWN"
     eth_bonus,eth_desc=compute_eth_correlation(eth_klines,direction_guess) if eth_klines else (0,"ETH N/A")
-    cs=compute_confluence_score(i1,i5,i15,i1h,i4h,st.fg,sess,adv,ob,liq,eth_bonus,eth_desc,st.btc24)
+    cs=compute_confluence_score(i1,i5,i15,i1h,i4h,st.fg,sess,adv,ob,liq,eth_bonus,eth_desc,st.btc24,st.window_delta,st.window_delta_pct)
     mom=compute_momentum_score(i1,i5,i15)
     st.last_conf_score=cs; st.last_mom_score=mom; st.last_ob=ob; st.last_liq=liq
     # ✅ v10.13f — Cherche le marché, fallback sur le cache du dernier tick
