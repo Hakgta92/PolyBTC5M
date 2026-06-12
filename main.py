@@ -15,7 +15,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.21"
+BOT_VERSION = "10.21b"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -1915,8 +1915,12 @@ async def job_tick(context):
     # P(direction) calculée mathématiquement vs prix du token = Expected Value réelle
     sigma = realized_vol()
     t_rem = 300 - (time.time() % 300)
+    # Delta temps réel au moment exact du gate (le tick peut dater de quelques secondes)
+    delta_gate = st.window_delta_pct
+    if st.ws_price > 0 and st.slot_open_price > 0 and st.slot_open_ts == int(time.time() // 300) * 300:
+        delta_gate = (st.ws_price - st.slot_open_price) / st.slot_open_price * 100
     if sigma > 0:
-        p_up = fair_prob_up(st.window_delta_pct, t_rem, sigma)
+        p_up = fair_prob_up(delta_gate, t_rem, sigma)
         p_dir = p_up if conf_score["direction"] == "UP" else 1.0 - p_up
         ev = p_dir - token_price_dir
         st.last_fair = {"p_up": round(p_up,3), "sigma": round(sigma,4), "ev": round(ev,3), "t_rem": int(t_rem)}
@@ -2467,12 +2471,14 @@ async def cmd_fair(update,context):
     if not st.ws_connected or sigma <= 0:
         await update.message.reply_text("⏳ WebSocket Binance pas encore prêt — relance dans 1min.")
         return
-    p_up = fair_prob_up(st.window_delta_pct, t_rem, sigma)
     cur = st.ws_price
+    # ✅ Delta calculé en temps réel (pas celui du dernier tick)
+    delta_live = (cur - st.slot_open_price) / st.slot_open_price * 100 if st.slot_open_price > 0 else 0.0
+    p_up = fair_prob_up(delta_live, t_rem, sigma)
     await update.message.reply_text(
         f"⚖️ *FAIR VALUE* (Brownien)\n━━━━━━━━━━━━━━\n"
         f"₿`${cur:,.2f}` | Slot open:`${st.slot_open_price:,.2f}`\n"
-        f"Δ:`{st.window_delta_pct:+.3f}%` | ⏰`{t_rem}s` | σ:`{sigma:.4f}`\n\n"
+        f"Δ:`{delta_live:+.3f}%` | ⏰`{t_rem}s` | σ:`{sigma:.4f}`\n\n"
         f"🟢 P(UP):`{p_up*100:.0f}%` | 🔴 P(DOWN):`{(1-p_up)*100:.0f}%`\n\n"
         f"💡 Trade si P(dir) ≥ prix token + {FAIR_EDGE_MIN*100:.0f}pts",
         parse_mode="Markdown")
