@@ -9,13 +9,13 @@ NOUVEAUTÉS:
   • Alerte expiration position réelle
 """
 
-import asyncio, logging, os, json, time, math, aiohttp
+import asyncio, math, logging, os, json, time, math, aiohttp
 from datetime import datetime, timedelta
 from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.20k"
+BOT_VERSION = "10.21"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -43,6 +43,7 @@ POLY_GAMMA         = "https://gamma-api.polymarket.com"
 POLY_CHAIN_ID      = 137
 
 MIN_BET_USD     = 5.0  # ✅ v10.19g — Min 5$
+FAIR_EDGE_MIN   = 0.08  # ✅ v10.21 — EV minimum: fair value - prix token ≥ 8 points
 MAX_BET_USD     = 10.0
 MAX_BET_PCT     = 0.08
 KELLY_FRACTION  = 0.25
@@ -60,14 +61,15 @@ BOOST_AFTER_WINS = 5            # ✅ v10.20 — Augmenter mises après N wins
 DAILY_LOSS_MAX      = 0.15
 DAILY_PAUSE_H       = 2
 
+# ✅ v10.21 — Seuils relevés (+2 partout): -73% de trades = 7x moins de pertes (source v3 testée réel)
 SESSION_THRESHOLDS = {
-    "US_OPEN":      (8,  2.5, 3),
-    "US_AFTERNOON": (8,  2.5, 3),
-    "EU_OPEN":      (9,  3.0, 4),
-    "US_CLOSE":     (9,  3.0, 4),
-    "ASIA_LATE":    (10, 3.5, 4),
-    "ASIA_EARLY":   (11, 4.0, 5),
-    "OVERNIGHT":    (12, 4.5, 6),
+    "US_OPEN":      (10, 3.0, 4),
+    "US_AFTERNOON": (10, 3.0, 4),
+    "EU_OPEN":      (11, 3.5, 4),
+    "US_CLOSE":     (11, 3.5, 4),
+    "ASIA_LATE":    (12, 4.0, 5),
+    "ASIA_EARLY":   (13, 4.5, 5),
+    "OVERNIGHT":    (14, 5.0, 6),
 }
 
 # ✅ v10.12f — Seuil momentum réduit si score très élevé
@@ -1277,6 +1279,14 @@ class State:
         self.win_streak_count=0  # ✅ v10.20 Compteur wins consécutifs
         self.window_delta_pct=0.0  # ✅ v10.20g Window delta BTC depuis début slot
         self.window_delta=0.0
+        # ✅ v10.21 — WebSocket Binance temps réel
+        self.ws_prices=deque()      # (ts, prix) des ~120 dernières secondes
+        self.ws_price=0.0           # Dernier prix temps réel
+        self.ws_connected=False
+        self.ws_task=None
+        self.slot_open_price=0.0    # Prix BTC à l'ouverture du slot actuel (via WS)
+        self.slot_open_ts=0
+        self.last_fair={}           # Dernier calcul fair value
         self.last_decision={}; self.last_conf_score={}; self.last_mom_score=0
         self.fg={"value":50,"label":"Neutral"}; self.btc24={}
         self.tick_job=self.price_job=self.macro_job=self.tp_job=self.backup_job=self.recap_job=None
@@ -1494,15 +1504,10 @@ async def job_take_profit(context):
         sell_reason = None
         sell_pct = 100  # % des shares à vendre
 
-        # ✅ v10.19 — Stop loss si token tombe à x0.5 (mais pas trop tôt)
-        time_in_trade = time.time() - st.bet.get("ts", time.time())
-        if gain_mult <= 0.5 and time_in_trade > 120:  # Seulement après 2min dans le trade
-            # Vérifier si le slot expire bientôt — si oui attendre la résolution auto
-            if st.bet_expiry > 0 and (st.bet_expiry - time.time()) < 90:
-                pass  # Laisse résoudre automatiquement
-            else:
-                sell_reason = f"🛑 Stop loss x{gain_mult:.2f} (protection -50%)"
-                sell_pct = 100
+        # ✅ v10.21 — STOP LOSS SUPPRIMÉ
+        # Données réelles (gengar_polymarket_bot): 4 des 5 trades stoppés auraient gagné
+        # à la résolution. Les stops vendent en panique sur des micro-rebonds normaux.
+        # Sur 5min, l'edge vient d'avoir raison à la résolution, pas de timer les sorties.
 
         # ✅ Paliers de vente anticipée basés sur le multiplicateur TOKEN
         # Token à 0.20$ → x5 potentiel. Si le prix monte à 0.60$ → x3 → on vend
@@ -1571,6 +1576,68 @@ async def job_take_profit(context):
                     f"BR:`{st.bankroll:.2f}` | ROI:`{roi()}`")
                 st.backup()
     except Exception as e: log.error(f"job_take_profit: {e}")
+
+# ═══════════ ✅ v10.21 — WEBSOCKET BINANCE + FAIR VALUE (modèle Brownien) ═══════════
+async def ws_binance_loop():
+    """Flux temps réel BTC via WebSocket Binance aggTrade (public, sans clé)"""
+    url = "wss://stream.binance.com:9443/ws/btcusdt@aggTrade"
+    while True:
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.ws_connect(url, heartbeat=20) as ws:
+                    st.ws_connected = True
+                    log.info("✅ WS Binance connecté")
+                    async for msg in ws:
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            d = json.loads(msg.data)
+                            p = float(d.get("p", 0))
+                            if p > 0:
+                                now = time.time()
+                                st.ws_price = p
+                                st.ws_prices.append((now, p))
+                                while st.ws_prices and now - st.ws_prices[0][0] > 120:
+                                    st.ws_prices.popleft()
+                                # Capturer le prix d'ouverture du slot (référence exacte)
+                                slot_start = int(now // 300) * 300
+                                if st.slot_open_ts != slot_start:
+                                    st.slot_open_ts = slot_start
+                                    st.slot_open_price = p
+                                    log.info(f"📌 Slot open: ${p:,.2f}")
+                        elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                            break
+        except Exception as e:
+            log.warning(f"WS Binance déconnecté: {e}")
+        st.ws_connected = False
+        await asyncio.sleep(5)  # Reconnexion auto
+
+async def job_ws_watchdog(context):
+    """Garde le WebSocket en vie"""
+    t = st.ws_task
+    if t is None or t.done():
+        st.ws_task = asyncio.create_task(ws_binance_loop())
+
+def realized_vol():
+    """Volatilité réalisée (% par √seconde) sur les ~60 dernières secondes WS"""
+    pts = list(st.ws_prices)
+    if len(pts) < 10: return 0.0
+    rets = []; last_t, last_p = pts[0]
+    for t, p in pts[1:]:
+        dt = t - last_t
+        if dt >= 0.8 and last_p > 0:
+            rets.append((p - last_p) / last_p * 100 / math.sqrt(dt))
+            last_t, last_p = t, p
+    if len(rets) < 5: return 0.0
+    m = sum(rets) / len(rets)
+    var = sum((r - m) ** 2 for r in rets) / len(rets)
+    return math.sqrt(var)
+
+def fair_prob_up(delta_pct, t_remaining_s, sigma):
+    """P(BTC finit UP) — modèle Brownien: N(delta / (sigma * √T))
+    Même principe que Black-Scholes binaire (bot référence: 86% de précision)"""
+    if t_remaining_s <= 0: return 1.0 if delta_pct > 0 else 0.0
+    if sigma <= 0: return 0.5
+    z = delta_pct / (sigma * math.sqrt(t_remaining_s))
+    return 0.5 * (1.0 + math.erf(z / math.sqrt(2)))
 
 async def job_price(context):
     p=await fetch_price()
@@ -1671,9 +1738,21 @@ async def job_tick(context):
         elif window_delta_pct < -0.05: window_delta = -4.0  # Direction claire DOWN
         elif window_delta_pct < -0.01: window_delta = -2.0  # Légère tendance DOWN
     
+    # ✅ v10.21 — Si le WebSocket a le prix d'ouverture exact du slot, l'utiliser (bien plus précis)
+    cur_slot = int(time.time() // 300) * 300
+    if st.ws_price > 0 and st.slot_open_price > 0 and st.slot_open_ts == cur_slot:
+        window_delta_pct = (st.ws_price - st.slot_open_price) / st.slot_open_price * 100
+        if window_delta_pct > 0.15: window_delta = 6.0
+        elif window_delta_pct > 0.05: window_delta = 4.0
+        elif window_delta_pct > 0.01: window_delta = 2.0
+        elif window_delta_pct < -0.15: window_delta = -6.0
+        elif window_delta_pct < -0.05: window_delta = -4.0
+        elif window_delta_pct < -0.01: window_delta = -2.0
+        else: window_delta = 0.0
+
     st.window_delta_pct = window_delta_pct
     st.window_delta = window_delta
-    log.info(f"Window delta: {window_delta_pct:+.3f}% → score {window_delta:+.1f}")
+    log.info(f"Window delta: {window_delta_pct:+.3f}% → score {window_delta:+.1f} (WS:{'✅' if st.ws_connected else '❌'})")
     st.c1=deque(c1,maxlen=100); st.c5=deque(c5,maxlen=100); st.c15=deque(c15,maxlen=100)
     st.c1h=deque(c1h,maxlen=100); st.c4h=deque(c4h,maxlen=50); st.price=c5[-1]["close"]
     if trades_last_hour(st.trades)>=MAX_TRADES_PER_H: return
@@ -1815,6 +1894,40 @@ async def job_tick(context):
         st.skipped+=1
         st.pass_reasons.append({"ts":int(time.time()),"reason":f"Token trop haut ({token_price_dir:.2f}$>0.88$) = plus de marge profit"})
         return
+
+    # ✅ v10.21 — FILTRE TENDANCE 10MIN: jamais contre la tendance de fond
+    cur_px = st.ws_price if st.ws_price > 0 else st.price
+    if len(st.price_history) >= 2 and cur_px > 0:
+        older = [x for x in st.price_history if time.time() - x["ts"] >= 540]
+        ref_px = older[-1]["price"] if older else st.price_history[0]["price"]
+        if ref_px > 0:
+            ch10 = (cur_px - ref_px) / ref_px * 100
+            if conf_score["direction"] == "UP" and ch10 < -0.15:
+                st.skipped+=1
+                st.pass_reasons.append({"ts":int(time.time()),"reason":f"UP bloqué: BTC {ch10:+.2f}% sur 10min (contre-tendance)"})
+                return
+            if conf_score["direction"] == "DOWN" and ch10 > 0.15:
+                st.skipped+=1
+                st.pass_reasons.append({"ts":int(time.time()),"reason":f"DOWN bloqué: BTC {ch10:+.2f}% sur 10min (contre-tendance)"})
+                return
+
+    # ✅ v10.21 — FAIR VALUE GATE (modèle Brownien — le vrai edge)
+    # P(direction) calculée mathématiquement vs prix du token = Expected Value réelle
+    sigma = realized_vol()
+    t_rem = 300 - (time.time() % 300)
+    if sigma > 0:
+        p_up = fair_prob_up(st.window_delta_pct, t_rem, sigma)
+        p_dir = p_up if conf_score["direction"] == "UP" else 1.0 - p_up
+        ev = p_dir - token_price_dir
+        st.last_fair = {"p_up": round(p_up,3), "sigma": round(sigma,4), "ev": round(ev,3), "t_rem": int(t_rem)}
+        if ev < FAIR_EDGE_MIN:
+            st.skipped+=1
+            st.pass_reasons.append({"ts":int(time.time()),"reason":f"EV {ev*100:+.0f}%<{FAIR_EDGE_MIN*100:.0f}% (fair:{p_dir:.2f} vs token:{token_price_dir:.2f}$)"})
+            return
+        log.info(f"✅ Fair value: P({conf_score['direction']})={p_dir:.2f} vs token {token_price_dir:.2f}$ → EV {ev*100:+.0f}%")
+    else:
+        st.last_fair = {}
+        log.info("Fair value: WS pas encore prêt — gate ignoré ce tick")
     dec=await claude_decide(i1,i5,i15,i1h,i4h,adv,st.trades[-15:],st.bankroll,st.consec,
                             st.fg,st.btc24,sess,conf_score,mom_score,tpu,tpd,st.last_ob,st.last_liq,eth_desc)
     st.last_decision=dec
@@ -1903,6 +2016,7 @@ async def cmd_run(update,context):
     st.backup_job=context.job_queue.run_repeating(job_backup,interval=600,first=60)
     st.recap_job=context.job_queue.run_repeating(job_daily_recap,interval=3600,first=60)
     context.job_queue.run_repeating(job_check_expiry,interval=30,first=15)
+    context.job_queue.run_repeating(job_ws_watchdog,interval=30,first=1)  # ✅ v10.21 WS Binance
     st.fg=await fetch_fear_greed(); st.btc24=await fetch_btc_24h(); sess=session_ctx()
     # ✅ v10.15c — Auto-sync balance depuis CLOB V2
     clob_bal = await fetch_clob_balance()
@@ -2345,6 +2459,24 @@ async def cmd_cooldown(update,context):
     st.cooldown_until=0; st.consec=0; st.daily_pause_until=0
     await update.message.reply_text("✅ Cooldown + pause reset.",parse_mode="Markdown")
 
+async def cmd_fair(update,context):
+    """✅ v10.21 — Fair value du slot actuel (modèle Brownien)"""
+    if not auth(update): return
+    sigma = realized_vol()
+    t_rem = int(300 - (time.time() % 300))
+    if not st.ws_connected or sigma <= 0:
+        await update.message.reply_text("⏳ WebSocket Binance pas encore prêt — relance dans 1min.")
+        return
+    p_up = fair_prob_up(st.window_delta_pct, t_rem, sigma)
+    cur = st.ws_price
+    await update.message.reply_text(
+        f"⚖️ *FAIR VALUE* (Brownien)\n━━━━━━━━━━━━━━\n"
+        f"₿`${cur:,.2f}` | Slot open:`${st.slot_open_price:,.2f}`\n"
+        f"Δ:`{st.window_delta_pct:+.3f}%` | ⏰`{t_rem}s` | σ:`{sigma:.4f}`\n\n"
+        f"🟢 P(UP):`{p_up*100:.0f}%` | 🔴 P(DOWN):`{(1-p_up)*100:.0f}%`\n\n"
+        f"💡 Trade si P(dir) ≥ prix token + {FAIR_EDGE_MIN*100:.0f}pts",
+        parse_mode="Markdown")
+
 async def cmd_sellcheck(update,context):
     """✅ v10.20d — Affiche le PnL actuel sans vendre"""
     if not auth(update): return
@@ -2456,7 +2588,7 @@ def main():
         ("stats",cmd_stats),("fear",cmd_fear),("passes",cmd_passes),("market",cmd_market),
         ("balance",cmd_balance),("paper",cmd_paper),("cooldown",cmd_cooldown),("reset",cmd_reset),
         ("setbalance",cmd_setbalance),("backup",cmd_backup),("recap",cmd_recap),("dashboard",cmd_dashboard),
-        ("history",cmd_history),("turbo",cmd_turbo),("sell",cmd_sell),("sellcheck",cmd_sellcheck)]:
+        ("history",cmd_history),("turbo",cmd_turbo),("sell",cmd_sell),("sellcheck",cmd_sellcheck),("fair",cmd_fair)]:
         app.add_handler(CommandHandler(name,handler))
     app.add_handler(CallbackQueryHandler(cb))
     log.info(f"🧠 PolyBot v{BOT_VERSION} démarré")
