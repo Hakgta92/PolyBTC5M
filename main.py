@@ -1,20 +1,18 @@
 """
-POLYMARKET BTC BOT v10.22
-NOUVEAUTÉS v10.22:
-  • FIX: retry recalculait le score SANS window delta (signal x6 perdu)
-  • FIX: prix token refetché juste avant l'ordre (entry_tp n'est plus périmé)
-  • Claude RETIRÉ du chemin chaud (10-25s de latence) — décision déterministe
-    basée sur fair value. Claude reste dispo pour /signal (analyse manuelle)
-  • Frais taker réels intégrés dans l'EV gate: fee = 0.25*(p*(1-p))² par share
-    (max ~1.6¢ à p=0.50, quasi nul à p=0.90 — source docs Polymarket)
-  • MODE SNIPE: entrée tardive T-45s→T-20s sur direction quasi lockée
-    (~85% de la direction connue à T-10s — achat du favori 0.75-0.93$)
-  • Fenêtre d'entrée normale élargie: jusqu'à T-45s (avant: T-90s)
-  • Tracking résultat THÉORIQUE des skips → /passes affiche le WR des trades
-    refusés (la vraie réponse à "le bot est-il trop strict ?")
-  • Boost Kelly réellement appliqué après série de wins (+20% capé)
-  • Mode conservateur déclenché aussi sur les trades réels (job_check_expiry)
-  • Take profit check toutes les 15s (avant: 30s)
+POLYMARKET BTC BOT v10.24
+NOUVEAUTÉS v10.24 (patch rentabilité):
+  • FIX CRITIQUE: kelly_bet retourne 0 si edge négatif (plus de MIN_BET forcé)
+  • FIX CRITIQUE: trade bloqué si WS déconnecté (sigma=0 = données fiables)
+  • STOP LOSS réintroduit: vente si token perd >55% de sa valeur d'entrée
+  • Mise dynamique: MIN_BET = max(2$, BR*4%) — s'adapte à la bankroll
+  • Mise boostée sur bons setups: EV>15% ou oracle confirmé → Kelly plein
+  • VOL_SAFETY relevé 1.5→2.5 (sous-estimation du risque BTC 5min)
+  • SNIPE_MIN_PROB abaissé 0.90→0.82 (0.90 était irréaliste sur Brownien)
+  • MAX_TRADES_PER_H réduit 3→2 (moins de trades = meilleure sélection)
+  • BOOST_AFTER_WINS désactivé (hot hand fallacy)
+  • is_trending seuil relevé 0.05%→0.10% (évite les entrées sur bruit)
+  • DAILY_LOSS_MAX réduit 15%→10% (coupe plus tôt les mauvaises journées)
+  • Fallback EV sans WS: BLOQUÉ en mode réel (pas de sigma = pas de trade)
 """
 
 import asyncio, math, logging, os, json, time, aiohttp
@@ -23,7 +21,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.23"
+BOT_VERSION = "10.24"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -50,7 +48,7 @@ POLY_HOST          = "https://clob.polymarket.com"
 POLY_GAMMA         = "https://gamma-api.polymarket.com"
 POLY_CHAIN_ID      = 137
 
-MIN_BET_USD     = 5.0   # ✅ v10.19g — Min 5$
+MIN_BET_USD     = 2.0   # ✅ v10.24 — Min absolu 2$ (dynamique dans kelly_bet)
 FAIR_EDGE_MIN   = 0.08  # ✅ v10.21 — EV minimum (mode normal): fair - prix - frais ≥ 8 pts
 MAX_BET_USD     = 10.0
 MAX_BET_PCT     = 0.08
@@ -59,10 +57,13 @@ KELLY_FRACTION  = 0.25
 # ✅ v10.22 — Fenêtres d'entrée
 ENTRY_LAST_SECONDS = 45   # Mode normal: entrée autorisée jusqu'à T-45s (avant: T-90s)
 SNIPE_LAST_MIN     = 20   # Mode snipe: T-45s → T-20s (en dessous: trop tard, latence ordre)
-SNIPE_MIN_PROB     = 0.90 # Snipe: P(direction) minimum (direction quasi lockée)
+SNIPE_MIN_PROB     = 0.82 # ✅ v10.24 — Abaissé 0.90→0.82 (0.90 était irréaliste sur modèle Brownien)
 SNIPE_EDGE_MIN     = 0.03 # Snipe: EV minimum après frais (frais quasi nuls à p>0.85)
 SNIPE_TOKEN_MIN    = 0.70 # Snipe: zone token favorisée (frais faibles + direction connue)
 SNIPE_TOKEN_MAX    = 0.93
+
+# ✅ v10.24 — Stop loss réintroduit
+STOP_LOSS_MULT     = 0.45  # Vendre si token tombe sous 45% du prix d'entrée (perte >55%)
 
 # ═══════════ v10.23 — NOUVELLES CONSTANTES ═══════════
 # Oracle lag (le meilleur edge: l'oracle bouge en <1s, l'orderbook met ~55s)
@@ -89,10 +90,10 @@ TAKE_PROFIT_CHECK   = 15   # ✅ v10.22 — 15s (avant: 30s, trop lent sur du 5m
 POLY_FEE            = 0.02 # Legacy: estimation flat pour le paper mode uniquement
 MAX_CONSEC_LOSS     = 2
 COOLDOWN_MIN        = 25
-MAX_TRADES_PER_H    = 3
+MAX_TRADES_PER_H    = 2   # ✅ v10.24 — Réduit 3→2 (moins de trades = meilleure sélection)
 CONSERVATIVE_AFTER_LOSSES = 3   # ✅ v10.20 — Mode conservateur après N pertes
-BOOST_AFTER_WINS = 5            # ✅ v10.20 — Augmenter mises après N wins
-DAILY_LOSS_MAX      = 0.15
+BOOST_AFTER_WINS = 999          # ✅ v10.24 — DÉSACTIVÉ (hot hand fallacy, chaque slot est indépendant)
+DAILY_LOSS_MAX      = 0.10  # ✅ v10.24 — Réduit 15%→10% (coupe plus tôt les mauvaises journées)
 DAILY_PAUSE_H       = 2
 
 # ✅ v10.21 — Seuils relevés (+2 partout): -73% de trades = 7x moins de pertes (source v3 testée réel)
@@ -140,22 +141,32 @@ def delta_to_weight(pct):
     if pct < -0.01: return -2.0
     return 0.0
 
-def kelly_bet(bankroll, win_prob, payout_mult, token_price=0.5):
+def kelly_bet(bankroll, win_prob, payout_mult, token_price=0.5, ev_bonus=False):
     """
-    ✅ v10.16 — Kelly adaptatif au vrai prix du token.
-    token_price: prix actuel du token (0.01-0.99)
-    payout_mult: 1/token_price
+    ✅ v10.24 — Kelly corrigé:
+    - Retourne 0 si edge négatif (plus de MIN_BET forcé sur edge nul)
+    - MIN_BET dynamique: max(2$, BR*4%) — s'adapte à la bankroll
+    - Mise boostée si ev_bonus (oracle confirmé ou EV>15%): Kelly plein sans *0.25
+    - Liquidity factor maintenu pour tokens extrêmes
     """
-    if win_prob<=0 or payout_mult<=1: return MIN_BET_USD
-    b=payout_mult-1; q=1-win_prob
-    kp=(win_prob*b-q)/b
-    if kp<=0: return 0.0
-    # Ajustement selon liquidité du marché (token proche de 0 ou 1 = moins liquide)
+    # ✅ v10.24 FIX CRITIQUE: win_prob<=0 ou payout<=1 = edge nul → NE PAS TRADER
+    if win_prob <= 0 or payout_mult <= 1:
+        return 0.0
+    b = payout_mult - 1
+    q = 1 - win_prob
+    kp = (win_prob * b - q) / b
+    if kp <= 0:
+        return 0.0  # ✅ v10.24 FIX: edge négatif → 0, jamais MIN_BET forcé
+    # Ajustement selon liquidité du marché
     liquidity_factor = 1.0
     if token_price < 0.15 or token_price > 0.85:
-        liquidity_factor = 0.7  # Réduire la mise sur marchés très déséquilibrés
-    raw_bet = bankroll * min(kp * KELLY_FRACTION * liquidity_factor, MAX_BET_PCT)
-    return round(max(MIN_BET_USD, min(raw_bet, MAX_BET_USD)), 2)
+        liquidity_factor = 0.7
+    # ✅ v10.24 — Mise boostée sur bon setup (oracle confirmé ou EV>15%)
+    fraction = KELLY_FRACTION * 1.5 if ev_bonus else KELLY_FRACTION
+    raw_bet = bankroll * min(kp * fraction * liquidity_factor, MAX_BET_PCT)
+    # ✅ v10.24 — MIN_BET dynamique: max(2$, 4% de la bankroll)
+    dynamic_min = max(MIN_BET_USD, round(bankroll * 0.04, 2))
+    return round(max(dynamic_min, min(raw_bet, MAX_BET_USD)), 2)
 
 # ─── DONNÉES AVANCÉES ──────────────────────────────────────────────────────
 async def fetch_orderbook_imbalance():
@@ -1110,7 +1121,9 @@ def pattern_mem(trades):
 
 def is_trending(c5,c15):
     if len(c5)<12: return False
-    h=(datetime.utcnow().hour+2)%24; thr=0.10 if (22<=h or h<7) else 0.05
+    h=(datetime.utcnow().hour+2)%24
+    # ✅ v10.24 — Seuil relevé 0.05%→0.10% (évite les entrées sur bruit de marché plat)
+    thr=0.15 if (22<=h or h<7) else 0.10
     closes=[c["close"] for c in c5[-12:]]; highs=[c["high"] for c in c5[-6:]]
     lows=[c["low"] for c in c5[-6:]]; price=closes[-1] if closes[-1] else 1
     return (max(highs)-min(lows))/price*100>thr or abs(closes[-1]-closes[0])/price*100>thr*0.7
@@ -1635,7 +1648,11 @@ async def job_take_profit(context):
         sell_reason = None
         sell_pct = 100
 
-        # ✅ v10.21 — STOP LOSS SUPPRIMÉ (les stops vendaient en panique sur micro-rebonds)
+        # ✅ v10.24 — STOP LOSS réintroduit: si token perd >55% de l'entrée → vendre
+        # (v10.21 l'avait supprimé car "panique sur micro-rebonds" — mais sans SL on rend 100% sur chaque perte)
+        if gain_mult < STOP_LOSS_MULT:
+            sell_reason = f"🛑 Stop loss x{gain_mult:.2f} (<{STOP_LOSS_MULT})"
+            sell_pct = 100
 
         if current_price >= 0.95:
             sell_reason = f"✅ Résolution imminente (token={current_price:.2f}$)"
@@ -1894,7 +1911,7 @@ def realized_vol():
     var = sum((r - m) ** 2 for r in rets) / len(rets)
     return math.sqrt(var)
 
-VOL_SAFETY = 1.5   # ✅ v10.21c — Marge sur σ: BTC a des sauts que le Brownien sous-estime
+VOL_SAFETY = 2.5   # ✅ v10.24 — Relevé 1.5→2.5 (BTC a des sauts brusques que le Brownien sous-estime fortement)
 P_CAP      = 0.95  # ✅ v10.21c — Jamais plus confiant que 95% (15-20% des slots flippent en fin)
 
 
@@ -2255,27 +2272,36 @@ async def job_tick(context):
         log.info(f"✅ Fair value: P({direction})={p_dir:.2f}(+orc {oracle_conf_bonus:.2f}) vs token {token_price_dir:.2f}$ frais {fee*100:.2f}¢ → EV {ev*100:+.1f}%")
     else:
         st.last_fair = {}
-        # ✅ v10.22 — Fallback sans WS: EV gate sur la proba implicite du score
+        # ✅ v10.24 — BLOQUÉ en mode réel si sigma=0 (WS déconnecté = pas de données fiables)
+        # En paper mode on laisse passer pour continuer à collecter des stats
+        if not st.paper_mode:
+            log_skip("WS déconnecté — sigma=0 — trade réel bloqué (pas de fair value)", direction)
+            return
+        # Paper mode: fallback sur la proba implicite du score
         prob_conf = conf_score.get("prob_up",0.5) if direction=="UP" else conf_score.get("prob_dn",0.5)
         ev_fb = prob_conf - token_price_dir - fee
-        if not st.paper_mode and ev_fb < FAIR_EDGE_MIN:
-            log_skip(f"EV fallback {ev_fb*100:+.1f}%<{FAIR_EDGE_MIN*100:.0f}% (WS off)", direction)
+        if ev_fb < FAIR_EDGE_MIN:
+            log_skip(f"EV fallback {ev_fb*100:+.1f}%<{FAIR_EDGE_MIN*100:.0f}% (WS off, paper)", direction)
             return
         win_prob = prob_conf
-        log.info("Fair value: WS pas prêt — gate fallback sur proba score")
+        log.info("Fair value: WS pas prêt — gate fallback sur proba score (PAPER uniquement)")
 
-    # ✅ v10.22 — DÉCISION DÉTERMINISTE (Claude retiré: 10-25s de latence tuait l'entrée)
+    # ✅ v10.24 — ev_bonus: mise boostée si oracle confirme OU EV très forte (>15%)
+    ev_val = st.last_fair.get("ev", 0)
+    ev_bonus = (oracle_sig is not None) or (ev_val >= 0.15)
     payout = best_payout if best_payout>0 else round(1/token_price_dir,2) if token_price_dir>0 else 2.0
-    amount = kelly_bet(st.bankroll, win_prob, payout, token_price_dir)
+    amount = kelly_bet(st.bankroll, win_prob, payout, token_price_dir, ev_bonus=ev_bonus)
     if st.win_streak_count >= BOOST_AFTER_WINS:
-        amount = round(min(amount*1.2, MAX_BET_USD), 2)  # ✅ Boost réellement appliqué
+        amount = round(min(amount*1.2, MAX_BET_USD), 2)  # BOOST_AFTER_WINS=999 donc désactivé
     dec = {"dir":direction,"conf":round(win_prob,2),"size":amount,
            "reasoning":f"EV {st.last_fair.get('ev',0)*100:+.1f}% | fair P={win_prob:.2f} vs token {token_price_dir:.2f}$ | Δslot {st.window_delta_pct:+.3f}%",
            "risk":"LOW" if win_prob>=0.75 else "MEDIUM" if win_prob>=0.6 else "HIGH",
            "trade":True,"kelly_pct":round(amount/st.bankroll*100,1) if st.bankroll>0 else 0}
     st.last_decision=dec
-    if amount<=0 or amount<MIN_BET_USD:
-        log_skip("Kelly edge négatif", direction); return
+    if amount <= 0:
+        log_skip("Kelly edge négatif — EV insuffisante pour cette mise", direction); return
+    if amount < MIN_BET_USD:
+        log_skip(f"Mise calculée {amount:.2f}$<{MIN_BET_USD}$ minimum absolu", direction); return
     if st.bankroll<amount: return
     ok = await place_bet(context, direction, amount, dec["conf"], dec["reasoning"], conf_score, sess, tpu, tpd, market_end, source="tick")
     if not ok: return
@@ -2354,8 +2380,10 @@ async def job_snipe(context):
     if ev < SNIPE_EDGE_MIN:
         log_skip(f"SNIPE: EV {ev*100:+.1f}%<{SNIPE_EDGE_MIN*100:.0f}% (P:{p_dir:.2f} tok:{token_price_dir:.2f}$)", direction)
         return
+    # ✅ v10.24 — ev_bonus snipe: EV>8% sur favori = bon setup
+    ev_bonus_snipe = ev >= 0.08
     payout=round(1/token_price_dir,2) if token_price_dir>0 else 1.1
-    amount=kelly_bet(st.bankroll, p_dir, payout, token_price_dir)
+    amount=kelly_bet(st.bankroll, p_dir, payout, token_price_dir, ev_bonus=ev_bonus_snipe)
     if st.win_streak_count >= BOOST_AFTER_WINS:
         amount=round(min(amount*1.2, MAX_BET_USD),2)
     if amount<MIN_BET_USD or st.bankroll<amount: return
@@ -2392,13 +2420,14 @@ async def cmd_start(update,context):
         f"🧠 *POLYMARKET BOT v{BOT_VERSION}*\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"Mode:*{'📄 PAPER' if st.paper_mode else '💰 RÉEL'}* | API:{'✅' if poly.ready else '❌'}\n"
         f"Wallet:`{w[:6]}...{w[-4:]}`\n\n"
-        f"🆕 v10.22:\n"
-        f"  ✅ FIX retry sans window delta\n"
-        f"  ✅ Décision déterministe (Claude hors chemin chaud)\n"
-        f"  ✅ Frais taker réels dans l'EV gate\n"
-        f"  ✅ MODE SNIPE T-45s→T-20s (favori 0.70-0.93$)\n"
-        f"  ✅ Refetch prix token avant ordre\n"
-        f"  ✅ WR théorique des skips (/passes)\n\n"
+        f"🆕 v10.24 (patch rentabilité):\n"
+        f"  ✅ FIX CRITIQUE: Kelly=0 si edge nul (plus de MIN_BET forcé)\n"
+        f"  ✅ Stop loss réintroduit: sortie si token <45% entrée\n"
+        f"  ✅ WS déconnecté = trade réel bloqué (sigma=0)\n"
+        f"  ✅ MIN_BET dynamique: max(2$, BR*4%)\n"
+        f"  ✅ Mise boostée si oracle confirmé ou EV>15%\n"
+        f"  ✅ VOL_SAFETY 1.5→2.5 | SNIPE_MIN_PROB 0.90→0.82\n"
+        f"  ✅ BOOST_AFTER_WINS désactivé | MAX_TRADES/H: 3→2\n\n"
         f"*/run* */stop* */status* */signal* */score*\n"
         f"*/market* */balance* */trades* */recap* */dashboard*\n"
         f"*/passes* */fair* */setbalance 55.11* • */backup*",
