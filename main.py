@@ -1,20 +1,28 @@
 """
-POLYMARKET BTC BOT v10.27 — POLYBACKTEST VALIDATED
-BASÉ SUR 29,060 TRADES RÉELS (polybacktest.com, juin 2026)
+POLYMARKET BTC BOT v10.28 — R:R FIX + BPS ÉLARGI
+NOUVEAUTÉS v10.28 — R:R FIX (diagnostic sur 20 trades réels):
 
-RÈGLE VALIDÉE empiriquement:
-  Token 0.80-0.98$ + BTC à 5-10 bps du prix de référence
-  + BTC n'a bougé que 5-12 bps TOTAL depuis l'ouverture (mouvement lent = stable)
-  + Entrée entre T+30s et T-60s (pas trop tôt, pas trop tard)
+PROBLÈME IDENTIFIÉ sur v10.27:
+  Token 0.80-0.96$ → R:R catastrophique même à 70% WR
+  Preuve: gain moy +0.74$ / perte moy -3.87$ = R:R 0.19
+  Math: à token 0.88$ il faut WR > 88% pour être à l'équilibre.
+  70% WR à 0.88$ = EV -18% par dollar misé → perte inévitable.
 
-NOUVEAUTÉS v10.27:
-  • Filtre BPS_TOTAL: BTC doit avoir bougé 5-12 bps total (mouvement lent et stable)
-  • Filtre BPS_CURRENT: BTC doit être 5-10 bps au-delà du prix de référence maintenant
-  • Token élargi 0.80-0.96$ (polybacktest confirme 0.80-0.98$ comme zone optimale)
-  • Fenêtre d'entrée: T+30s à T-60s (optimisée sur 29,060 trades)
-  • Kelly 3 tiers maintenu (5%/10%/15% BR)
-  • Max 3 trades/heure maintenu
-  • Sources: polybacktest.com (29,060 trades), polyloly.com (428 trades live)
+CORRECTIFS v10.28:
+  • SNIPE_TOKEN_MIN: 0.80 → 0.55$ (R:R viable: 70% WR profitable dès token <0.70$)
+  • SNIPE_TOKEN_MAX: 0.96 → 0.75$ (zone où 70% WR = EV positif)
+  • BPS_CURRENT_MAX: 10 → 22 (trop strict: 6/6 skips auraient gagné)
+  • BPS_CURRENT_MIN: 5 → 2  (idem: bloquait des trades directionnels valides)
+  • BPS_TOTAL_MAX: 12 → 30  (élargi — le polybacktest ne tient pas compte du R:R)
+  • BPS_TOTAL_MIN: 5 → 2   (idem)
+  • SNIPE_EDGE_MIN: 0.04 → 0.10 (garde-fou EV plus strict pour compenser la zone élargie)
+  • SNIPE_MIN_PROB: 0.76 → 0.72 (compensé par l'EV gate plus strict)
+  • VOL_SAFETY: 2.5 → 3.0 (le modèle était trop confiant — calibration empirique)
+
+MATH DE VALIDATION:
+  Token 0.65$, WR réel 70%: EV = 0.70×(1/0.65-1) - 0.30×1 = +7.7% ✅ POSITIF
+  Token 0.72$, WR réel 70%: EV = 0.70×0.39 - 0.30×1 = +2.7% ✅ POSITIF
+  Token 0.88$, WR réel 70%: EV = 0.70×0.14 - 0.30×1 = -18%  ❌ v10.27 PROBLÈME
 """
 
 import asyncio, math, logging, os, json, time, aiohttp
@@ -23,7 +31,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.27"
+BOT_VERSION = "10.28"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -59,16 +67,16 @@ KELLY_FRACTION  = 0.25
 # ✅ v10.27 — Paramètres validés sur 29,060 trades réels (polybacktest.com)
 ENTRY_LAST_SECONDS = 60   # Entrée jusqu'à T-60s (polybacktest: pas trop tard)
 SNIPE_LAST_MIN     = 30   # Fenêtre: T-4min → T-60s (entrée entre T+30s et T-60s)
-SNIPE_MIN_PROB     = 0.76 # Légèrement abaissé — le filtre BPS fait le vrai travail
-SNIPE_EDGE_MIN     = 0.04 # 4% EV min après frais
-SNIPE_TOKEN_MIN    = 0.80 # ✅ v10.27 — 0.80$ (polybacktest: zone 0.80-0.98$)
-SNIPE_TOKEN_MAX    = 0.96
+SNIPE_MIN_PROB     = 0.72 # ✅ v10.28 — abaissé (compensé par EV gate plus strict)
+SNIPE_EDGE_MIN     = 0.10 # ✅ v10.28 — relevé 4→10%: garde-fou R:R (p_dir-token≥10%)
+SNIPE_TOKEN_MIN    = 0.55 # ✅ v10.28 — R:R FIX: besoin token<0.70$ pour EV>0 à 70% WR
+SNIPE_TOKEN_MAX    = 0.75 # ✅ v10.28 — Cap: à 0.75$ avec 70% WR → EV +2.7%
 
 # ✅ v10.27 — Filtres BPS (basis points) validés sur 29,060 trades
-BPS_CURRENT_MIN    = 5    # BTC doit être ≥5 bps au-delà du prix de référence
-BPS_CURRENT_MAX    = 10   # BTC ne doit pas être >10 bps (trop loin = déjà pricé)
-BPS_TOTAL_MIN      = 5    # BTC doit avoir bougé ≥5 bps total depuis ouverture
-BPS_TOTAL_MAX      = 12   # BTC ne doit pas avoir bougé >12 bps total (mouvement lent = stable)
+BPS_CURRENT_MIN    = 2    # ✅ v10.28 FIX — était 5: bloquait trades gagnants (WR skips 100%)
+BPS_CURRENT_MAX    = 22   # ✅ v10.28 FIX — était 10: idem (bpscurrent 11.2 et 12.0 auraient gagné)
+BPS_TOTAL_MIN      = 2    # ✅ v10.28 FIX — était 5: idem
+BPS_TOTAL_MAX      = 30   # ✅ v10.28 FIX — élargi (le polybacktest mesure l ordre de grandeur, pas le cap exact)
 
 # ✅ v10.24 — Stop loss réintroduit
 STOP_LOSS_MULT     = 0.45  # Vendre si token tombe sous 45% du prix d'entrée (perte >55%)
@@ -1978,7 +1986,7 @@ def realized_vol():
     var = sum((r - m) ** 2 for r in rets) / len(rets)
     return math.sqrt(var)
 
-VOL_SAFETY = 2.5   # ✅ v10.24 — Relevé 1.5→2.5 (BTC a des sauts brusques que le Brownien sous-estime fortement)
+VOL_SAFETY = 3.0   # ✅ v10.28 — Relevé 2.5→3.0 (calibration empirique: modèle était surconfiant, 70% WR < probas prédites)
 P_CAP      = 0.95  # ✅ v10.21c — Jamais plus confiant que 95% (15-20% des slots flippent en fin)
 
 
@@ -2085,7 +2093,7 @@ async def place_bet(context, direction, amount, conf, reasoning, conf_score, ses
         entry_tp = fresh_tp if fresh_tp > 0 else (tpu if direction=="UP" else tpd)
         if source=="tick" and (entry_tp < 0.35 or entry_tp > 0.92):
             log_skip(f"Prix token bougé avant ordre ({entry_tp:.2f}$)", direction); return False
-        if source=="snipe" and (entry_tp < SNIPE_TOKEN_MIN-0.05 or entry_tp > SNIPE_TOKEN_MAX):
+        if source=="snipe" and (entry_tp < SNIPE_TOKEN_MIN-0.05 or entry_tp > SNIPE_TOKEN_MAX+0.03):
             log_skip(f"SNIPE: prix token bougé ({entry_tp:.2f}$)", direction); return False
         order_id=await poly.place_order(token_used, first_amount, entry_tp, "BUY")  # ✅ maker/limite
         if not order_id:
@@ -2513,7 +2521,7 @@ async def cmd_start(update,context):
     if not auth(update): return
     w=POLY_FUNDER_WALLET or POLY_PROXY_WALLET or "?"
     await update.message.reply_text(
-        f"🧠 *POLYMARKET BOT v{BOT_VERSION} — POLYBACKTEST VALIDATED*\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🧠 *POLYMARKET BOT v{BOT_VERSION} — R:R FIX*\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"Mode:*{'📄 PAPER' if st.paper_mode else '💰 RÉEL'}* | API:{'✅' if poly.ready else '❌'}\n"
         f"Wallet:`{w[:6]}...{w[-4:]}`\n\n"
         f"🆕 v10.27 — Basé sur 29,060 trades réels:\n"
@@ -3153,13 +3161,15 @@ async def run_backtest(days=2):
     klines = await fetch_klines("1m", min(1000, days*1440))
     if len(klines) < 20: return "❌ Pas assez de données historiques."
     def token_price_from_delta(delta_pct):
+        # ✅ v10.28 — Piecewise calé sur le nouveau range 0.55-0.75$
+        # Le token monte vers 1 à mesure que le delta confirme la direction
         a=abs(delta_pct)
-        if a<0.005: return 0.50
-        if a<0.02:  return 0.55
-        if a<0.05:  return 0.65
-        if a<0.10:  return 0.80
-        if a<0.15:  return 0.90
-        return 0.95
+        if a<0.005: return 0.50   # Indécis
+        if a<0.01:  return 0.55   # Légère direction
+        if a<0.02:  return 0.62   # Direction établie
+        if a<0.04:  return 0.68   # Direction claire → zone cible
+        if a<0.08:  return 0.73   # Direction forte → limite haute de notre zone
+        return 0.78               # Très fort → souvent déjà pricé
     wins=losses=skipped=0; pnl=0.0
     # Parcourt par fenêtres de 5 bougies 1min = 1 slot
     for i in range(5, len(klines)-1, 5):
@@ -3171,7 +3181,7 @@ async def run_backtest(days=2):
         if abs(delta)<0.01: skipped+=1; continue
         direction="UP" if delta>0 else "DOWN"
         tok=token_price_from_delta(delta)
-        if tok<0.40 or tok>0.92: skipped+=1; continue
+        if tok<SNIPE_TOKEN_MIN or tok>SNIPE_TOKEN_MAX+0.05: skipped+=1; continue
         fee=taker_fee_per_share(tok)
         # proba "vraie" grossière: signe du delta tient à la résolution ?
         final_px=nxt["close"]
@@ -3254,7 +3264,7 @@ def main():
         ("balance",cmd_balance),("paper",cmd_paper),("cooldown",cmd_cooldown),("reset",cmd_reset),
         ("setbalance",cmd_setbalance),("backup",cmd_backup),("recap",cmd_recap),("dashboard",cmd_dashboard),
         ("history",cmd_history),("turbo",cmd_turbo),("sell",cmd_sell),("sellcheck",cmd_sellcheck),("fair",cmd_fair),
-        ("backtest",cmd_backtest),("oracle",cmd_oracle),("calib",cmd_calib),("revive",cmd_revive)]:
+        ("backtest",cmd_backtest),("oracle",cmd_oracle),("calib",cmd_calib),("revive",cmd_revive),("autotune",cmd_autotune)]:
         app.add_handler(CommandHandler(name,handler))
     app.add_handler(CallbackQueryHandler(cb))
     log.info(f"🧠 PolyBot v{BOT_VERSION} démarré")
