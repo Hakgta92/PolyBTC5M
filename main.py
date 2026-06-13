@@ -132,7 +132,7 @@ KILL_SWITCH_LOSSES  = 5      # Pertes consécutives → arrêt total (au-delà d
 # Edge documenté: l'oracle Chainlink (qui RÈGLE le marché) bouge en <1s
 # L'orderbook Polymarket met 30-55s à suivre → fenêtre d'arb
 # Strategy: si oracle a bougé X% depuis slot open ET token gagnant encore pas cher → BUY
-ORACLE_ENTRY_DELTA  = 0.03  # ✅ v10.31 — baissé 0.05→0.03% (-0.049% bloqué mais ✅ dans passes)
+ORACLE_ENTRY_DELTA  = 0.01  # ✅ v11.9 — 0.01% pour capter signaux DOWN faibles (token confirme)
 ORACLE_TOKEN_MAX    = 0.92  # ✅ v10.32 — breakeven exact @92%WR = token 0.92$ (EV>0 jusqu'à 0.92$)
 ORACLE_TOKEN_MIN    = 0.51  # Token min (trop proche de 0.50$ = incertitude trop haute)
 ORACLE_EDGE_MIN     = 0.08  # EV minimum après frais (8%)
@@ -2601,7 +2601,6 @@ async def job_oracle_lag(context):
     if not (ORACLE_WINDOW_END <= slot_remaining <= ORACLE_WINDOW_START):
         return
 
-    # ✅ v11.9 — tout ce qui bloque DANS la fenêtre est loggué dans /passes
     if st.last_trade_slot == int(now_ts // 300) * 300:
         log_skip(f"Oracle: slot déjà tradé (T-{int(slot_remaining)}s)", None); return
     if check_daily():
@@ -3061,7 +3060,7 @@ async def cmd_run(update,context):
     context.job_queue.run_repeating(job_check_expiry,interval=30,first=15)
     context.job_queue.run_repeating(job_ws_watchdog_all,interval=30,first=1)  # ✅ v10.23 tous les WS
     context.job_queue.run_repeating(job_staged_entry,interval=5,first=14)     # ✅ v10.23 2e tranche
-    context.job_queue.run_repeating(job_oracle_lag,interval=2,first=16)       # ✅ v11.9 — 2s dans fenêtre
+    context.job_queue.run_repeating(job_oracle_lag,interval=2,first=16)       # ✅ v10.30 oracle lag (T-35s→T-6s)
     context.job_queue.run_repeating(job_auto_calibrate,interval=7200,first=300)  # ✅ v10.37 seuils auto
     context.job_queue.run_repeating(job_pattern_memory,interval=3600,first=600)  # ✅ v10.37 mémoire patterns
     context.job_queue.run_repeating(job_haiku_analysis,interval=7200,first=900)  # ✅ v10.37 Haiku insights
@@ -3523,7 +3522,7 @@ async def cmd_passes(update,context):
     try:
         await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
     except Exception as e:
-        log.warning(f"cmd_passes markdown: {e}")
+        log.warning(f"cmd_passes: {e}")
         plain = "\n".join(lines).replace("*","").replace("`","").replace("_","")
         try: await update.message.reply_text(plain)
         except: pass
