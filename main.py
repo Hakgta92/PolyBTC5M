@@ -61,7 +61,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.34"
+BOT_VERSION = "10.35"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -2817,7 +2817,7 @@ async def cmd_run(update,context):
     await update.message.reply_text(
         f"▶️ *Bot v{BOT_VERSION} démarré !*\nMode:*{'📄 PAPER' if st.paper_mode else '💰 RÉEL'}*\n"
         f"Session:`{sess['session']}` | Seuils: score≥`{min_score}` mom≥`{min_mom}`\n"
-        f"⚡ ORACLE LAG actif: T-35s→T-6s | gap≥`{int(ORACLE_ENTRY_DELTA*10000)}bps`\n"
+        f"⚡ ORACLE LAG actif: T-35s→T-6s | gap≥1bps / delta≥{int(ORACLE_ENTRY_DELTA*10000)}bps\n"
         f"BR:`{st.bankroll:.2f}$` | ROI:`{roi()}`\n"
         f"📊 `{ob_txt}` | 💸 `{liq_txt}`\n"
         f"Récap auto: 22h Paris 🕙",
