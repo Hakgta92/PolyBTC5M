@@ -61,7 +61,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.33"
+BOT_VERSION = "10.34"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -142,6 +142,7 @@ ORACLE_WINDOW_END   = 6     # T-6s = dernier moment sûr (latence ordre ~2-3s)
 ORACLE_ULTRA_WINDOW = 12    # Passe ultra-précise si T-12s→T-6s ET EV exceptionnelle
 ORACLE_ULTRA_EV_MIN = 0.05  # EV min pour passe ultra (moins strict car WR > 95% à T-10s)
 ORACLE_MIN_FRESH_S  = 2.0   # Tick oracle doit être frais (<2s) pour trader
+EXCH_STALE_S        = 3.0   # Prix exchange ignoré si plus vieux que 3s (consensus_price)
 
 
 TAKE_PROFIT_MULT    = 2.0
@@ -2181,7 +2182,9 @@ async def job_staged_entry(context):
     if st.bankroll<remaining:
         st.bet["staged_done"]=True; return
     fresh_tp=await poly.get_token_price(st.active_token_id)
-    if fresh_tp<=0 or fresh_tp>0.95:
+    if fresh_tp<=0 or fresh_tp>0.70:
+        # ✅ v10.34 — Token >0.70$ = direction déjà pricée, EV 2e tranche négative
+        # Ex: 1re tranche 0.59$ (EV+29%), 2e tranche 0.86$ (EV~0%) = dilution pure
         st.bet["staged_done"]=True; return
     oid=await poly.place_order(st.active_token_id, remaining, fresh_tp, "BUY")
     if oid:
@@ -2719,8 +2722,8 @@ async def job_oracle_lag(context):
     sess = session_ctx()
     conf_score = st.last_conf_score if st.last_conf_score else {"score": 0, "signals": []}
     reasoning = (
-        f"⚡ORACLE LAG {direction} | {primary_signal}={signal_strength:+.3f}% | "
-        f"gap={spot_oracle_gap:+.3f}% votes={dir_votes}/3 | "
+        f"⚡ORACLE LAG {direction} | "
+        f"gap={spot_oracle_gap:+.3f}% delta={oracle_delta:+.3f}% votes={dir_votes}/3 | "
         f"tok={token_price:.3f}$ EV={ev*100:+.1f}% T-{int(slot_remaining)}s")
 
     ok = await place_bet(
@@ -2814,7 +2817,7 @@ async def cmd_run(update,context):
     await update.message.reply_text(
         f"▶️ *Bot v{BOT_VERSION} démarré !*\nMode:*{'📄 PAPER' if st.paper_mode else '💰 RÉEL'}*\n"
         f"Session:`{sess['session']}` | Seuils: score≥`{min_score}` mom≥`{min_mom}`\n"
-        f"🎯 SNIPE actif: T-45s→T-20s si P≥`{SNIPE_MIN_PROB*100:.0f}%`\n"
+        f"⚡ ORACLE LAG actif: T-35s→T-6s | gap≥`{int(ORACLE_ENTRY_DELTA*10000)}bps`\n"
         f"BR:`{st.bankroll:.2f}$` | ROI:`{roi()}`\n"
         f"📊 `{ob_txt}` | 💸 `{liq_txt}`\n"
         f"Récap auto: 22h Paris 🕙",
@@ -3491,15 +3494,18 @@ async def cmd_oracle(update,context):
         rec = f"📡 Pas de lag exploitable (gap:`{spot_gap:+.3f}%` delta:`{oracle_delta:+.3f}%`)"
     # Tie bias
     tie_note = "\n💡 _Quasi-plat → tie bias UP (smart contract: end≥start=UP gagne)_" if abs(oracle_delta)<0.01 and abs(spot_gap)<0.01 else ""
-    await update.message.reply_text(
-        f"🔗 *ORACLE CHAINLINK*\n━━━━━━━━━━━━━━\n"
-        f"Connecté:{'✅' if st.oracle_connected else '❌'} | Tick:`{tick_age}s`\n"
-        f"Oracle BTC:`${oracle:,.2f}`\n"
-        f"Slot open:`${slot_open:,.2f}` (Δ oracle:`{oracle_delta:+.3f}%`)\n"
-        f"Spot consensus:`${spot:,.2f}` (Δ oracle:`{spot_gap:+.3f}%`){tie_note}\n\n"
-        f"{rec}\n\n"
-        f"WS: {' | '.join(srcs)}",
-        parse_mode="Markdown")
+    try:
+        await update.message.reply_text(
+            f"🔗 *ORACLE CHAINLINK*\n━━━━━━━━━━━━━━\n"
+            f"Connecté:{'✅' if st.oracle_connected else '❌'} | Tick:`{tick_age}s`\n"
+            f"Oracle BTC:`${oracle:,.2f}`\n"
+            f"Slot open:`${slot_open:,.2f}` (Δ oracle:`{oracle_delta:+.3f}%`)\n"
+            f"Spot consensus:`${spot:,.2f}` (Δ spot↔oracle:`{spot_gap:+.3f}%`){tie_note}\n\n"
+            f"{rec}\n\n"
+            f"WS: {' | '.join(srcs)}",
+            parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Erreur oracle: {str(e)[:100]}")
 
 
 async def cmd_calib(update,context):
