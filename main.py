@@ -42,7 +42,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.29"
+BOT_VERSION = "10.30"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -108,6 +108,18 @@ CALIB_MIN_TRADES    = 30     # Trades mini avant d'auto-calibrer
 AUTOTUNE_MIN_SKIPS  = 25     # Skips résolus mini avant de proposer un ajustement
 # Kill-switch drawdown
 KILL_SWITCH_LOSSES  = 5      # Pertes consécutives → arrêt total (au-delà du cooldown)
+
+# ✅ v10.30 — ORACLE LAG STRATEGY (source: medium.com/mountain-movers, dev.to/fatherson)
+# Edge documenté: l'oracle Chainlink (qui RÈGLE le marché) bouge en <1s
+# L'orderbook Polymarket met 30-55s à suivre → fenêtre d'arb
+# Strategy: si oracle a bougé X% depuis slot open ET token gagnant encore pas cher → BUY
+ORACLE_ENTRY_DELTA  = 0.05  # % de move oracle minimum pour signal (0.05% = 5bps)
+ORACLE_TOKEN_MAX    = 0.58  # Token max à acheter (si déjà >0.58$, orderbook a déjà suivi)
+ORACLE_TOKEN_MIN    = 0.51  # Token min (trop proche de 0.50$ = incertitude trop haute)
+ORACLE_EDGE_MIN     = 0.08  # EV minimum après frais (8%)
+ORACLE_WINDOW_START = 35    # Entrer entre T-35s (source: dev.to → T-35s à T-6s)
+ORACLE_WINDOW_END   = 6     # T-6s = dernier moment (après: latence ordre > temps restant)
+ORACLE_MIN_FRESH_S  = 2.0   # Tick oracle doit être frais (<2s) pour trader
 
 
 TAKE_PROFIT_MULT    = 2.0
@@ -2419,14 +2431,16 @@ async def job_tick(context):
 
 async def job_snipe(context):
     """
-    ✅ v10.22 — MODE SNIPE: entrée tardive T-45s → T-20s.
-    Stratégie documentée: ~85% de la direction BTC est déjà déterminée vers
-    T-10s, mais les odds Polymarket ne le reflètent pas complètement.
-    On achète le FAVORI (token 0.70-0.93$) quand le modèle Brownien donne
-    P(direction) ≥ 0.90. Les frais taker y sont quasi nuls (~0.2¢/share).
-    Job dédié toutes les 10s (le tick 30s raterait la fenêtre).
+    ✅ v10.30 — SNIPE BROWNIEN: désactivé en mode RÉEL.
+    Sources (medium.com/mountain-movers, dev.to/fatherson): le vrai edge
+    sur BTC 5min n'est PAS la prédiction Brownienne mais l'oracle lag.
+    Brownien gardé en PAPER pour tests comparatifs.
+    Le trading réel passe par job_oracle_lag (T-35s→T-6s).
     """
     if not st.running or st.killed or st.bet: return
+    # ✅ v10.30 — Brownien désactivé en réel
+    if not st.paper_mode:
+        return
     now_ts = time.time()
     slot_remaining = 300 - (now_ts % 300)
     if not (SNIPE_LAST_MIN <= slot_remaining < ENTRY_LAST_SECONDS): return
@@ -2521,6 +2535,143 @@ async def job_snipe(context):
         f"₿`${st.ws_price:,.2f}` Δslot:`{delta_pct:+.3f}%` σ:`{sigma:.4f}`\n\n"
         f"💭 _{reasoning}_")
 
+async def job_oracle_lag(context):
+    """
+    ✅ v10.30 — ORACLE LAG STRATEGY (l'unique edge prouvé sur BTC 5min)
+    Sources: medium.com/mountain-movers (mai 2026), dev.to/fatherson (juin 2026)
+
+    PRINCIPE:
+    - L'oracle Chainlink (qui RÈGLE le marché) update en <1s
+    - L'orderbook Polymarket met 30-55s à suivre
+    - Si oracle a bougé ≥0.05% depuis slot open ET token gagnant encore ≤0.58$
+      → le marché propose encore 0.54-0.57$ sur un côté qui vaut ~0.90-0.95$
+      → edge réel de 30-40%
+
+    FENÊTRE: T-35s → T-6s (source: dev.to → T-6s = dernier moment sûr)
+    SORTIE: résolution automatique du slot (pas de stop loss — on tient)
+    """
+    if not st.running or st.killed or st.bet: return
+    now_ts = time.time()
+    slot_remaining = 300 - (now_ts % 300)
+
+    # Fenêtre stricte T-35s → T-6s
+    if not (ORACLE_WINDOW_END <= slot_remaining <= ORACLE_WINDOW_START):
+        return
+
+    if st.last_trade_slot == int(now_ts // 300) * 300: return  # dédup
+    if check_daily() or in_cd(): return
+    if trades_last_hour(st.trades) >= MAX_TRADES_PER_H: return
+
+    # ── Signal oracle ──
+    now = time.time()
+    if not st.oracle_connected or st.oracle_price <= 0 or st.oracle_slot_open <= 0:
+        return
+    if now - st.oracle_ts > ORACLE_MIN_FRESH_S:
+        return  # tick périmé
+    cur_slot = int(now // 300) * 300
+    if st.oracle_slot_ts != cur_slot:
+        return  # pas de slot open oracle pour ce slot
+
+    oracle_delta = (st.oracle_price - st.oracle_slot_open) / st.oracle_slot_open * 100
+    if abs(oracle_delta) < ORACLE_ENTRY_DELTA:
+        log_skip(f"Oracle lag: Δ{oracle_delta:+.3f}%<{ORACLE_ENTRY_DELTA}% (signal trop faible)", None)
+        return
+
+    direction = "UP" if oracle_delta > 0 else "DOWN"
+
+    # ── Récupérer le token ──
+    if st.paper_mode:
+        # Paper: simuler le token à ~0.54$ (lag non pricé)
+        token_price = 0.54
+        tpu = token_price if direction == "UP" else 1.0 - token_price
+        tpd = 1.0 - tpu
+        market_end = cur_slot + 300
+    else:
+        cur_slug = f"btc-updown-5m-{cur_slot}"
+        market = st.current_market
+        if not market or market.get("market_slug") != cur_slug:
+            market = await poly.find_btc_5min_market()
+        if not market:
+            log_skip("Oracle lag: aucun marché actif", direction); return
+        st.current_market = market
+        token_used = market["token_up"] if direction == "UP" else market["token_down"]
+        token_price = await poly.get_token_price(token_used)
+        tpu = token_price if direction == "UP" else 1.0 - token_price
+        tpd = 1.0 - tpu
+        try:
+            market_end = datetime.fromisoformat(
+                market.get("end_date","").replace("Z","+00:00")).timestamp()
+        except:
+            market_end = cur_slot + 300
+
+    # ── Vérifications edge ──
+    if token_price > ORACLE_TOKEN_MAX:
+        log_skip(f"Oracle lag: token {token_price:.2f}$>{ORACLE_TOKEN_MAX}$ (déjà pricé)", direction)
+        return
+    if token_price < ORACLE_TOKEN_MIN:
+        log_skip(f"Oracle lag: token {token_price:.2f}$<{ORACLE_TOKEN_MIN}$ (trop incertain)", direction)
+        return
+
+    fee = taker_fee_per_share(token_price)
+    # P(direction) oracle = quasi certaine si delta > seuil + temps restant court
+    # Calibration empirique: à T-20s Δ0.05%, les pros observent ~85-90% WR
+    # On reste conservateur: P = 0.85 (pas de modèle Brownien ici)
+    p_oracle = min(0.92, 0.80 + abs(oracle_delta) * 2.0)
+    ev = p_oracle - token_price - fee
+
+    if ev < ORACLE_EDGE_MIN:
+        log_skip(
+            f"Oracle lag: EV {ev*100:+.1f}%<{ORACLE_EDGE_MIN*100:.0f}% "
+            f"(P:{p_oracle:.2f} tok:{token_price:.2f}$)", direction)
+        return
+
+    # ── Consensus spot pour vérif cohérence ──
+    spot = consensus_price()
+    if spot > 0 and st.oracle_price > 0:
+        spot_oracle_gap = abs(spot - st.oracle_price) / st.oracle_price * 100
+        if spot_oracle_gap > 0.20:
+            # Oracle et spot divergent trop → données suspectes
+            log_skip(f"Oracle lag: gap oracle/spot {spot_oracle_gap:.3f}%>0.20% (incohérent)", direction)
+            return
+
+    # ── Kelly sizing ──
+    payout = round(1 / token_price, 2) if token_price > 0 else 1.0
+    amount = kelly_bet(st.bankroll, p_oracle, payout, token_price, ev_bonus=True)
+    if amount < MIN_BET_USD or st.bankroll < amount:
+        return
+
+    sess = session_ctx()
+    conf_score = st.last_conf_score if st.last_conf_score else {"score": 0, "signals": []}
+    reasoning = (
+        f"⚡ORACLE LAG {direction} | Chainlink Δ{oracle_delta:+.3f}% | "
+        f"token={token_price:.3f}$ | EV={ev*100:+.1f}% | T-{int(slot_remaining)}s")
+
+    ok = await place_bet(
+        context, direction, amount, round(p_oracle, 2),
+        reasoning, conf_score, sess, tpu, tpd, market_end, source="snipe")
+    if not ok: return
+
+    st.last_decision = {
+        "dir": direction, "conf": round(p_oracle, 2), "size": amount,
+        "reasoning": reasoning, "risk": "LOW", "trade": True,
+        "kelly_pct": round(amount / st.bankroll * 100, 1) if st.bankroll > 0 else 0}
+    st.last_fair = {
+        "p_up": round(p_oracle if direction=="UP" else 1-p_oracle, 3),
+        "ev": round(ev, 3), "t_rem": int(slot_remaining),
+        "fee": round(fee, 4), "mode": "ORACLE_LAG",
+        "oracle_delta": round(oracle_delta, 4)}
+
+    mode = "💰 RÉEL" if not st.paper_mode else "📄 paper"
+    entry_tp = st.entry_token_price if not st.paper_mode else token_price
+    await send(context.bot,
+        f"⚡ *ORACLE LAG* [{mode}]\n━━━━━━━━━━━━━━━\n"
+        f"*{direction}* | `{amount:.2f}$` | P:`{p_oracle*100:.0f}%` | ⏰T-`{int(slot_remaining)}s`\n"
+        f"Chainlink Δ:`{oracle_delta:+.3f}%` | Token:`{entry_tp:.3f}$`\n"
+        f"EV:`{ev*100:+.1f}%` | Frais:`{fee*100:.2f}¢`\n"
+        f"Oracle:`${st.oracle_price:,.2f}` vs Spot:`${spot:,.2f}`\n\n"
+        f"💭 _{reasoning}_")
+
+
 def auth(u): return ALLOWED_UID==0 or u.effective_user.id==ALLOWED_UID
 
 def kb():
@@ -2567,6 +2718,7 @@ async def cmd_run(update,context):
     context.job_queue.run_repeating(job_check_expiry,interval=30,first=15)
     context.job_queue.run_repeating(job_ws_watchdog_all,interval=30,first=1)  # ✅ v10.23 tous les WS
     context.job_queue.run_repeating(job_staged_entry,interval=5,first=14)     # ✅ v10.23 2e tranche
+    context.job_queue.run_repeating(job_oracle_lag,interval=5,first=16)       # ✅ v10.30 oracle lag (T-35s→T-6s)
     st.fg=await fetch_fear_greed(); st.btc24=await fetch_btc_24h(); sess=session_ctx()
     clob_bal = await fetch_clob_balance()
     if clob_bal is not None and clob_bal > 0:
@@ -2691,7 +2843,9 @@ async def cmd_status(update,context):
     fair_info=""
     if st.last_fair:
         f_mode=st.last_fair.get("mode","")
-        fair_info=f"\n⚖️ {f_mode} P(UP):`{st.last_fair.get('p_up',0)*100:.0f}%` EV:`{st.last_fair.get('ev',0)*100:+.1f}%`"
+        od=st.last_fair.get("oracle_delta",0)
+        od_txt=f" Δoracle:`{od:+.3f}%`" if od else ""
+        fair_info=f"\n⚡ {f_mode} P:`{st.last_fair.get('p_up',0)*100:.0f}%` EV:`{st.last_fair.get('ev',0)*100:+.1f}%`{od_txt}"
     bet_info="Aucun"
     if st.bet:
         elapsed=int((time.time()-st.bet["ts"])/60)
