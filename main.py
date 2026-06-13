@@ -61,7 +61,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "11.9"
+BOT_VERSION = "11.9h"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -2681,11 +2681,17 @@ async def job_oracle_lag(context):
         1 if direction=="UP" and ret_3s>0 else (-1 if direction=="DOWN" and ret_3s<0 else 0),
     ])
 
-    # ✅ v11.9g — Fix#1: votes<2 → gap doit être fort OU delta neutre
+    # ✅ v11.9h — Fix#1 corrigé: ne pas bloquer quand le delta primaire est fort ET dans la bonne direction
+    # BUG v11.9g: delta+0.067% UP bloqué car "delta_is_neutral=False" (0.067>0.032)
+    # alors que 0.067% IS le signal le plus fort → il faut bypasser dans ce cas
     if dir_votes < 2:
         gap_is_strong = abs(spot_oracle_gap) >= ORACLE_GAP_MIN_STRONG
         delta_is_neutral = abs(oracle_delta) < ORACLE_DELTA_CONTRA_MAX
-        if not (gap_is_strong or delta_is_neutral):
+        # ✅ Nouveau: si delta EST le signal primaire ET dans la bonne direction → bypass
+        delta_confirms = (primary_signal == "delta" and
+                          ((direction=="UP" and oracle_delta > 0) or
+                           (direction=="DOWN" and oracle_delta < 0)))
+        if not (gap_is_strong or delta_is_neutral or delta_confirms):
             log_skip(
                 f"Oracle: votes={dir_votes}/3 gap={spot_oracle_gap:+.3f}% delta={oracle_delta:+.3f}% "
                 f"(gap pas fort ET delta contre trop fort)", direction,
