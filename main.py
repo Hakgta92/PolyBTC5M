@@ -1,18 +1,16 @@
 """
-POLYMARKET BTC BOT v10.24
-NOUVEAUTÉS v10.24 (patch rentabilité):
-  • FIX CRITIQUE: kelly_bet retourne 0 si edge négatif (plus de MIN_BET forcé)
-  • FIX CRITIQUE: trade bloqué si WS déconnecté (sigma=0 = données fiables)
-  • STOP LOSS réintroduit: vente si token perd >55% de sa valeur d'entrée
-  • Mise dynamique: MIN_BET = max(2$, BR*4%) — s'adapte à la bankroll
-  • Mise boostée sur bons setups: EV>15% ou oracle confirmé → Kelly plein
-  • VOL_SAFETY relevé 1.5→2.5 (sous-estimation du risque BTC 5min)
-  • SNIPE_MIN_PROB abaissé 0.90→0.82 (0.90 était irréaliste sur Brownien)
-  • MAX_TRADES_PER_H réduit 3→2 (moins de trades = meilleure sélection)
-  • BOOST_AFTER_WINS désactivé (hot hand fallacy)
-  • is_trending seuil relevé 0.05%→0.10% (évite les entrées sur bruit)
-  • DAILY_LOSS_MAX réduit 15%→10% (coupe plus tôt les mauvaises journées)
-  • Fallback EV sans WS: BLOQUÉ en mode réel (pas de sigma = pas de trade)
+POLYMARKET BTC BOT v10.25 — SNIPE-ONLY MODE
+NOUVEAUTÉS v10.25 (stratégie maker confirmée par recherches 2026):
+  • STRATÉGIE UNIQUE: SNIPE-ONLY sur token ≥ 0.82$ (frais ~0¢, direction ~90% lockée)
+  • job_tick DÉSACTIVÉ en mode réel (tokens 0.50-0.75$ = frais taker max = perte garantie)
+  • SNIPE_TOKEN_MIN relevé 0.70→0.82$ (seule zone profitable après frais 2026)
+  • SNIPE_MIN_PROB abaissé 0.82→0.78 (plus d'opportunités dans la zone sûre)
+  • SNIPE_EDGE_MIN relevé 0.03→0.05 (5% d'EV minimum après frais)
+  • Fenêtre snipe élargie: T-50s→T-15s (plus de temps pour capter les bons setups)
+  • MAX_TRADES_PER_H réduit à 1 (qualité > quantité — 1 bon trade vaut 10 mauvais)
+  • MAKER_UNDERCUT relevé 0.01→0.02 (meilleure chance d'être maker = zéro frais)
+  • Kelly min 2$ max 5$ en réel (BR ~30$ = max 16% par trade)
+  • Sources: exmon.pro, htx.com, dev.to/xniiinx (consensus 2026 sur maker strategy)
 """
 
 import asyncio, math, logging, os, json, time, aiohttp
@@ -21,7 +19,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.24"
+BOT_VERSION = "10.25"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -48,19 +46,19 @@ POLY_HOST          = "https://clob.polymarket.com"
 POLY_GAMMA         = "https://gamma-api.polymarket.com"
 POLY_CHAIN_ID      = 137
 
-MIN_BET_USD     = 2.0   # ✅ v10.24 — Min absolu 2$ (dynamique dans kelly_bet)
-FAIR_EDGE_MIN   = 0.08  # ✅ v10.21 — EV minimum (mode normal): fair - prix - frais ≥ 8 pts
-MAX_BET_USD     = 10.0
-MAX_BET_PCT     = 0.08
+MIN_BET_USD     = 2.0   # ✅ v10.25 — Min absolu 2$
+FAIR_EDGE_MIN   = 0.08  # EV minimum mode normal (non utilisé en réel v10.25)
+MAX_BET_USD     = 5.0   # ✅ v10.25 — Max 5$ (BR ~30$ = max 16% par trade)
+MAX_BET_PCT     = 0.06  # ✅ v10.25 — Max 6% de la bankroll par trade
 KELLY_FRACTION  = 0.25
 
-# ✅ v10.22 — Fenêtres d'entrée
-ENTRY_LAST_SECONDS = 45   # Mode normal: entrée autorisée jusqu'à T-45s (avant: T-90s)
-SNIPE_LAST_MIN     = 20   # Mode snipe: T-45s → T-20s (en dessous: trop tard, latence ordre)
-SNIPE_MIN_PROB     = 0.82 # ✅ v10.24 — Abaissé 0.90→0.82 (0.90 était irréaliste sur modèle Brownien)
-SNIPE_EDGE_MIN     = 0.03 # Snipe: EV minimum après frais (frais quasi nuls à p>0.85)
-SNIPE_TOKEN_MIN    = 0.70 # Snipe: zone token favorisée (frais faibles + direction connue)
-SNIPE_TOKEN_MAX    = 0.93
+# ✅ v10.25 — Fenêtre snipe élargie + token min relevé (stratégie maker 2026)
+ENTRY_LAST_SECONDS = 50   # Snipe normal: entrée jusqu'à T-50s
+SNIPE_LAST_MIN     = 15   # Snipe: T-50s → T-15s
+SNIPE_MIN_PROB     = 0.78 # ✅ v10.25 — Abaissé légèrement pour plus d'opps dans zone sûre
+SNIPE_EDGE_MIN     = 0.05 # ✅ v10.25 — Relevé 0.03→0.05 (5% EV min après frais)
+SNIPE_TOKEN_MIN    = 0.82 # ✅ v10.25 — CLEF: relevé 0.70→0.82$ (frais ~0¢ au-dessus)
+SNIPE_TOKEN_MAX    = 0.96 # ✅ v10.25 — Légèrement élargi (0.95 était trop serré)
 
 # ✅ v10.24 — Stop loss réintroduit
 STOP_LOSS_MULT     = 0.45  # Vendre si token tombe sous 45% du prix d'entrée (perte >55%)
@@ -73,8 +71,8 @@ ORACLE_FRESH_S      = 3.0    # Tick Chainlink considéré frais si <3s
 STAGED_ENTRY        = True   # Splitter la mise en 2 tranches
 STAGED_FRACTIONS    = [0.6, 0.4]   # 60% à la 1re entrée, 40% à la 2e si signal tient
 # Maker order (presque gratuit: tout est limite sur Polymarket de toute façon)
-USE_MAKER_ORDERS    = True   # Poser un limite légèrement sous l'ask au lieu de payer le full ask
-MAKER_UNDERCUT      = 0.01   # Poser 1¢ sous le prix marché (rempli souvent, frais réduits/rebate)
+USE_MAKER_ORDERS    = True   # Ordre limite maker = zéro frais + rebate 25%
+MAKER_UNDERCUT      = 0.02   # ✅ v10.25 — 2¢ sous le prix (meilleure chance d'être maker)
 # Calibration sigma (auto-correction de VOL_SAFETY après N trades)
 CALIB_MIN_TRADES    = 30     # Trades mini avant d'auto-calibrer
 # Auto-tuning seuils via WR théorique des skips
@@ -89,12 +87,12 @@ TRAILING_STOP_MULT  = 1.3
 TAKE_PROFIT_CHECK   = 15   # ✅ v10.22 — 15s (avant: 30s, trop lent sur du 5min)
 POLY_FEE            = 0.02 # Legacy: estimation flat pour le paper mode uniquement
 MAX_CONSEC_LOSS     = 2
-COOLDOWN_MIN        = 25
-MAX_TRADES_PER_H    = 2   # ✅ v10.24 — Réduit 3→2 (moins de trades = meilleure sélection)
-CONSERVATIVE_AFTER_LOSSES = 3   # ✅ v10.20 — Mode conservateur après N pertes
-BOOST_AFTER_WINS = 999          # ✅ v10.24 — DÉSACTIVÉ (hot hand fallacy, chaque slot est indépendant)
-DAILY_LOSS_MAX      = 0.10  # ✅ v10.24 — Réduit 15%→10% (coupe plus tôt les mauvaises journées)
-DAILY_PAUSE_H       = 2
+COOLDOWN_MIN        = 30   # ✅ v10.25 — Cooldown étendu 25→30min
+MAX_TRADES_PER_H    = 1    # ✅ v10.25 — MAX 1 trade/heure (qualité > quantité)
+CONSERVATIVE_AFTER_LOSSES = 2   # ✅ v10.25 — Mode conservateur après 2 pertes (avant: 3)
+BOOST_AFTER_WINS    = 999       # Désactivé
+DAILY_LOSS_MAX      = 0.10
+DAILY_PAUSE_H       = 3    # ✅ v10.25 — Pause 3h après daily loss (avant: 2h)
 
 # ✅ v10.21 — Seuils relevés (+2 partout): -73% de trades = 7x moins de pertes (source v3 testée réel)
 SESSION_THRESHOLDS = {
@@ -2075,6 +2073,14 @@ async def job_staged_entry(context):
 async def job_tick(context):
     if not st.running or st.killed: return
 
+    # ✅ v10.25 — SNIPE-ONLY en mode réel
+    # job_tick (entrée T-60s à T-50s, token 0.50-0.75$) = zone taker fees max = non rentable
+    # En mode réel: on laisse tourner uniquement pour la résolution paper et les stats
+    # job_snipe gère tout le trading réel (token ≥ 0.82$, frais ~0¢)
+    if not st.paper_mode:
+        await resolve_paper_bet(context)  # résolution si position paper ouverte
+        return
+
     # ✅ v10.22 — Résolution paper HORS des gates de timing
     await resolve_paper_bet(context)
 
@@ -2371,17 +2377,22 @@ async def job_snipe(context):
         tpu=token_price_dir if direction=="UP" else 1.0-token_price_dir
         tpd=1.0-tpu
     if token_price_dir < SNIPE_TOKEN_MIN or token_price_dir > SNIPE_TOKEN_MAX:
-        log_skip(f"SNIPE: token {token_price_dir:.2f}$ hors zone [{SNIPE_TOKEN_MIN}-{SNIPE_TOKEN_MAX}]", direction)
+        log_skip(f"SNIPE: token {token_price_dir:.2f}$ hors zone [{SNIPE_TOKEN_MIN}-{SNIPE_TOKEN_MAX}] — frais trop élevés", direction)
         return
     fee=taker_fee_per_share(token_price_dir)
+    # ✅ v10.25 — Vérification frais explicite: à 0.82$+ les frais sont <0.2¢ (quasi nuls)
+    fee_pct = fee / token_price_dir * 100 if token_price_dir > 0 else 99
+    if not st.paper_mode and fee_pct > 0.5:  # Jamais entrer si frais > 0.5% en réel
+        log_skip(f"SNIPE: frais trop élevés {fee_pct:.2f}% (token={token_price_dir:.2f}$)", direction)
+        return
     ev=p_dir-token_price_dir-fee
     st.last_fair={"p_up":round(p_up,3),"sigma":round(sigma,4),"ev":round(ev,3),
                   "t_rem":int(slot_remaining),"fee":round(fee,4),"mode":"SNIPE"}
     if ev < SNIPE_EDGE_MIN:
         log_skip(f"SNIPE: EV {ev*100:+.1f}%<{SNIPE_EDGE_MIN*100:.0f}% (P:{p_dir:.2f} tok:{token_price_dir:.2f}$)", direction)
         return
-    # ✅ v10.24 — ev_bonus snipe: EV>8% sur favori = bon setup
-    ev_bonus_snipe = ev >= 0.08
+    # ✅ v10.25 — ev_bonus: tout snipe dans la zone sûre est déjà un bon setup
+    ev_bonus_snipe = ev >= 0.05
     payout=round(1/token_price_dir,2) if token_price_dir>0 else 1.1
     amount=kelly_bet(st.bankroll, p_dir, payout, token_price_dir, ev_bonus=ev_bonus_snipe)
     if st.win_streak_count >= BOOST_AFTER_WINS:
@@ -2417,20 +2428,19 @@ async def cmd_start(update,context):
     if not auth(update): return
     w=POLY_FUNDER_WALLET or POLY_PROXY_WALLET or "?"
     await update.message.reply_text(
-        f"🧠 *POLYMARKET BOT v{BOT_VERSION}*\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🧠 *POLYMARKET BOT v{BOT_VERSION} — SNIPE ONLY*\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"Mode:*{'📄 PAPER' if st.paper_mode else '💰 RÉEL'}* | API:{'✅' if poly.ready else '❌'}\n"
         f"Wallet:`{w[:6]}...{w[-4:]}`\n\n"
-        f"🆕 v10.24 (patch rentabilité):\n"
-        f"  ✅ FIX CRITIQUE: Kelly=0 si edge nul (plus de MIN_BET forcé)\n"
-        f"  ✅ Stop loss réintroduit: sortie si token <45% entrée\n"
-        f"  ✅ WS déconnecté = trade réel bloqué (sigma=0)\n"
-        f"  ✅ MIN_BET dynamique: max(2$, BR*4%)\n"
-        f"  ✅ Mise boostée si oracle confirmé ou EV>15%\n"
-        f"  ✅ VOL_SAFETY 1.5→2.5 | SNIPE_MIN_PROB 0.90→0.82\n"
-        f"  ✅ BOOST_AFTER_WINS désactivé | MAX_TRADES/H: 3→2\n\n"
+        f"🆕 v10.25 — Stratégie maker 2026:\n"
+        f"  🎯 SNIPE-ONLY en réel (token ≥0.82$, frais ~0¢)\n"
+        f"  🚫 job\\_tick désactivé en réel (0.50-0.75$ = frais max)\n"
+        f"  ✅ MAX 1 trade/heure | MAX 5$/trade\n"
+        f"  ✅ EV min 5% | Token 0.82-0.96$ uniquement\n"
+        f"  ✅ Fenêtre T-50s→T-15s\n"
+        f"  ✅ Maker orders = zéro frais + rebate 25%\n\n"
         f"*/run* */stop* */status* */signal* */score*\n"
         f"*/market* */balance* */trades* */recap* */dashboard*\n"
-        f"*/passes* */fair* */setbalance 55.11* • */backup*",
+        f"*/passes* */fair* */setbalance 30.43* • */backup*",
         parse_mode="Markdown")
 
 async def cmd_run(update,context):
