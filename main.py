@@ -61,7 +61,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.35"
+BOT_VERSION = "10.36"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -141,6 +141,13 @@ ORACLE_WINDOW_END   = 6     # T-6s = dernier moment sûr (latence ordre ~2-3s)
 # ✅ v10.32 — Mode T-10s (source: github.com/Archetapp — T-10s "direction quasi lockée")
 ORACLE_ULTRA_WINDOW = 12    # Passe ultra-précise si T-12s→T-6s ET EV exceptionnelle
 ORACLE_ULTRA_EV_MIN = 0.05  # EV min pour passe ultra (moins strict car WR > 95% à T-10s)
+
+# ✅ v10.36 — Filtres WR validés par étude live (medium.com/@gwrx2005, mars 2026)
+# Source: filtre 10min → -93% pertes, seuils relevés → -73% fréquence = bien meilleur WR
+ORACLE_DELTA_CONTRA_MAX = 0.03  # Si votes=1/3, delta contre doit être < 0.03% sinon skip
+ORACLE_GAP_MIN_STRONG   = 0.05  # Gap "fort" = au-delà de ce seuil, même votes=1/3 accepté
+ORACLE_TREND_10MIN      = 0.08  # Filtre tendance 10min: si BTC contre-tendance de 0.08%, skip
+ORACLE_GAP_CONFIRM_RET  = 0.01  # Return 3s minimum pour confirmer la direction du gap (0.01%=1bps)
 ORACLE_MIN_FRESH_S  = 2.0   # Tick oracle doit être frais (<2s) pour trader
 EXCH_STALE_S        = 3.0   # Prix exchange ignoré si plus vieux que 3s (consensus_price)
 
@@ -2639,16 +2646,50 @@ async def job_oracle_lag(context):
         log_skip(f"Oracle: Δ{oracle_delta:+.3f}% gap{spot_oracle_gap:+.3f}% (signals faibles)", None)
         return
 
-    # ── Cohérence des 3 signals ──
+    # ── Cohérence des 3 signals (v10.36 — filtres renforcés) ──
     dir_votes = sum([
         1 if direction=="UP" and oracle_delta>0 else (-1 if direction=="DOWN" and oracle_delta<0 else 0),
         1 if direction=="UP" and spot_oracle_gap>0 else (-1 if direction=="DOWN" and spot_oracle_gap<0 else 0),
         1 if direction=="UP" and ret_3s>0 else (-1 if direction=="DOWN" and ret_3s<0 else 0),
     ])
-    # Au moins 2 signals sur 3 doivent être alignés (évite les faux positifs)
-    if dir_votes < 1:
-        log_skip(f"Oracle: direction {direction} mais signals divergents (votes:{dir_votes})", direction)
-        return
+
+    # ✅ v10.36 FIX #1 — Votes=1/3 uniquement si gap fort OU delta neutre
+    # Source: trade perdu (delta -0.053%, gap +0.037%, votes 1/3)
+    # → gap seul ne suffit pas si la tendance du slot est clairement contre
+    if dir_votes < 2:
+        gap_is_strong = abs(spot_oracle_gap) >= ORACLE_GAP_MIN_STRONG  # gap fort = signal fiable seul
+        delta_is_neutral = abs(oracle_delta) < ORACLE_DELTA_CONTRA_MAX  # delta quasi-plat = pas de contre-signal
+        if not (gap_is_strong or delta_is_neutral):
+            log_skip(
+                f"Oracle: votes={dir_votes}/3 gap={spot_oracle_gap:+.3f}% delta={oracle_delta:+.3f}% "
+                f"(gap pas assez fort ET delta contre trop fort)", direction)
+            return
+
+    # ✅ v10.36 FIX #2 — Filtre tendance 10min (source: -93% pertes dans étude live Polymarket)
+    # Si BTC a bougé contre notre direction sur les 10 dernières minutes → skip
+    # Protège contre les gaps momentanés dans une tendance opposée claire
+    cur_px = st.ws_price if st.ws_price > 0 else spot_now
+    if len(st.price_history) >= 2 and cur_px > 0:
+        old_prices = [x for x in st.price_history if time.time() - x["ts"] >= 540]
+        if old_prices:
+            ref_10min = old_prices[-1]["price"]
+            ch10 = (cur_px - ref_10min) / ref_10min * 100 if ref_10min > 0 else 0
+            if direction == "UP" and ch10 < -ORACLE_TREND_10MIN:
+                log_skip(f"Oracle: UP bloqué — tendance 10min {ch10:+.2f}% (baissière)", direction)
+                return
+            if direction == "DOWN" and ch10 > ORACLE_TREND_10MIN:
+                log_skip(f"Oracle: DOWN bloqué — tendance 10min {ch10:+.2f}% (haussière)", direction)
+                return
+
+    # ✅ v10.36 FIX #3 — Return 3s doit confirmer le gap (min 1bps dans la bonne direction)
+    # Le gap spot↔oracle peut être un artefact si le spot lui-même repart en sens inverse
+    if primary_signal == "gap" and dir_votes < 3:
+        ret_ok = (direction == "UP" and ret_3s >= -ORACLE_GAP_CONFIRM_RET) or                  (direction == "DOWN" and ret_3s <= ORACLE_GAP_CONFIRM_RET)
+        if not ret_ok:
+            log_skip(
+                f"Oracle: gap {direction} mais ret_3s={ret_3s:+.3f}% confirme pas (seuil {ORACLE_GAP_CONFIRM_RET}%)",
+                direction)
+            return
 
     # ── Récupérer le token ──
     if st.paper_mode:
