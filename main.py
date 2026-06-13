@@ -61,7 +61,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "11.8"
+BOT_VERSION = "11.9"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -147,9 +147,7 @@ ORACLE_ULTRA_EV_MIN = 0.05  # EV min pour passe ultra (moins strict car WR > 95%
 ORACLE_DELTA_CONTRA_MAX = 0.03  # Si votes=1/3, delta contre doit être < 0.03% sinon skip
 ORACLE_GAP_MIN_STRONG   = 0.05  # Gap "fort" = au-delà de ce seuil, même votes=1/3 accepté
 ORACLE_TREND_10MIN      = 0.08  # Filtre tendance 10min: si BTC contre-tendance de 0.08%, skip
-ORACLE_GAP_CONFIRM_RET  = 0.03  # v11.1 fallback (quand historique gap insuffisant)
-GAP_PERSIST_SECS       = 15     # ✅ v11.1 — fenêtre persistance gap (secondes)
-GAP_PERSIST_RATIO      = 0.60   # ✅ v11.1 — 60% des points doivent être du même côté
+ORACLE_GAP_CONFIRM_RET  = 0.01  # Return 3s minimum pour confirmer la direction du gap (0.01%=1bps)
 ORACLE_MIN_FRESH_S  = 2.0   # Tick oracle doit être frais (<2s) pour trader
 EXCH_STALE_S        = 3.0   # Prix exchange ignoré si plus vieux que 3s (consensus_price)
 
@@ -1473,9 +1471,8 @@ class State:
         self.window_delta_pct=0.0
         self.window_delta=0.0
         # ✅ v10.21 — WebSocket Binance temps réel
-        self.ws_prices=deque(maxlen=300)   # (ts, price) 5 dernières minutes
+        self.ws_prices=deque()
         self.ws_price=0.0
-        self.gap_history=deque(maxlen=60)  # ✅ v11.1 — (ts, gap%) historique du gap spot↔oracle
         self.ws_connected=False
         self.ws_task=None
         self.slot_open_price=0.0
@@ -1530,13 +1527,7 @@ class State:
             "daily_pause_until":self.daily_pause_until,"paper_mode":self.paper_mode,
             "skipped":self.skipped,"pass_reasons":self.pass_reasons[-50:],
             "calib_factor":self.calib_factor,"killed":self.killed,
-            "version":BOT_VERSION,"saved_at":int(time.time()),
-            "oracle_patterns":self.oracle_patterns[-200:],
-            "calibration_log":self.calibration_log[-20:],
-            "haiku_insights":self.haiku_insights[-20:],
-            "filter_ret3s":FILTER_RET3S,
-            "filter_delta_contra":FILTER_DELTA_CONTRA,
-            "filter_gap_strong":FILTER_GAP_STRONG}
+            "version":BOT_VERSION,"saved_at":int(time.time())}
         try:
             with open(DATA_FILE,"w") as f: json.dump(data,f,indent=2)
         except Exception as e: log.error(f"Save: {e}")
@@ -1564,14 +1555,6 @@ class State:
                     self.daily_pause_until=d.get("daily_pause_until",0)
                     self.paper_mode=d.get("paper_mode",PAPER_MODE)
                     self.skipped=d.get("skipped",0); self.pass_reasons=d.get("pass_reasons",[])
-                    self.oracle_patterns=d.get("oracle_patterns",[])
-                    self.calibration_log=d.get("calibration_log",[])
-                    self.haiku_insights=d.get("haiku_insights",[])
-                    # ✅ Restaurer les seuils auto-calibrés
-                    global FILTER_RET3S, FILTER_DELTA_CONTRA, FILTER_GAP_STRONG
-                    FILTER_RET3S=d.get("filter_ret3s", FILTER_RET3S)
-                    FILTER_DELTA_CONTRA=d.get("filter_delta_contra", FILTER_DELTA_CONTRA)
-                    FILTER_GAP_STRONG=d.get("filter_gap_strong", FILTER_GAP_STRONG)
                     self.calib_factor=d.get("calib_factor",1.0); self.killed=d.get("killed",False)
                     age=int((time.time()-d.get("saved_at",0))/60)
                     log.info(f"✅ State {filepath} ({age}min) BR:{self.bankroll:.2f}"); return
@@ -2614,14 +2597,11 @@ async def job_oracle_lag(context):
     now_ts = time.time()
     slot_remaining = 300 - (now_ts % 300)
 
-    # ✅ v11.6 — Hors fenêtre: juste alimenter gap_history, rien logguer
+    # Fenêtre stricte T-35s → T-6s
     if not (ORACLE_WINDOW_END <= slot_remaining <= ORACLE_WINDOW_START):
-        if st.oracle_connected and st.oracle_price > 0:
-            spot_chk = consensus_price()
-            g_chk = (spot_chk - st.oracle_price) / st.oracle_price * 100 if st.oracle_price > 0 else 0
-            st.gap_history.append((time.time(), g_chk))
         return
 
+    # ✅ v11.9 — tout ce qui bloque DANS la fenêtre est loggué dans /passes
     if st.last_trade_slot == int(now_ts // 300) * 300:
         log_skip(f"Oracle: slot déjà tradé (T-{int(slot_remaining)}s)", None); return
     if check_daily():
@@ -2631,7 +2611,7 @@ async def job_oracle_lag(context):
     if trades_last_hour(st.trades) >= MAX_TRADES_PER_H:
         log_skip(f"Oracle: max {MAX_TRADES_PER_H} trades/h atteint (T-{int(slot_remaining)}s)", None); return
 
-    # ── Signal oracle (v10.32 — 3 features documentées par les pros) ──
+    # ── Signal oracle ──
     now = time.time()
     if not st.oracle_connected or st.oracle_price <= 0 or st.oracle_slot_open <= 0:
         log_skip(f"Oracle: WS non dispo (T-{int(slot_remaining)}s)", None); return
@@ -2639,7 +2619,7 @@ async def job_oracle_lag(context):
         log_skip(f"Oracle: tick périmé {int(now-st.oracle_ts)}s (T-{int(slot_remaining)}s)", None); return
     cur_slot = int(now // 300) * 300
     if st.oracle_slot_ts != cur_slot:
-        log_skip(f"Oracle: pas de slot open (T-{int(slot_remaining)}s)", None); return
+        log_skip(f"Oracle: pas de slot open oracle (T-{int(slot_remaining)}s)", None); return
 
     # ── Feature 1: delta cumulé depuis slot open (signal de direction) ──
     oracle_delta = (st.oracle_price - st.oracle_slot_open) / st.oracle_slot_open * 100
@@ -2652,8 +2632,6 @@ async def job_oracle_lag(context):
     gap_direction = None
     if spot_now > 0 and st.oracle_price > 0:
         spot_oracle_gap = (spot_now - st.oracle_price) / st.oracle_price * 100
-        # ✅ v11.1 — Alimenter l'historique du gap pour le check de persistance
-        st.gap_history.append((time.time(), spot_oracle_gap))
         if abs(spot_oracle_gap) >= 0.01:   # ✅ v10.33 — 1bps (Data Streams sub-sec: le lag est bref)
             gap_direction = "UP" if spot_oracle_gap > 0 else "DOWN"
 
@@ -2668,34 +2646,21 @@ async def job_oracle_lag(context):
             return (spot_now - old[-1]) / old[-1] * 100 if old and old[-1]>0 else 0.0
         ret_1s = ret_over(1); ret_3s = ret_over(3); ret_10s = ret_over(10)
 
-    # ── Décision direction v11.1: combinaison intelligente gap + delta ──
-    # Si gap ET delta se contredisent fortement → le delta (tendance slot) l'emporte
-    # Données empiriques: gap faible (<0.05%) + delta fort (>0.03%) contre → suivre delta
-    # Cas 19:19: gap+0.03% UP + delta-0.04% DOWN → le bot UP → bloqué → aurait dû être DOWN
-    gap_strong = abs(spot_oracle_gap) >= FILTER_GAP_STRONG    # 0.05%
-    delta_strong = abs(oracle_delta) >= ORACLE_ENTRY_DELTA     # 0.03%
-    gap_vs_delta_conflict = (
-        gap_direction is not None and delta_strong and
-        gap_direction != ("UP" if oracle_delta > 0 else "DOWN")
-    )
-
-    if gap_strong and not gap_vs_delta_conflict:
-        # Gap fort ET pas de conflit → gap prime (lag oracle clair)
+    # ── Décision direction: combinaison des 3 features ──
+    # Priorité 1: gap spot↔oracle (plus immédiat)
+    # Priorité 2: delta cumulé depuis slot open
+    # Priorité 3: momentum returns
+    if gap_direction:
+        # Le lag instantané est le signal le plus fort
         direction = gap_direction
         primary_signal = "gap"
         signal_strength = abs(spot_oracle_gap)
-    elif delta_strong and (not gap_direction or gap_vs_delta_conflict):
-        # Delta fort ET gap faible ou en conflit → suivre delta (tendance slot)
+    elif abs(oracle_delta) >= ORACLE_ENTRY_DELTA:
         direction = "UP" if oracle_delta > 0 else "DOWN"
         primary_signal = "delta"
         signal_strength = abs(oracle_delta)
-    elif gap_direction and not gap_vs_delta_conflict:
-        # Gap faible mais pas de conflit → gap modéré accepté
-        direction = gap_direction
-        primary_signal = "gap"
-        signal_strength = abs(spot_oracle_gap)
     else:
-        log_skip(f"Oracle: Δ{oracle_delta:+.3f}% gap{spot_oracle_gap:+.3f}% (signals faibles ou conflit)", None)
+        log_skip(f"Oracle: Δ{oracle_delta:+.3f}% gap{spot_oracle_gap:+.3f}% (signals faibles)", None)
         return
 
     # ── Cohérence des 3 signals (v10.36 — filtres renforcés) ──
@@ -2735,41 +2700,16 @@ async def job_oracle_lag(context):
                 log_skip(f"Oracle: DOWN bloqué — tendance 10min {ch10:+.2f}% (haussière)", direction, features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"filter":"trend10","ch10":ch10})
                 return
 
-    # ✅ v11.1 FIX #3 REMPLACÉ — Persistance du gap (ret3s était du bruit)
-    # Donnée empirique: 18:54 ret3s<0 → 0/6 WIN, 18:59 ret3s<0 → 6/6 WIN
-    # → ret3s n'est PAS prédictif. Le vrai signal = le gap qui TIENT dans le temps.
-    # Un gap artefact se referme en <5s. Un vrai lag reste >10s.
+    # ✅ v10.36 FIX #3 — Return 3s doit confirmer le gap (min 1bps dans la bonne direction)
+    # Le gap spot↔oracle peut être un artefact si le spot lui-même repart en sens inverse
     if primary_signal == "gap" and dir_votes < 3:
-        now_ts_check = time.time()
-        # Regarder les 15 dernières secondes de gap_history
-        recent_gaps = [(t, g) for t, g in st.gap_history
-                       if now_ts_check - t <= 15 and now_ts_check - t >= 2]
-        if len(recent_gaps) >= 3:
-            # Le gap doit être resté du même côté sur au moins 2/3 des points récents
-            same_side = sum(1 for _, g in recent_gaps
-                            if (direction=="UP" and g > 0) or (direction=="DOWN" and g < 0))
-            persist_ratio = same_side / len(recent_gaps)
-            if persist_ratio < 0.60:  # gap pas persistant = artefact
-                log_skip(
-                    f"Oracle: gap {direction} non persistant ({persist_ratio*100:.0f}% des 15s, besoin 60%)",
-                    direction, features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,
-                                         "votes":dir_votes,"filter":"gap_persist",
-                                         "persist_ratio":persist_ratio})
-                return
-            # Ajouter persist_ratio dans le message pour debug
-            gap_persist_info = f" persist={persist_ratio*100:.0f}%"
-        else:
-            # Pas assez d'historique (bot vient de démarrer) → check ret3s fallback
-            ret_ok = (direction == "UP" and ret_3s >= -0.03) or                      (direction == "DOWN" and ret_3s <= 0.03)
-            if not ret_ok:
-                log_skip(
-                    f"Oracle: gap {direction} ret3s={ret_3s:+.3f}% (pas d'historique, fallback)",
-                    direction, features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,
-                                         "votes":dir_votes,"filter":"ret3s_fallback"})
-                return
-            gap_persist_info = " (fallback ret3s)"
-    else:
-        gap_persist_info = ""
+        ret_ok = (direction == "UP" and ret_3s >= -ORACLE_GAP_CONFIRM_RET) or                  (direction == "DOWN" and ret_3s <= ORACLE_GAP_CONFIRM_RET)
+        if not ret_ok:
+            log_skip(
+                f"Oracle: gap {direction} mais ret_3s={ret_3s:+.3f}% confirme pas (seuil {ORACLE_GAP_CONFIRM_RET}%)",
+                direction, features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,
+                                     "votes":dir_votes,"filter":"ret3s"})
+            return
 
     # ── Récupérer le token ──
     if st.paper_mode:
@@ -2867,7 +2807,7 @@ async def job_oracle_lag(context):
     await send(context.bot,
         f"⚡ *ORACLE LAG* [{mode}]\n━━━━━━━━━━━━━━━\n"
         f"*{direction}* | `{amount:.2f}$` | P:`{p_oracle*100:.0f}%` | ⏰T-`{int(slot_remaining)}s`\n"
-        f"Δslot:`{oracle_delta:+.3f}%` | Gap:`{spot_oracle_gap:+.3f}%`{gap_persist_info} | Votes:`{dir_votes}/3`\n"
+        f"Δslot:`{oracle_delta:+.3f}%` | Gap spot↔oracle:`{spot_oracle_gap:+.3f}%` | Votes:`{dir_votes}/3`\n"
         f"Ret 1s:`{ret_1s:+.3f}%` 3s:`{ret_3s:+.3f}%` 10s:`{ret_10s:+.3f}%`\n"
         f"Token:`{entry_tp:.3f}$` | EV:`{ev*100:+.1f}%` | Frais:`{fee*100:.2f}¢`\n"
         f"Oracle:`${st.oracle_price:,.2f}` → Spot:`${spot_now:,.2f}`\n\n"
@@ -2884,7 +2824,7 @@ async def job_auto_calibrate(context):
     ajuste ORACLE_DELTA_CONTRA_MAX, ORACLE_GAP_MIN_STRONG, ORACLE_GAP_CONFIRM_RET.
     Objectif: seuils qui maximisent le WR réel, pas le WR théorique des skips.
     """
-    global ORACLE_DELTA_CONTRA_MAX, ORACLE_GAP_MIN_STRONG, ORACLE_GAP_CONFIRM_RET, GAP_PERSIST_RATIO
+    global ORACLE_DELTA_CONTRA_MAX, ORACLE_GAP_MIN_STRONG, ORACLE_GAP_CONFIRM_RET
 
     resolved = [p for p in st.oracle_patterns if p.get("result") in ("WIN","LOSS")]
     if len(resolved) < 15:
@@ -2902,27 +2842,16 @@ async def job_auto_calibrate(context):
     adjustments = []
 
     # Fix #3 (ret3s): si >60% des skips ret3s gagnent → seuil trop strict → relâcher
-    global ORACLE_GAP_CONFIRM_RET, GAP_PERSIST_RATIO
-    if "ret3s_fallback" in by_filter:
-        r = by_filter["ret3s_fallback"]; total = r["w"]+r["l"]
+    if "ret3s" in by_filter:
+        r = by_filter["ret3s"]; total = r["w"]+r["l"]
         if total >= 8:
             wr = r["w"]/total
-            if wr > 0.60:
-                ORACLE_GAP_CONFIRM_RET = round(min(0.08, ORACLE_GAP_CONFIRM_RET + 0.005), 3)
-                adjustments.append(f"ret3s_fallback↑ {ORACLE_GAP_CONFIRM_RET:.3f}% (WR {wr*100:.0f}%)")
-            elif wr < 0.35:
-                ORACLE_GAP_CONFIRM_RET = round(max(0.01, ORACLE_GAP_CONFIRM_RET - 0.005), 3)
-                adjustments.append(f"ret3s_fallback↓ {ORACLE_GAP_CONFIRM_RET:.3f}% (WR {wr*100:.0f}%)")
-    if "gap_persist" in by_filter:
-        r = by_filter["gap_persist"]; total = r["w"]+r["l"]
-        if total >= 8:
-            wr = r["w"]/total
-            if wr > 0.60 and GAP_PERSIST_RATIO > 0.40:
-                GAP_PERSIST_RATIO = round(max(0.40, GAP_PERSIST_RATIO - 0.05), 2)
-                adjustments.append(f"gap_persist↓ {GAP_PERSIST_RATIO:.0%} (trop strict, WR {wr*100:.0f}%)")
-            elif wr < 0.35 and GAP_PERSIST_RATIO < 0.80:
-                GAP_PERSIST_RATIO = round(min(0.80, GAP_PERSIST_RATIO + 0.05), 2)
-                adjustments.append(f"gap_persist↑ {GAP_PERSIST_RATIO:.0%} (bien calibré, WR {wr*100:.0f}%)")
+            if wr > 0.60 and ORACLE_GAP_CONFIRM_RET < 0.05:
+                ORACLE_GAP_CONFIRM_RET = round(min(0.05, ORACLE_GAP_CONFIRM_RET + 0.005), 3)
+                adjustments.append(f"ret3s seuil↑ {ORACLE_GAP_CONFIRM_RET:.3f}% (WR skips {wr*100:.0f}%)")
+            elif wr < 0.35 and ORACLE_GAP_CONFIRM_RET > 0.005:
+                ORACLE_GAP_CONFIRM_RET = round(max(0.005, ORACLE_GAP_CONFIRM_RET - 0.005), 3)
+                adjustments.append(f"ret3s seuil↓ {ORACLE_GAP_CONFIRM_RET:.3f}% (WR skips {wr*100:.0f}%)")
 
     # Fix #1 (votes_delta): ajuster ORACLE_DELTA_CONTRA_MAX
     if "votes_delta" in by_filter:
@@ -3132,7 +3061,7 @@ async def cmd_run(update,context):
     context.job_queue.run_repeating(job_check_expiry,interval=30,first=15)
     context.job_queue.run_repeating(job_ws_watchdog_all,interval=30,first=1)  # ✅ v10.23 tous les WS
     context.job_queue.run_repeating(job_staged_entry,interval=5,first=14)     # ✅ v10.23 2e tranche
-    context.job_queue.run_repeating(job_oracle_lag,interval=1,first=16)       # ✅ v11.7 — 1s précision maximale
+    context.job_queue.run_repeating(job_oracle_lag,interval=2,first=16)       # ✅ v11.9 — 2s dans fenêtre
     context.job_queue.run_repeating(job_auto_calibrate,interval=7200,first=300)  # ✅ v10.37 seuils auto
     context.job_queue.run_repeating(job_pattern_memory,interval=3600,first=600)  # ✅ v10.37 mémoire patterns
     context.job_queue.run_repeating(job_haiku_analysis,interval=7200,first=900)  # ✅ v10.37 Haiku insights
@@ -3151,7 +3080,7 @@ async def cmd_run(update,context):
     ob_txt=st.last_ob["desc"] if st.last_ob else "N/A"
     liq_txt=st.last_liq["desc"] if st.last_liq else "N/A"
     await update.message.reply_text(
-        f"🚀 *Bot v{BOT_VERSION} démarré !*\nMode:*{'📄 PAPER' if st.paper_mode else '💰 RÉEL'}*\n"
+        f"▶️ *Bot v{BOT_VERSION} démarré !*\nMode:*{'📄 PAPER' if st.paper_mode else '💰 RÉEL'}*\n"
         f"Session:`{sess['session']}` | Seuils: score≥`{min_score}` mom≥`{min_mom}`\n"
         f"⚡ ORACLE LAG actif: T-35s→T-6s | gap≥1bps / delta≥{int(ORACLE_ENTRY_DELTA*10000)}bps\n"
         f"BR:`{st.bankroll:.2f}$` | ROI:`{roi()}`\n"
@@ -3287,8 +3216,7 @@ async def cmd_status(update,context):
         f"🎯 {score_info}{fair_info}\n\n"
         f"💰 BR:`{st.bankroll:.2f}$` | ROI:`{roi()}` | PnL:`{fmt(st.pnl)}`\n"
         f"📅 Perte jour:`{dl:.1f}%/{DAILY_LOSS_MAX*100:.0f}%`{pause_info}\n"
-        f"🎲 Bet:`{bet_info}` | 🚫 Refusés:`{st.skipped}` | ⏱`{upt()}`\n"
-        f"🧠 Patterns: `{len([p for p in st.oracle_patterns if p.get('result')])}` résolus | `/learn` pour détails",
+        f"🎲 Bet:`{bet_info}` | 🚫 Refusés:`{st.skipped}` | ⏱`{upt()}`",
         parse_mode="Markdown")
 
 async def cmd_balance(update,context):
@@ -3833,13 +3761,7 @@ async def cmd_oracle(update,context):
     # Recommandation
     if sig_dir:
         if in_window and st.oracle_connected and tick_age <= ORACLE_MIN_FRESH_S:
-            # ✅ v11.3 — Ne pas dire "TRADAIT" sans vérifier le token
-            # Le job vérifie aussi: token 0.51-0.92$, EV≥8%, Fix#1/2/3
-            # Un delta fort (+0.10%+) → token souvent déjà >0.92$ = bloqué
-            if abs(oracle_delta) > 0.10:
-                rec = f"⚡ Signal *{sig_dir}* fort (Δ`{oracle_delta:+.3f}%`) T-`{int(slot_remaining)}s`\n_⚠️ Delta élevé → token probablement déjà pricé (>0.92$)_"
-            else:
-                rec = f"⚡ Signal *{sig_dir}* (gap`{spot_gap:+.3f}%` Δ`{oracle_delta:+.3f}%`) T-`{int(slot_remaining)}s`\n_Le job vérifie token + EV + filtres avant de trader_"
+            rec = f"⚡ BOT TRADAIT *{sig_dir}* maintenant (T-`{int(slot_remaining)}s`)"
         elif in_window:
             rec = f"⚠️ Signal *{sig_dir}* mais oracle périmé (`{tick_age}s`)"
         else:
