@@ -88,10 +88,10 @@ POLY_HOST          = "https://clob.polymarket.com"
 POLY_GAMMA         = "https://gamma-api.polymarket.com"
 POLY_CHAIN_ID      = 137
 
-MIN_BET_USD     = 2.0   # Minimum absolu
+MIN_BET_USD     = 2.0   # ✅ v11.9i — 2$ minimum (Kelly sur BR 28$)
 FAIR_EDGE_MIN   = 0.08
-MAX_BET_USD     = 8.0   # ✅ v10.26 — Max 8$ (setup exceptionnel sur BR 35$ = ~23%)
-MAX_BET_PCT     = 0.15  # ✅ v10.26 — Max Kelly 15% sur setup exceptionnel
+MAX_BET_USD     = 4.0   # ✅ v11.9i — 4$ max (14% BR max sur 28$)
+MAX_BET_PCT     = 0.05  # ✅ v11.9i — 5% BR max (conservateur)
 KELLY_FRACTION  = 0.25
 
 # ✅ v10.27 — Paramètres validés sur 29,060 trades réels (polybacktest.com)
@@ -158,11 +158,11 @@ TRAILING_STOP_MULT  = 1.3
 TAKE_PROFIT_CHECK   = 15   # ✅ v10.22 — 15s (avant: 30s, trop lent sur du 5min)
 POLY_FEE            = 0.02 # Legacy: estimation flat pour le paper mode uniquement
 MAX_CONSEC_LOSS     = 2
-COOLDOWN_MIN        = 30
-MAX_TRADES_PER_H    = 3    # ✅ v10.26 — Max 3/heure (supprimé la limite 1, garde-fou à 3)
+COOLDOWN_MIN        = 0    # ✅ v11.9j — Cooldown supprimé (h24)
+MAX_TRADES_PER_H    = 6   # ✅ v11.9j — 6/h    # ✅ v10.26 — Max 3/heure (supprimé la limite 1, garde-fou à 3)
 CONSERVATIVE_AFTER_LOSSES = 2
 BOOST_AFTER_WINS    = 999
-DAILY_LOSS_MAX      = 0.10
+DAILY_LOSS_MAX      = 0.99  # ✅ v11.9j — Pause journalière désactivée (h24)
 DAILY_PAUSE_H       = 3
 
 # ✅ v10.21 — Seuils relevés (+2 partout): -73% de trades = 7x moins de pertes (source v3 testée réel)
@@ -1624,8 +1624,9 @@ def register_trade_result(won):
         st.worst_streak=min(st.worst_streak,st.streak)
         st.win_streak_count=0
         if st.consec>=MAX_CONSEC_LOSS: st.cooldown_until=time.time()+COOLDOWN_MIN*60
-        if st.consec>=CONSERVATIVE_AFTER_LOSSES:
-            st.conservative_until=time.time()+2*3600
+        # ✅ v11.9j — mode conservateur désactivé (h24)
+        if False and st.consec>=CONSERVATIVE_AFTER_LOSSES:  # désactivé
+            pass  # st.conservative_until=time.time()+2*3600
         if st.consec>=KILL_SWITCH_LOSSES:  # ✅ v10.23 — arrêt total
             st.killed=True; st.running=False
 
@@ -2618,10 +2619,8 @@ async def job_oracle_lag(context):
 
     if st.last_trade_slot == int(now_ts // 300) * 300:
         log_skip(f"Oracle: slot déjà tradé (T-{int(slot_remaining)}s)", None); return
-    if check_daily():
-        log_skip(f"Oracle: pause journalière (T-{int(slot_remaining)}s)", None); return
-    if in_cd():
-        log_skip(f"Oracle: cooldown actif (T-{int(slot_remaining)}s)", None); return
+    # ✅ v11.9j — Pauses supprimées: bot tourne h24 pour accumuler données
+    # Seul le kill switch reste (KILL_SWITCH_LOSSES = 5 pertes consécutives)
     if trades_last_hour(st.trades) >= MAX_TRADES_PER_H:
         log_skip(f"Oracle: max {MAX_TRADES_PER_H} trades/h atteint (T-{int(slot_remaining)}s)", None); return
 
