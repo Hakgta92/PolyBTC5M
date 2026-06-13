@@ -2193,9 +2193,12 @@ async def place_bet(context, direction, amount, conf, reasoning, conf_score, ses
     return True
 
 async def job_staged_entry(context):
-    """✅ v10.23 — Place la 2e tranche si le signal tient toujours (oracle/delta cohérents)"""
+    """✅ v11.9h — 2e tranche DÉSACTIVÉE en réel (aggravait les pertes: -4.35$ vs -2.19$)"""
     if not st.bet or st.bet.get("staged_done") or st.bet.get("staged_remaining",0)<MIN_BET_USD: return
-    if st.paper_mode:  # en paper on valide juste la logique, on additionne au montant
+    if not st.paper_mode:
+        # En réel: annuler la 2e tranche immédiatement
+        st.bet["staged_done"]=True; return
+    if st.paper_mode:
         st.bet["amount"]=round(st.bet["amount"]+st.bet["staged_remaining"],2)
         st.bet["staged_remaining"]=0.0; st.bet["staged_done"]=True
         return
