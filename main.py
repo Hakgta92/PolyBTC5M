@@ -2791,10 +2791,10 @@ async def job_oracle_lag(context):
 
     # ── Vérifications edge ──
     if token_price > ORACLE_TOKEN_MAX:
-        log_skip(f"Oracle lag: token {token_price:.2f}$>{ORACLE_TOKEN_MAX}$ (déjà pricé)", direction)
+        log_skip(f"Oracle lag: token {token_price:.2f}$>{ORACLE_TOKEN_MAX}$ (déjà pricé)", direction, features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"filter":"token_max","token":token_price})
         return
     if token_price < ORACLE_TOKEN_MIN:
-        log_skip(f"Oracle lag: token {token_price:.2f}$<{ORACLE_TOKEN_MIN}$ (trop incertain)", direction)
+        log_skip(f"Oracle lag: token {token_price:.2f}$<{ORACLE_TOKEN_MIN}$ (trop incertain)", direction, features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"filter":"token_min","token":token_price})
         return
 
     fee = taker_fee_per_share(token_price)
@@ -2820,7 +2820,9 @@ async def job_oracle_lag(context):
     if ev < ORACLE_EDGE_MIN:
         log_skip(
             f"Oracle lag: EV {ev*100:+.1f}%<{ORACLE_EDGE_MIN*100:.0f}% "
-            f"(P:{p_oracle:.2f} tok:{token_price:.2f}$)", direction)
+            f"(P:{p_oracle:.2f} tok:{token_price:.2f}$)", direction,
+            features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,
+                      "votes":dir_votes,"filter":"ev","token":token_price,"ev":ev})
         return
 
     # ✅ v10.32 — gap calculé dans Feature 2 (spot_now = consensus_price())
@@ -3026,8 +3028,9 @@ async def cmd_learn(update, context):
 
     # Seuils actuels
     lines.append(f"📐 *Seuils actuels (auto-calibrés):*")
-    lines.append(f"  ret3s: `{ORACLE_GAP_CONFIRM_RET:.3f}%` | delta_contra: `{ORACLE_DELTA_CONTRA_MAX:.3f}%`")
-    lines.append(f"  gap_fort: `{ORACLE_GAP_MIN_STRONG:.3f}%` | gap_min: `{ORACLE_ENTRY_DELTA:.3f}%`")
+    lines.append(f"  delta_contra: `{ORACLE_DELTA_CONTRA_MAX:.3f}%` | gap_fort: `{ORACLE_GAP_MIN_STRONG:.3f}%`")
+    lines.append(f"  gap_min: `{ORACLE_ENTRY_DELTA:.3f}%` | token: `{ORACLE_TOKEN_MIN:.2f}$`-`{ORACLE_TOKEN_MAX:.2f}$`")
+    lines.append(f"  EV_min: `{ORACLE_EDGE_MIN*100:.0f}%` | delta_strict: `0.020%`")
 
     # Patterns résolus
     resolved = [p for p in st.oracle_patterns if p.get("result") in ("WIN","LOSS")]
