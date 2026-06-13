@@ -119,8 +119,8 @@ ORACLE_FRESH_S      = 3.0    # Tick Chainlink considéré frais si <3s
 STAGED_ENTRY        = True   # Splitter la mise en 2 tranches
 STAGED_FRACTIONS    = [0.6, 0.4]   # 60% à la 1re entrée, 40% à la 2e si signal tient
 # Maker order (presque gratuit: tout est limite sur Polymarket de toute façon)
-USE_MAKER_ORDERS    = True   # Ordre limite maker = zéro frais + rebate 25%
-MAKER_UNDERCUT      = 0.02   # ✅ v10.25 — 2¢ sous le prix (meilleure chance d'être maker)
+USE_MAKER_ORDERS    = True   # ✅ Ordre GTC maker = ZÉRO frais + rebate USDC quotidien
+MAKER_UNDERCUT      = 0.01   # ✅ v11.9k — 1¢ sous le prix (moins agressif = meilleur fill maker)
 # Calibration sigma (auto-correction de VOL_SAFETY après N trades)
 CALIB_MIN_TRADES    = 30     # Trades mini avant d'auto-calibrer
 # Auto-tuning seuils via WR théorique des skips
@@ -256,9 +256,14 @@ def kelly_bet(bankroll, win_prob, payout_mult, token_price=0.5, ev_bonus=False):
         tier_pct = 0.05
         tier_name = "NORMAL"
 
-    raw_bet = bankroll * min(kp * fraction * liquidity_factor, tier_pct)
-    dynamic_min = max(MIN_BET_USD, round(bankroll * 0.04, 2))
-    result = round(max(dynamic_min, min(raw_bet, MAX_BET_USD)), 2)
+    # ✅ v11.9k — tier_pct adaptatif: si BR faible, réduire proportionnellement
+    effective_tier = min(tier_pct, 0.10)  # jamais plus de 10% BR
+    raw_bet = bankroll * min(kp * fraction * liquidity_factor, effective_tier)
+    # ✅ v11.9k — 5% BR minimum (source: pros recommandent 1-2%, on met 5% plancher)
+    dynamic_min = max(MIN_BET_USD, round(bankroll * 0.05, 2))
+    # MAX adaptatif: 10% BR absolu (protège en cas de bankroll faible)
+    dynamic_max = min(MAX_BET_USD, round(bankroll * 0.10, 2))
+    result = round(max(dynamic_min, min(raw_bet, dynamic_max)), 2)
     log.debug(f"Kelly tier={tier_name} EV={ev_real:.2f} P={win_prob:.2f} → {result:.2f}$")
     return result
 
@@ -1490,9 +1495,9 @@ class State:
         self.last_news={"sentiment":"neutral","score":0,"news":[]}
         self.price_history=[]
         # ✅ v10.23 — Multi-exchange WS (Coinbase + Kraken en plus de Binance)
-        self.cb_price=0.0; self.kr_price=0.0
-        self.cb_ts=0; self.kr_ts=0
-        self.cb_task=None; self.kr_task=None
+        self.cb_price=0.0; self.kr_price=0.0; self.bs_price=0.0
+        self.cb_ts=0; self.kr_ts=0; self.bs_ts=0
+        self.cb_task=None; self.kr_task=None; self.bs_task=None  # ✅ v11.9k Bitstamp
         # ✅ v10.23 — Oracle Chainlink (le feed qui RÈGLE le marché)
         self.oracle_price=0.0; self.oracle_ts=0
         self.oracle_slot_open=0.0; self.oracle_slot_ts=0
@@ -1906,6 +1911,29 @@ async def ws_kraken_loop():
             log.warning(f"WS Kraken: {e}")
         await asyncio.sleep(5)
 
+async def ws_bitstamp_loop():
+    """✅ v11.9k — Flux temps réel BTC via Bitstamp (utilisé par PolyCryptoBot)"""
+    url = "wss://ws.bitstamp.net"
+    sub = {"event":"bts:subscribe","data":{"channel":"live_trades_btcusd"}}
+    while True:
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.ws_connect(url, heartbeat=20) as ws:
+                    await ws.send_json(sub)
+                    log.info("✅ WS Bitstamp connecté")
+                    async for msg in ws:
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            d = json.loads(msg.data)
+                            if d.get("event") == "trade" and d.get("data",{}).get("price"):
+                                st.bs_price = float(d["data"]["price"])
+                                st.bs_ts = time.time()
+                        elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                            break
+        except Exception as e:
+            log.warning(f"WS Bitstamp: {e}")
+        await asyncio.sleep(5)
+
+
 async def ws_oracle_loop():
     """
     ✅ v10.23 — Feed Chainlink de Polymarket (LE prix qui règle le marché).
@@ -1950,6 +1978,8 @@ async def job_ws_watchdog_all(context):
         st.ws_task = asyncio.create_task(ws_binance_loop())
     if st.cb_task is None or st.cb_task.done():
         st.cb_task = asyncio.create_task(ws_coinbase_loop())
+    if not hasattr(st,"bs_task") or st.bs_task is None or st.bs_task.done():
+        st.bs_task = asyncio.create_task(ws_bitstamp_loop())  # ✅ v11.9k
     if st.kr_task is None or st.kr_task.done():
         st.kr_task = asyncio.create_task(ws_kraken_loop())
     if st.oracle_task is None or st.oracle_task.done():
@@ -1962,6 +1992,7 @@ def consensus_price():
     if st.ws_price > 0 and now - (st.ws_prices[-1][0] if st.ws_prices else 0) < 3: prices.append(st.ws_price)
     if st.cb_price > 0 and now - st.cb_ts < 3: prices.append(st.cb_price)
     if st.kr_price > 0 and now - st.kr_ts < 3: prices.append(st.kr_price)
+    if st.bs_price > 0 and now - st.bs_ts < 3: prices.append(st.bs_price)  # ✅ v11.9k Bitstamp
     if not prices: return st.ws_price if st.ws_price>0 else st.price
     prices.sort()
     n=len(prices)
@@ -3774,6 +3805,8 @@ async def cmd_oracle(update,context):
     else: srcs.append("Coinbase❌")
     if hasattr(st,'kr_price') and st.kr_price > 0 and now - st.kr_ts < EXCH_STALE_S: srcs.append("Kraken✅")
     else: srcs.append("Kraken❌")
+    if hasattr(st,'bs_price') and st.bs_price > 0 and now - st.bs_ts < EXCH_STALE_S: srcs.append("Bitstamp✅")
+    else: srcs.append("Bitstamp❌")
     # Signal dominant (même logique que job_oracle_lag)
     gap_dir = ("UP" if spot_gap>0 else "DOWN") if abs(spot_gap) >= 0.01 else None
     delta_dir = ("UP" if oracle_delta>0 else "DOWN") if abs(oracle_delta) >= ORACLE_ENTRY_DELTA else None
