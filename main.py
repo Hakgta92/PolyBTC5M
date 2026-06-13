@@ -61,7 +61,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "11.2"
+BOT_VERSION = "11.4"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -2614,8 +2614,18 @@ async def job_oracle_lag(context):
     now_ts = time.time()
     slot_remaining = 300 - (now_ts % 300)
 
-    # Fenêtre stricte T-35s → T-6s
+    # ✅ v11.4 — Log monitoring hors fenêtre pour visibilité dans /passes
     if not (ORACLE_WINDOW_END <= slot_remaining <= ORACLE_WINDOW_START):
+        if st.oracle_connected and st.oracle_price > 0 and st.oracle_slot_open > 0:
+            spot_chk = consensus_price()
+            d_chk = (st.oracle_price - st.oracle_slot_open) / st.oracle_slot_open * 100 if st.oracle_slot_open > 0 else 0
+            g_chk = (spot_chk - st.oracle_price) / st.oracle_price * 100 if st.oracle_price > 0 else 0
+            st.gap_history.append((time.time(), g_chk))
+            if abs(d_chk) >= ORACLE_ENTRY_DELTA or abs(g_chk) >= ORACLE_GAP_MIN:
+                dir_chk = "UP" if (g_chk > 0 and d_chk >= 0) or d_chk > 0 else "DOWN"
+                log_skip(f"Oracle lag: Δ{d_chk:+.3f}% gap{g_chk:+.3f}% (hors fenêtre T-{int(slot_remaining)}s)", dir_chk)
+            elif abs(d_chk) > 0.005 or abs(g_chk) > 0.005:
+                log_skip(f"Oracle lag: Δ{d_chk:+.3f}%<{ORACLE_ENTRY_DELTA}% (signal trop faible)", None)
         return
 
     if st.last_trade_slot == int(now_ts // 300) * 300: return  # dédup
@@ -3824,7 +3834,13 @@ async def cmd_oracle(update,context):
     # Recommandation
     if sig_dir:
         if in_window and st.oracle_connected and tick_age <= ORACLE_MIN_FRESH_S:
-            rec = f"⚡ BOT TRADAIT *{sig_dir}* maintenant (T-`{int(slot_remaining)}s`)"
+            # ✅ v11.3 — Ne pas dire "TRADAIT" sans vérifier le token
+            # Le job vérifie aussi: token 0.51-0.92$, EV≥8%, Fix#1/2/3
+            # Un delta fort (+0.10%+) → token souvent déjà >0.92$ = bloqué
+            if abs(oracle_delta) > 0.10:
+                rec = f"⚡ Signal *{sig_dir}* fort (Δ`{oracle_delta:+.3f}%`) T-`{int(slot_remaining)}s`\n_⚠️ Delta élevé → token probablement déjà pricé (>0.92$)_"
+            else:
+                rec = f"⚡ Signal *{sig_dir}* (gap`{spot_gap:+.3f}%` Δ`{oracle_delta:+.3f}%`) T-`{int(slot_remaining)}s`\n_Le job vérifie token + EV + filtres avant de trader_"
         elif in_window:
             rec = f"⚠️ Signal *{sig_dir}* mais oracle périmé (`{tick_age}s`)"
         else:
