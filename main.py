@@ -61,7 +61,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "11.7"
+BOT_VERSION = "11.8"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -2622,9 +2622,14 @@ async def job_oracle_lag(context):
             st.gap_history.append((time.time(), g_chk))
         return
 
-    if st.last_trade_slot == int(now_ts // 300) * 300: return  # dédup
-    if check_daily() or in_cd(): return
-    if trades_last_hour(st.trades) >= MAX_TRADES_PER_H: return
+    if st.last_trade_slot == int(now_ts // 300) * 300:
+        log_skip(f"Oracle: slot déjà tradé (T-{int(slot_remaining)}s)", None); return
+    if check_daily():
+        log_skip(f"Oracle: pause journalière (T-{int(slot_remaining)}s)", None); return
+    if in_cd():
+        log_skip(f"Oracle: cooldown actif (T-{int(slot_remaining)}s)", None); return
+    if trades_last_hour(st.trades) >= MAX_TRADES_PER_H:
+        log_skip(f"Oracle: max {MAX_TRADES_PER_H} trades/h atteint (T-{int(slot_remaining)}s)", None); return
 
     # ── Signal oracle (v10.32 — 3 features documentées par les pros) ──
     now = time.time()
