@@ -144,7 +144,7 @@ ORACLE_ULTRA_EV_MIN = 0.05  # EV min pour passe ultra (moins strict car WR > 95%
 
 # ✅ v10.36 — Filtres WR validés par étude live (medium.com/@gwrx2005, mars 2026)
 # Source: filtre 10min → -93% pertes, seuils relevés → -73% fréquence = bien meilleur WR
-ORACLE_DELTA_CONTRA_MAX = 0.03  # Si votes=1/3, delta contre doit être < 0.03% sinon skip
+ORACLE_DELTA_CONTRA_MAX = 0.02  # ✅ v11.9f — calibré sur données réelles  # Si votes=1/3, delta contre doit être < 0.03% sinon skip
 ORACLE_GAP_MIN_STRONG   = 0.05  # Gap "fort" = au-delà de ce seuil, même votes=1/3 accepté
 ORACLE_TREND_10MIN      = 0.08  # Filtre tendance 10min: si BTC contre-tendance de 0.08%, skip
 ORACLE_GAP_CONFIRM_RET  = 0.01  # Return 3s minimum pour confirmer la direction du gap (0.01%=1bps)
