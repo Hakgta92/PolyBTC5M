@@ -61,7 +61,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.36"
+BOT_VERSION = "10.37"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -1460,6 +1460,11 @@ class State:
         self.daily_start=50.0; self.daily_ts=time.time()
         self.daily_pause_until=0
         self.skipped=0; self.pass_reasons=[]
+        # ✅ v10.37 — Auto-apprentissage
+        self.oracle_patterns=[]          # [{gap,delta,ret3s,votes,dir,result,ts}]
+        self.calibration_log=[]          # historique des ajustements auto
+        self.haiku_insights=[]           # insights Claude Haiku horaires
+        self.last_haiku_ts=0
         self.turbo_until=0
         self.conservative_until=0
         self.win_streak_count=0
@@ -1558,22 +1563,21 @@ class State:
 st=State()
 
 # ─── HELPERS v10.22 ────────────────────────────────────────────────────────
-def log_skip(reason, direction=None):
-    """
-    ✅ v10.22 — Log un skip AVEC tracking du résultat théorique.
-    Si direction connue: on enregistre le prix d'ouverture du slot et on
-    résoudra plus tard (WIN/LOSS théorique) dans job_price.
-    → /passes affiche le WR théorique des trades refusés = LA réponse
-      objective à "le bot est-il trop strict ?"
-    """
+def log_skip(reason, direction=None, features=None):
+    """✅ v10.37 — Log skip + features oracle pour auto-calibration."""
     st.skipped += 1
     now = int(time.time())
-    st.pass_reasons.append({
-        "ts": now, "reason": reason, "dir": direction,
-        "slot_end": (now // 300) * 300 + 300,
-        "open_px": st.slot_open_price if st.slot_open_price > 0 else st.price,
-        "resolved": None
-    })
+    entry = {"ts": now, "reason": reason, "dir": direction,
+             "slot_end": (now // 300) * 300 + 300,
+             "open_px": st.slot_open_price if st.slot_open_price > 0 else st.price,
+             "resolved": None}
+    st.pass_reasons.append(entry)
+    if features and direction:
+        st.oracle_patterns.append({**features, "direction": direction,
+                                    "result": None, "ts": now, "slot_end": entry["slot_end"],
+                                    "open_px": entry["open_px"]})
+        if len(st.oracle_patterns) > 300:
+            st.oracle_patterns = st.oracle_patterns[-300:]
 
 def live_window_delta():
     """✅ v10.22 — Delta du slot en TEMPS RÉEL (WS prioritaire, fallback dernier tick)"""
@@ -2062,13 +2066,20 @@ async def job_price(context):
         st.price_history.append({"price":p,"ts":now})
         st.price_history=[x for x in st.price_history if now-x["ts"]<600]
 
-        # ✅ v10.22 — Résolution THÉORIQUE des skips trackés (réponse à "trop strict ?")
+        # ✅ v10.22 — Résolution THÉORIQUE des skips
         for pr in st.pass_reasons[-40:]:
             if (pr.get("resolved") is None and pr.get("slot_end",0)>0
                 and now>pr["slot_end"]+10 and pr.get("dir") in ("UP","DOWN")
                 and pr.get("open_px",0)>0):
                 won=(p>pr["open_px"])==(pr["dir"]=="UP")
                 pr["resolved"]="WIN" if won else "LOSS"
+        # ✅ v10.37 — Résolution des patterns oracle pour auto-calibration
+        for pat in st.oracle_patterns[-100:]:
+            if (pat.get("result") is None and pat.get("slot_end",0)>0
+                and now>pat["slot_end"]+10 and pat.get("open_px",0)>0
+                and pat.get("direction") in ("UP","DOWN")):
+                won=(p>pat["open_px"])==(pat["direction"]=="UP")
+                pat["result"]="WIN" if won else "LOSS"
 
         if st.price>0 and not st.bet:
             move_pct = (p - st.price) / st.price * 100
@@ -2662,7 +2673,9 @@ async def job_oracle_lag(context):
         if not (gap_is_strong or delta_is_neutral):
             log_skip(
                 f"Oracle: votes={dir_votes}/3 gap={spot_oracle_gap:+.3f}% delta={oracle_delta:+.3f}% "
-                f"(gap pas assez fort ET delta contre trop fort)", direction)
+                f"(gap pas assez fort ET delta contre trop fort)", direction,
+                features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,
+                          "votes":dir_votes,"filter":"votes_delta"})
             return
 
     # ✅ v10.36 FIX #2 — Filtre tendance 10min (source: -93% pertes dans étude live Polymarket)
@@ -2675,10 +2688,10 @@ async def job_oracle_lag(context):
             ref_10min = old_prices[-1]["price"]
             ch10 = (cur_px - ref_10min) / ref_10min * 100 if ref_10min > 0 else 0
             if direction == "UP" and ch10 < -ORACLE_TREND_10MIN:
-                log_skip(f"Oracle: UP bloqué — tendance 10min {ch10:+.2f}% (baissière)", direction)
+                log_skip(f"Oracle: UP bloqué — tendance 10min {ch10:+.2f}% (baissière)", direction, features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"filter":"trend10","ch10":ch10})
                 return
             if direction == "DOWN" and ch10 > ORACLE_TREND_10MIN:
-                log_skip(f"Oracle: DOWN bloqué — tendance 10min {ch10:+.2f}% (haussière)", direction)
+                log_skip(f"Oracle: DOWN bloqué — tendance 10min {ch10:+.2f}% (haussière)", direction, features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"filter":"trend10","ch10":ch10})
                 return
 
     # ✅ v10.36 FIX #3 — Return 3s doit confirmer le gap (min 1bps dans la bonne direction)
@@ -2688,7 +2701,8 @@ async def job_oracle_lag(context):
         if not ret_ok:
             log_skip(
                 f"Oracle: gap {direction} mais ret_3s={ret_3s:+.3f}% confirme pas (seuil {ORACLE_GAP_CONFIRM_RET}%)",
-                direction)
+                direction, features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,
+                                     "votes":dir_votes,"filter":"ret3s"})
             return
 
     # ── Récupérer le token ──
@@ -2794,6 +2808,203 @@ async def job_oracle_lag(context):
         f"💭 _{reasoning}_")
 
 
+
+# ═══════════ ✅ v10.37 — AUTO-APPRENTISSAGE ═══════════
+
+async def job_auto_calibrate(context):
+    """
+    ✅ v10.37 — Point 1: Auto-calibration des seuils toutes les 2h.
+    Analyse les patterns oracle résolus (WIN/LOSS) par filtre,
+    ajuste ORACLE_DELTA_CONTRA_MAX, ORACLE_GAP_MIN_STRONG, ORACLE_GAP_CONFIRM_RET.
+    Objectif: seuils qui maximisent le WR réel, pas le WR théorique des skips.
+    """
+    global ORACLE_DELTA_CONTRA_MAX, ORACLE_GAP_MIN_STRONG, ORACLE_GAP_CONFIRM_RET
+
+    resolved = [p for p in st.oracle_patterns if p.get("result") in ("WIN","LOSS")]
+    if len(resolved) < 15:
+        log.info(f"Auto-calibration: {len(resolved)}/15 patterns résolus — attente")
+        return
+
+    # Analyser par filtre
+    by_filter = {}
+    for p in resolved[-100:]:
+        f = p.get("filter","unknown")
+        if f not in by_filter: by_filter[f] = {"w":0,"l":0}
+        if p["result"]=="WIN": by_filter[f]["w"] += 1
+        else: by_filter[f]["l"] += 1
+
+    adjustments = []
+
+    # Fix #3 (ret3s): si >60% des skips ret3s gagnent → seuil trop strict → relâcher
+    if "ret3s" in by_filter:
+        r = by_filter["ret3s"]; total = r["w"]+r["l"]
+        if total >= 8:
+            wr = r["w"]/total
+            if wr > 0.60 and ORACLE_GAP_CONFIRM_RET < 0.05:
+                ORACLE_GAP_CONFIRM_RET = round(min(0.05, ORACLE_GAP_CONFIRM_RET + 0.005), 3)
+                adjustments.append(f"ret3s seuil↑ {ORACLE_GAP_CONFIRM_RET:.3f}% (WR skips {wr*100:.0f}%)")
+            elif wr < 0.35 and ORACLE_GAP_CONFIRM_RET > 0.005:
+                ORACLE_GAP_CONFIRM_RET = round(max(0.005, ORACLE_GAP_CONFIRM_RET - 0.005), 3)
+                adjustments.append(f"ret3s seuil↓ {ORACLE_GAP_CONFIRM_RET:.3f}% (WR skips {wr*100:.0f}%)")
+
+    # Fix #1 (votes_delta): ajuster ORACLE_DELTA_CONTRA_MAX
+    if "votes_delta" in by_filter:
+        r = by_filter["votes_delta"]; total = r["w"]+r["l"]
+        if total >= 8:
+            wr = r["w"]/total
+            if wr > 0.60 and ORACLE_DELTA_CONTRA_MAX < 0.06:
+                ORACLE_DELTA_CONTRA_MAX = round(min(0.06, ORACLE_DELTA_CONTRA_MAX + 0.005), 3)
+                adjustments.append(f"delta_contra↑ {ORACLE_DELTA_CONTRA_MAX:.3f}% (WR skips {wr*100:.0f}%)")
+            elif wr < 0.35 and ORACLE_DELTA_CONTRA_MAX > 0.01:
+                ORACLE_DELTA_CONTRA_MAX = round(max(0.01, ORACLE_DELTA_CONTRA_MAX - 0.005), 3)
+                adjustments.append(f"delta_contra↓ {ORACLE_DELTA_CONTRA_MAX:.3f}% (WR skips {wr*100:.0f}%)")
+
+    if adjustments:
+        msg = f"🔧 *Auto-calibration*\n" + "\n".join(f"  • {a}" for a in adjustments)
+        msg += f"\n_Basé sur {len(resolved)} patterns résolus_"
+        st.calibration_log.append({"ts":int(time.time()),"adjustments":adjustments})
+        await send(context.bot, msg)
+        log.info(f"Auto-calibration: {adjustments}")
+    else:
+        log.info(f"Auto-calibration: seuils OK (patterns:{len(resolved)}, filtres:{list(by_filter.keys())})")
+
+
+async def job_pattern_memory(context):
+    """
+    ✅ v10.37 — Point 2: Mémoire des patterns gagnants.
+    Toutes les heures, calcule le WR par combinaison (gap_range × delta_range × filtre).
+    Stocke les patterns qui gagnent et ceux qui perdent → p_oracle ajusté.
+    Résultat: /learn affiche les conditions optimales détectées.
+    """
+    resolved = [p for p in st.oracle_patterns if p.get("result") in ("WIN","LOSS")]
+    if len(resolved) < 20: return
+
+    # Buckets gap: faible 0.01-0.03%, moyen 0.03-0.05%, fort >0.05%
+    def gap_bucket(g):
+        a=abs(g)
+        return "fort" if a>=0.05 else "moyen" if a>=0.03 else "faible"
+
+    def delta_bucket(d):
+        a=abs(d)
+        return "contre_fort" if a>=0.04 else "contre_léger" if a>=0.01 else "neutre"
+
+    combos = {}
+    for p in resolved[-150:]:
+        k = f"gap:{gap_bucket(p.get('gap',0))} delta:{delta_bucket(p.get('delta',0))}"
+        if k not in combos: combos[k]={"w":0,"l":0}
+        if p["result"]=="WIN": combos[k]["w"]+=1
+        else: combos[k]["l"]+=1
+
+    top_win = sorted([(k,v) for k,v in combos.items() if v["w"]+v["l"]>=5],
+                     key=lambda x: x[1]["w"]/(x[1]["w"]+x[1]["l"]), reverse=True)
+    if top_win:
+        best_k, best_v = top_win[0]
+        best_wr = best_v["w"]/(best_v["w"]+best_v["l"])*100
+        st.haiku_insights.append({
+            "type":"pattern","ts":int(time.time()),
+            "insight":f"Meilleur pattern: {best_k} → {best_wr:.0f}% WR ({best_v['w']+best_v['l']} trades)",
+            "combos":top_win[:3]})
+        log.info(f"Pattern memory: best={best_k} WR={best_wr:.0f}%")
+
+
+async def job_haiku_analysis(context):
+    """
+    ✅ v10.37 — Point 3: Claude Haiku analyse les stats toutes les 2h.
+    Envoie les 20 derniers patterns + résultats → Haiku identifie des patterns
+    que le code n'a pas vus. Coût: ~0.005$ par analyse. Résultat dans /learn.
+    """
+    if not ANTHROPIC_KEY: return
+    now = time.time()
+    if now - st.last_haiku_ts < 7200: return  # max 1 analyse / 2h
+    resolved = [p for p in st.oracle_patterns if p.get("result") in ("WIN","LOSS")]
+    if len(resolved) < 15: return
+
+    sample = resolved[-30:]
+    summary = []
+    for p in sample:
+        summary.append(f"gap={p.get('gap',0):+.3f}% delta={p.get('delta',0):+.3f}% "
+                       f"ret3s={p.get('ret3s',0):+.3f}% votes={p.get('votes',0)}/3 "
+                       f"filter={p.get('filter','?')} → {p['result']}")
+
+    prompt = f"""Tu analyses les skips d'un bot de trading Polymarket BTC 5min.
+Ces trades ont été BLOQUÉS par les filtres mais voici le résultat théorique.
+Trouve des patterns qui pourraient améliorer les seuils de filtrage.
+Réponds en 3 bullet points MAX, très concis, en français.
+
+Données ({len(sample)} skips résolus):
+{chr(10).join(summary)}
+
+Paramètres actuels: ret3s_seuil={ORACLE_GAP_CONFIRM_RET:.3f}% delta_contra={ORACLE_DELTA_CONTRA_MAX:.3f}% gap_fort={ORACLE_GAP_MIN_STRONG:.3f}%
+Seuils actuels: gap_min={ORACLE_ENTRY_DELTA:.3f}% token_max={ORACLE_TOKEN_MAX:.2f}$
+
+Identifie uniquement les patterns statistiquement significatifs (≥5 trades similaires).
+Format: "• [OBSERVATION]: [SUGGESTION CONCRÈTE]" """
+
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post("https://api.anthropic.com/v1/messages",
+                headers={"Content-Type":"application/json","x-api-key":ANTHROPIC_KEY,
+                         "anthropic-version":"2023-06-01"},
+                json={"model":"claude-haiku-4-5-20251001","max_tokens":300,
+                      "messages":[{"role":"user","content":prompt}]},
+                timeout=aiohttp.ClientTimeout(total=20)) as r:
+                if r.status==200:
+                    data=await r.json()
+                    insight=data["content"][0]["text"].strip()
+                    st.haiku_insights.append({"type":"haiku","ts":int(now),"insight":insight})
+                    if len(st.haiku_insights)>20: st.haiku_insights=st.haiku_insights[-20:]
+                    st.last_haiku_ts=now
+                    log.info(f"Haiku insight: {insight[:100]}")
+                    await send(context.bot, f"🤖 *Haiku Analysis*\n{insight}")
+    except Exception as e:
+        log.warning(f"Haiku analysis: {e}")
+
+
+async def cmd_learn(update, context):
+    """✅ v10.37 — Affiche ce que le bot a appris: calibrations + patterns + insights Haiku"""
+    if not auth(update): return
+    lines = ["🧠 *AUTO-APPRENTISSAGE v10.37*\n━━━━━━━━━━━━━━"]
+
+    # Seuils actuels
+    lines.append(f"📐 *Seuils actuels (auto-calibrés):*")
+    lines.append(f"  ret3s: `{ORACLE_GAP_CONFIRM_RET:.3f}%` | delta_contra: `{ORACLE_DELTA_CONTRA_MAX:.3f}%`")
+    lines.append(f"  gap_fort: `{ORACLE_GAP_MIN_STRONG:.3f}%` | gap_min: `{ORACLE_ENTRY_DELTA:.3f}%`")
+
+    # Patterns résolus
+    resolved = [p for p in st.oracle_patterns if p.get("result") in ("WIN","LOSS")]
+    if resolved:
+        wins = sum(1 for p in resolved if p["result"]=="WIN")
+        by_filter = {}
+        for p in resolved:
+            f=p.get("filter","?")
+            if f not in by_filter: by_filter[f]={"w":0,"l":0}
+            if p["result"]=="WIN": by_filter[f]["w"]+=1
+            else: by_filter[f]["l"]+=1
+        lines.append(f"\n📊 *Patterns résolus: {len(resolved)}* (WR: {wins/len(resolved)*100:.0f}%)")
+        for f,v in by_filter.items():
+            tot=v["w"]+v["l"]
+            wr=v["w"]/tot*100 if tot else 0
+            lines.append(f"  `{f}`: {wr:.0f}% ({v['w']}W/{v['l']}L)")
+    else:
+        lines.append("\n📊 Pas encore assez de patterns résolus (<15)")
+
+    # Dernière calibration
+    if st.calibration_log:
+        last=st.calibration_log[-1]
+        ts=datetime.fromtimestamp(last["ts"]).strftime("%d/%m %H:%M")
+        lines.append(f"\n🔧 *Dernière calibration:* `{ts}`")
+        for a in last["adjustments"]: lines.append(f"  • {a}")
+
+    # Insights Haiku
+    if st.haiku_insights:
+        last_h=[x for x in st.haiku_insights if x["type"]=="haiku"]
+        if last_h:
+            lines.append(f"\n🤖 *Dernier insight Haiku:*")
+            lines.append(last_h[-1]["insight"][:300])
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
 def auth(u): return ALLOWED_UID==0 or u.effective_user.id==ALLOWED_UID
 
 def kb():
@@ -2841,6 +3052,9 @@ async def cmd_run(update,context):
     context.job_queue.run_repeating(job_ws_watchdog_all,interval=30,first=1)  # ✅ v10.23 tous les WS
     context.job_queue.run_repeating(job_staged_entry,interval=5,first=14)     # ✅ v10.23 2e tranche
     context.job_queue.run_repeating(job_oracle_lag,interval=5,first=16)       # ✅ v10.30 oracle lag (T-35s→T-6s)
+    context.job_queue.run_repeating(job_auto_calibrate,interval=7200,first=300)  # ✅ v10.37 seuils auto
+    context.job_queue.run_repeating(job_pattern_memory,interval=3600,first=600)  # ✅ v10.37 mémoire patterns
+    context.job_queue.run_repeating(job_haiku_analysis,interval=7200,first=900)  # ✅ v10.37 Haiku insights
     st.fg=await fetch_fear_greed(); st.btc24=await fetch_btc_24h(); sess=session_ctx()
     clob_bal = await fetch_clob_balance()
     if clob_bal is not None and clob_bal > 0:
@@ -3583,7 +3797,7 @@ def main():
         ("balance",cmd_balance),("paper",cmd_paper),("cooldown",cmd_cooldown),("reset",cmd_reset),
         ("setbalance",cmd_setbalance),("backup",cmd_backup),("recap",cmd_recap),("dashboard",cmd_dashboard),
         ("history",cmd_history),("turbo",cmd_turbo),("sell",cmd_sell),("sellcheck",cmd_sellcheck),("fair",cmd_fair),
-        ("backtest",cmd_backtest),("oracle",cmd_oracle),("calib",cmd_calib),("revive",cmd_revive),("autotune",cmd_autotune)]:
+        ("backtest",cmd_backtest),("oracle",cmd_oracle),("calib",cmd_calib),("learn",cmd_learn),("revive",cmd_revive),("autotune",cmd_autotune)]:
         app.add_handler(CommandHandler(name,handler))
     app.add_handler(CallbackQueryHandler(cb))
     log.info(f"🧠 PolyBot v{BOT_VERSION} démarré")
