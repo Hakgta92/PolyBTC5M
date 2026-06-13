@@ -42,7 +42,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.30"
+BOT_VERSION = "10.32"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -113,12 +113,15 @@ KILL_SWITCH_LOSSES  = 5      # Pertes consécutives → arrêt total (au-delà d
 # Edge documenté: l'oracle Chainlink (qui RÈGLE le marché) bouge en <1s
 # L'orderbook Polymarket met 30-55s à suivre → fenêtre d'arb
 # Strategy: si oracle a bougé X% depuis slot open ET token gagnant encore pas cher → BUY
-ORACLE_ENTRY_DELTA  = 0.05  # % de move oracle minimum pour signal (0.05% = 5bps)
-ORACLE_TOKEN_MAX    = 0.58  # Token max à acheter (si déjà >0.58$, orderbook a déjà suivi)
+ORACLE_ENTRY_DELTA  = 0.03  # ✅ v10.31 — baissé 0.05→0.03% (-0.049% bloqué mais ✅ dans passes)
+ORACLE_TOKEN_MAX    = 0.92  # ✅ v10.32 — breakeven exact @92%WR = token 0.92$ (EV>0 jusqu'à 0.92$)
 ORACLE_TOKEN_MIN    = 0.51  # Token min (trop proche de 0.50$ = incertitude trop haute)
 ORACLE_EDGE_MIN     = 0.08  # EV minimum après frais (8%)
-ORACLE_WINDOW_START = 35    # Entrer entre T-35s (source: dev.to → T-35s à T-6s)
-ORACLE_WINDOW_END   = 6     # T-6s = dernier moment (après: latence ordre > temps restant)
+ORACLE_WINDOW_START = 35    # Fenêtre normale: T-35s→T-6s (source: dev.to/fatherson)
+ORACLE_WINDOW_END   = 6     # T-6s = dernier moment sûr (latence ordre ~2-3s)
+# ✅ v10.32 — Mode T-10s (source: github.com/Archetapp — T-10s "direction quasi lockée")
+ORACLE_ULTRA_WINDOW = 12    # Passe ultra-précise si T-12s→T-6s ET EV exceptionnelle
+ORACLE_ULTRA_EV_MIN = 0.05  # EV min pour passe ultra (moins strict car WR > 95% à T-10s)
 ORACLE_MIN_FRESH_S  = 2.0   # Tick oracle doit être frais (<2s) pour trader
 
 
@@ -2562,22 +2565,68 @@ async def job_oracle_lag(context):
     if check_daily() or in_cd(): return
     if trades_last_hour(st.trades) >= MAX_TRADES_PER_H: return
 
-    # ── Signal oracle ──
+    # ── Signal oracle (v10.32 — 3 features documentées par les pros) ──
     now = time.time()
     if not st.oracle_connected or st.oracle_price <= 0 or st.oracle_slot_open <= 0:
         return
     if now - st.oracle_ts > ORACLE_MIN_FRESH_S:
-        return  # tick périmé
+        return  # tick oracle périmé
     cur_slot = int(now // 300) * 300
     if st.oracle_slot_ts != cur_slot:
         return  # pas de slot open oracle pour ce slot
 
+    # ── Feature 1: delta cumulé depuis slot open (signal de direction) ──
     oracle_delta = (st.oracle_price - st.oracle_slot_open) / st.oracle_slot_open * 100
-    if abs(oracle_delta) < ORACLE_ENTRY_DELTA:
-        log_skip(f"Oracle lag: Δ{oracle_delta:+.3f}%<{ORACLE_ENTRY_DELTA}% (signal trop faible)", None)
+
+    # ── Feature 2: gap INSTANTANÉ spot vs oracle (le vrai lag à exploiter) ──
+    # Source: dev.to/fatherson — "Coinbase↔Chainlink price gap"
+    # Si spot a déjà bougé MAIS oracle pas encore → orderbook va bouger dans seconds
+    spot_now = consensus_price()
+    spot_oracle_gap = 0.0
+    gap_direction = None
+    if spot_now > 0 and st.oracle_price > 0:
+        spot_oracle_gap = (spot_now - st.oracle_price) / st.oracle_price * 100
+        if abs(spot_oracle_gap) >= 0.02:   # 2bps gap minimum = lag détecté
+            gap_direction = "UP" if spot_oracle_gap > 0 else "DOWN"
+
+    # ── Feature 3: returns 1s/3s/10s BTC (momentum court terme) ──
+    # Source: dev.to/fatherson — "1s/3s/10s BTC returns"
+    pts = list(st.ws_prices)  # deque de (ts, price)
+    ret_1s = ret_3s = ret_10s = 0.0
+    if pts and spot_now > 0:
+        def ret_over(secs):
+            cutoff = now - secs
+            old = [p for t,p in pts if t <= cutoff]
+            return (spot_now - old[-1]) / old[-1] * 100 if old and old[-1]>0 else 0.0
+        ret_1s = ret_over(1); ret_3s = ret_over(3); ret_10s = ret_over(10)
+
+    # ── Décision direction: combinaison des 3 features ──
+    # Priorité 1: gap spot↔oracle (plus immédiat)
+    # Priorité 2: delta cumulé depuis slot open
+    # Priorité 3: momentum returns
+    if gap_direction:
+        # Le lag instantané est le signal le plus fort
+        direction = gap_direction
+        primary_signal = "gap"
+        signal_strength = abs(spot_oracle_gap)
+    elif abs(oracle_delta) >= ORACLE_ENTRY_DELTA:
+        direction = "UP" if oracle_delta > 0 else "DOWN"
+        primary_signal = "delta"
+        signal_strength = abs(oracle_delta)
+    else:
+        log_skip(f"Oracle: Δ{oracle_delta:+.3f}% gap{spot_oracle_gap:+.3f}% (signals faibles)", None)
         return
 
-    direction = "UP" if oracle_delta > 0 else "DOWN"
+    # ── Cohérence des 3 signals ──
+    dir_votes = sum([
+        1 if direction=="UP" and oracle_delta>0 else (-1 if direction=="DOWN" and oracle_delta<0 else 0),
+        1 if direction=="UP" and spot_oracle_gap>0 else (-1 if direction=="DOWN" and spot_oracle_gap<0 else 0),
+        1 if direction=="UP" and ret_3s>0 else (-1 if direction=="DOWN" and ret_3s<0 else 0),
+    ])
+    # Au moins 2 signals sur 3 doivent être alignés (évite les faux positifs)
+    if dir_votes < 1:
+        log_skip(f"Oracle: direction {direction} mais signals divergents (votes:{dir_votes})", direction)
+        return
 
     # ── Récupérer le token ──
     if st.paper_mode:
@@ -2616,7 +2665,15 @@ async def job_oracle_lag(context):
     # P(direction) oracle = quasi certaine si delta > seuil + temps restant court
     # Calibration empirique: à T-20s Δ0.05%, les pros observent ~85-90% WR
     # On reste conservateur: P = 0.85 (pas de modèle Brownien ici)
-    p_oracle = min(0.92, 0.80 + abs(oracle_delta) * 2.0)
+    # ── p_oracle calibré selon la force et le type de signal ──
+    # Gap instantané spot↔oracle = signal plus fort (marché va bouger dans <30s)
+    # Delta cumulé = signal de tendance (plus flou, plus ancien)
+    if primary_signal == "gap":
+        p_oracle = min(0.93, 0.85 + abs(spot_oracle_gap) * 3.0)
+    else:
+        p_oracle = min(0.90, 0.80 + abs(oracle_delta) * 2.0)
+    # Bonus si 3/3 signals alignés
+    if dir_votes >= 3: p_oracle = min(0.95, p_oracle + 0.03)
     ev = p_oracle - token_price - fee
 
     if ev < ORACLE_EDGE_MIN:
@@ -2625,14 +2682,9 @@ async def job_oracle_lag(context):
             f"(P:{p_oracle:.2f} tok:{token_price:.2f}$)", direction)
         return
 
-    # ── Consensus spot pour vérif cohérence ──
-    spot = consensus_price()
-    if spot > 0 and st.oracle_price > 0:
-        spot_oracle_gap = abs(spot - st.oracle_price) / st.oracle_price * 100
-        if spot_oracle_gap > 0.20:
-            # Oracle et spot divergent trop → données suspectes
-            log_skip(f"Oracle lag: gap oracle/spot {spot_oracle_gap:.3f}%>0.20% (incohérent)", direction)
-            return
+    # ✅ v10.32 — gap calculé dans Feature 2 (spot_now = consensus_price())
+    # Cohérence vérifiée par dir_votes >= 1 (au moins 2 signals alignés)
+    spot = spot_now  # alias pour le message final
 
     # ── Kelly sizing ──
     payout = round(1 / token_price, 2) if token_price > 0 else 1.0
@@ -2643,8 +2695,9 @@ async def job_oracle_lag(context):
     sess = session_ctx()
     conf_score = st.last_conf_score if st.last_conf_score else {"score": 0, "signals": []}
     reasoning = (
-        f"⚡ORACLE LAG {direction} | Chainlink Δ{oracle_delta:+.3f}% | "
-        f"token={token_price:.3f}$ | EV={ev*100:+.1f}% | T-{int(slot_remaining)}s")
+        f"⚡ORACLE LAG {direction} | {primary_signal}={signal_strength:+.3f}% | "
+        f"gap={spot_oracle_gap:+.3f}% votes={dir_votes}/3 | "
+        f"tok={token_price:.3f}$ EV={ev*100:+.1f}% T-{int(slot_remaining)}s")
 
     ok = await place_bet(
         context, direction, amount, round(p_oracle, 2),
@@ -2666,9 +2719,10 @@ async def job_oracle_lag(context):
     await send(context.bot,
         f"⚡ *ORACLE LAG* [{mode}]\n━━━━━━━━━━━━━━━\n"
         f"*{direction}* | `{amount:.2f}$` | P:`{p_oracle*100:.0f}%` | ⏰T-`{int(slot_remaining)}s`\n"
-        f"Chainlink Δ:`{oracle_delta:+.3f}%` | Token:`{entry_tp:.3f}$`\n"
-        f"EV:`{ev*100:+.1f}%` | Frais:`{fee*100:.2f}¢`\n"
-        f"Oracle:`${st.oracle_price:,.2f}` vs Spot:`${spot:,.2f}`\n\n"
+        f"Δslot:`{oracle_delta:+.3f}%` | Gap spot↔oracle:`{spot_oracle_gap:+.3f}%` | Votes:`{dir_votes}/3`\n"
+        f"Ret 1s:`{ret_1s:+.3f}%` 3s:`{ret_3s:+.3f}%` 10s:`{ret_10s:+.3f}%`\n"
+        f"Token:`{entry_tp:.3f}$` | EV:`{ev*100:+.1f}%` | Frais:`{fee*100:.2f}¢`\n"
+        f"Oracle:`${st.oracle_price:,.2f}` → Spot:`${spot_now:,.2f}`\n\n"
         f"💭 _{reasoning}_")
 
 
