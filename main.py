@@ -61,7 +61,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "11.10q"
+BOT_VERSION = "11.10r"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -3192,10 +3192,46 @@ Format: "• [OBSERVATION]: [SUGGESTION CONCRÈTE]" """
 
 
 async def cmd_learn(update, context):
-    """✅ v11.10q — /learn enrichi: patterns détaillés + trades réels + tendances"""
+    """✅ v11.10r — /learn: merge mémoire RAM + JSON branche State en temps réel"""
     if not auth(update): return
     now = time.time()
     lines = [f"🧠 *AUTO-APPRENTISSAGE v{BOT_VERSION}*\n━━━━━━━━━━━━━━"]
+
+    # ── 0) Charger JSON depuis GitHub State en temps réel et merger avec RAM ──
+    try:
+        gh_token = os.getenv("GITHUB_TOKEN","")
+        gh_repo = os.getenv("GITHUB_REPO","")
+        if gh_token and gh_repo:
+            import base64
+            url = f"https://api.github.com/repos/{gh_repo}/contents/polybot_v10_state.json?ref=State"
+            hdrs = {"Authorization": f"token {gh_token}", "Accept": "application/vnd.github.v3+json"}
+            import aiohttp as _aiohttp
+            async with _aiohttp.ClientSession() as s:
+                async with s.get(url, headers=hdrs) as r:
+                    if r.status == 200:
+                        d = await r.json()
+                        data = json.loads(base64.b64decode(d["content"]))
+                        # Merger patterns GitHub + RAM (dédupliquer par ts)
+                        gh_patterns = data.get("oracle_patterns", [])
+                        ram_patterns = st.oracle_patterns
+                        all_ts = {p["ts"] for p in ram_patterns}
+                        merged_patterns = ram_patterns + [p for p in gh_patterns if p["ts"] not in all_ts]
+                        # Merger trades
+                        gh_trades = data.get("trades", [])
+                        ram_trades = st.trades
+                        all_trade_ts = {t["ts"] for t in ram_trades}
+                        merged_trades = ram_trades + [t for t in gh_trades if t["ts"] not in all_trade_ts]
+                        lines.append(f"📡 GitHub State: +{len(merged_patterns)-len(ram_patterns)} patterns | +{len(merged_trades)-len(ram_trades)} trades")
+                    else:
+                        merged_patterns = st.oracle_patterns
+                        merged_trades = st.trades
+        else:
+            merged_patterns = st.oracle_patterns
+            merged_trades = st.trades
+    except Exception as e:
+        merged_patterns = st.oracle_patterns
+        merged_trades = st.trades
+        lines.append(f"⚠️ GitHub State inaccessible: {e}")
 
     # ── 1) Seuils actuels ──
     lines.append(f"📐 *Seuils actuels:*")
@@ -3203,7 +3239,7 @@ async def cmd_learn(update, context):
     lines.append(f"  token:`{ORACLE_TOKEN_MIN:.2f}$`-`{ORACLE_TOKEN_MAX:.2f}$` | EV_min:`{ORACLE_EDGE_MIN*100:.0f}%`")
 
     # ── 2) Trades réels WR ──
-    trades = st.trades
+    trades = merged_trades
     if trades:
         real = [t for t in trades if not t.get("paper")]
         wins_r = sum(1 for t in real if t.get("result")=="WIN")
@@ -3231,7 +3267,7 @@ async def cmd_learn(update, context):
         lines.append(f"  📈 7j: {len(week)} trades | WR:`{wr_w:.0f}%` | PnL:`{pnl_w:+.2f}$`")
 
     # ── 3) Patterns skips détaillés ──
-    resolved = [p for p in st.oracle_patterns if p.get("result") in ("WIN","LOSS")]
+    resolved = [p for p in merged_patterns if p.get("result") in ("WIN","LOSS")]
     resolved_cur = [p for p in resolved if p.get("v") == BOT_VERSION]
     sample = resolved_cur if len(resolved_cur) >= 5 else resolved
     label = f"v{BOT_VERSION}" if len(resolved_cur) >= 5 else f"all ({len(resolved_cur)} en v{BOT_VERSION})"
