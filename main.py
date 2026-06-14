@@ -61,7 +61,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "11.10n"
+BOT_VERSION = "11.10o"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -132,7 +132,7 @@ KILL_SWITCH_LOSSES  = 5      # Pertes consécutives → arrêt total (au-delà d
 # Edge documenté: l'oracle Chainlink (qui RÈGLE le marché) bouge en <1s
 # L'orderbook Polymarket met 30-55s à suivre → fenêtre d'arb
 # Strategy: si oracle a bougé X% depuis slot open ET token gagnant encore pas cher → BUY
-ORACLE_ENTRY_DELTA  = 0.01  # ✅ v11.9 — 0.01% pour capter signaux DOWN faibles (token confirme)
+ORACLE_ENTRY_DELTA  = 0.02  # ✅ v11.10n — 0.02% min (delta +0.011% = bruit, trade perdu -3$)
 ORACLE_TOKEN_MAX    = 0.92  # ✅ v10.32 — breakeven exact @92%WR = token 0.92$ (EV>0 jusqu'à 0.92$)
 ORACLE_TOKEN_MIN    = 0.51  # Token min (trop proche de 0.50$ = incertitude trop haute)
 ORACLE_EDGE_MIN     = 0.08  # EV minimum après frais (8%)
