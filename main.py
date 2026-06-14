@@ -61,7 +61,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "11.10d"
+BOT_VERSION = "11.10e"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -2756,7 +2756,7 @@ async def job_oracle_lag(context):
     gap_direction = None
     if spot_now > 0 and st.oracle_price > 0:
         spot_oracle_gap = (spot_now - st.oracle_price) / st.oracle_price * 100
-        if abs(spot_oracle_gap) >= 0.01:   # ✅ v10.33 — 1bps (Data Streams sub-sec: le lag est bref)
+        if abs(spot_oracle_gap) >= 0.015:  # ✅ v11.10e Haiku — 1.5bps (gap<0.015% = bruit ret3s)
             gap_direction = "UP" if spot_oracle_gap > 0 else "DOWN"
 
     # ── Feature 3: returns 1s/3s/10s BTC (momentum court terme) ──
