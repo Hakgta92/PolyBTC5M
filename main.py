@@ -2982,15 +2982,17 @@ async def push_state_to_github():
         import base64
         data = st.save()
         state_json = json.dumps(data)
+        # ✅ v11.10j — push sur branche "state" pour ne pas déclencher le redéploiement Railway
+        branch = "State"
         url = f"https://api.github.com/repos/{gh_repo}/contents/polybot_v10_state.json"
         hdrs = {"Authorization": f"token {gh_token}",
                 "Accept": "application/vnd.github.v3+json",
                 "Content-Type": "application/json"}
         async with aiohttp.ClientSession() as s:
-            async with s.get(url, headers=hdrs) as r:
+            async with s.get(f"{url}?ref={branch}", headers=hdrs) as r:
                 sha = (await r.json()).get("sha","") if r.status==200 else ""
             content = base64.b64encode(state_json.encode()).decode()
-            body = {"message":f"state {int(time.time())}","content":content}
+            body = {"message":f"state {int(time.time())}","content":content,"branch":branch}
             if sha: body["sha"] = sha
             async with s.put(url, headers=hdrs, json=body) as r:
                 if r.status in (200,201): log.info("✅ State → GitHub")
