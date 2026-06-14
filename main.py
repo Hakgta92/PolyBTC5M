@@ -1549,15 +1549,18 @@ class State:
         except Exception as e:
             log.warning(f"CSV export: {e}")
         data={"bankroll":self.bankroll,"bankroll_ref":self.bankroll_ref,
-            "trades":self.trades[-200:],"wins":self.wins,"losses":self.losses,"pnl":self.pnl,
+            "trades":self.trades,
+            "wins":self.wins,"losses":self.losses,"pnl":self.pnl,
             "best_streak":self.best_streak,"worst_streak":self.worst_streak,"consec":self.consec,
             "daily_start":self.daily_start,"daily_ts":self.daily_ts,
             "daily_pause_until":self.daily_pause_until,"paper_mode":self.paper_mode,
-            "skipped":self.skipped,"pass_reasons":self.pass_reasons[-50:],
+            "skipped":self.skipped,
             "calib_factor":self.calib_factor,"killed":self.killed,
             "version":BOT_VERSION,"saved_at":int(time.time()),
             "oracle_patterns":self.oracle_patterns,
-            "pass_reasons":self.pass_reasons[-500:],"calibration_log":self.calibration_log[-20:],"haiku_insights":self.haiku_insights[-20:]}
+            "pass_reasons":self.pass_reasons[-500:],
+            "calibration_log":self.calibration_log,
+            "haiku_insights":self.haiku_insights[-50:]}
         try:
             with open(DATA_FILE,"w") as f: json.dump(data,f,indent=2)
         except Exception as e: log.error(f"Save: {e}")
