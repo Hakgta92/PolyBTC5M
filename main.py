@@ -61,7 +61,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "11.10k"
+BOT_VERSION = "11.10l"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -3418,6 +3418,13 @@ async def cmd_status(update,context):
 
 async def cmd_balance(update,context):
     if not auth(update): return
+    # ✅ v11.10l — sync BR avec CLOB réel à chaque /balance
+    if not st.paper_mode:
+        try:
+            fresh = await fetch_clob_balance()
+            if fresh and fresh > 0 and abs(fresh - st.bankroll) > 0.10:
+                st.bankroll = round(fresh, 2)
+        except: pass
     w=POLY_PROXY_WALLET or "?"
     short=f"{w[:6]}...{w[-4:]}"
     real_balance = None
