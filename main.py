@@ -61,7 +61,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "11.10h"
+BOT_VERSION = "11.10i"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -1567,14 +1567,7 @@ class State:
             data=self.save()
             with open(BACKUP_FILE,"w") as f: json.dump(data,f,indent=2)
             log.info(f"✅ Backup BR:{self.bankroll:.2f}")
-            gh_token = os.getenv("GITHUB_TOKEN","")
-            gh_repo = os.getenv("GITHUB_REPO","")
-            if gh_token and gh_repo:
-                try:
-                    loop = asyncio.get_event_loop()
-                    if loop and loop.is_running():
-                        loop.create_task(push_state_to_github())
-                except Exception: pass
+            # ✅ v11.10i — GitHub push déplacé dans job_backup (async, plus stable)
             return True
         except Exception as e: log.error(f"Backup: {e}"); return False
 
@@ -1678,8 +1671,15 @@ async def send(bot,text,parse_mode="Markdown"):
 async def job_backup(context):
     # ✅ v10.23 — Auto-calibration sigma à chaque backup
     factor, _ = calibrate_sigma()
-    st.calib_factor = factor
     st.backup()
+    # ✅ v11.10i — Push GitHub depuis contexte async (stable)
+    try:
+        gh_token = os.getenv("GITHUB_TOKEN","")
+        gh_repo = os.getenv("GITHUB_REPO","")
+        if gh_token and gh_repo:
+            await push_state_to_github()
+    except Exception as e:
+        log.warning(f"job_backup github: {e}")
 
 async def job_sync_balance(context):
     """✅ v11.9 — Sync auto BR avec solde CLOB réel toutes les 30min (h24 sans intervention)"""
