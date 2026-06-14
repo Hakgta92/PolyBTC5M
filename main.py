@@ -153,8 +153,8 @@ EXCH_STALE_S        = 3.0   # Prix exchange ignoré si plus vieux que 3s (consen
 
 
 TAKE_PROFIT_MULT    = 2.0
-TRAILING_PEAK_MULT  = 1.5
-TRAILING_STOP_MULT  = 1.3
+TRAILING_PEAK_MULT  = 99.0  # ✅ v11.9l — désactivé en réel (binaire: tenir jusqu'à résolution)
+TRAILING_STOP_MULT  = 0.01  # ✅ v11.9l — désactivé (seuil impossible = jamais déclenché)
 TAKE_PROFIT_CHECK   = 15   # ✅ v10.22 — 15s (avant: 30s, trop lent sur du 5min)
 POLY_FEE            = 0.02 # Legacy: estimation flat pour le paper mode uniquement
 MAX_CONSEC_LOSS     = 2
@@ -1490,6 +1490,11 @@ class State:
         self.current_market=None; self.active_order_id=None; self.active_token_id=None
         self.entry_token_price=0.0; self.shares_bought=0.0
         self.token_price_peak=0.0; self.trailing_active=False
+        # ✅ v11.9m — Orderbook imbalance (Strategy 2)
+        self.ob_imbalance=0.0        # -1.0 (full DOWN) → +1.0 (full UP)
+        self.ob_ts=0.0               # timestamp dernier update OB
+        self.ob_asset_id=""          # token UP actuellement tracké
+        self.clob_ws_task=None       # tâche WS CLOB
         self.bet_expiry=0
         self.last_ob=None; self.last_liq=None; self.last_eth_klines=[]
         self.last_news={"sentiment":"neutral","score":0,"news":[]}
@@ -1932,6 +1937,47 @@ async def ws_bitstamp_loop():
         except Exception as e:
             log.warning(f"WS Bitstamp: {e}")
         await asyncio.sleep(5)
+
+
+async def ws_clob_loop(asset_id_up: str):
+    """
+    ✅ v11.9m — Orderbook imbalance via CLOB WebSocket Polymarket.
+    Source: benjamincup.substack.com — Strategy 2: 80-90% WR sur imbalance forte.
+    Si côté UP a beaucoup plus d'acheteurs que de vendeurs → signal UP (smart money).
+    """
+    if not asset_id_up:
+        return
+    url = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+    sub = {"assets_ids": [asset_id_up], "type": "market"}
+    st.ob_asset_id = asset_id_up
+    st.ob_imbalance = 0.0
+    log.info(f"✅ WS CLOB OB démarré pour {asset_id_up[:12]}...")
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.ws_connect(url, heartbeat=10, timeout=aiohttp.ClientTimeout(total=300)) as ws:
+                await ws.send_json(sub)
+                async for msg in ws:
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        d = json.loads(msg.data)
+                        event_type = d.get("event_type") or d.get("type", "")
+                        # Formats: book, price_change, last_trade_price
+                        if event_type in ("book", "price_change"):
+                            bids = d.get("bids") or d.get("bid_size") or []
+                            asks = d.get("asks") or d.get("ask_size") or []
+                            # Calculer le volume total bids vs asks
+                            if isinstance(bids, list) and isinstance(asks, list):
+                                bid_vol = sum(float(b.get("size", b[1] if isinstance(b, list) else 0)) for b in bids)
+                                ask_vol = sum(float(a.get("size", a[1] if isinstance(a, list) else 0)) for a in asks)
+                                total = bid_vol + ask_vol
+                                if total > 0:
+                                    # imbalance > 0 = plus d'acheteurs UP → signal UP
+                                    st.ob_imbalance = (bid_vol - ask_vol) / total
+                                    st.ob_ts = time.time()
+                    elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                        break
+    except Exception as e:
+        log.warning(f"WS CLOB OB: {e}")
+    st.ob_imbalance = 0.0
 
 
 async def ws_oracle_loop():
@@ -2707,11 +2753,16 @@ async def job_oracle_lag(context):
         log_skip(f"Oracle: Δ{oracle_delta:+.3f}% gap{spot_oracle_gap:+.3f}% (signals faibles)", None)
         return
 
-    # ── Cohérence des 3 signals (v10.36 — filtres renforcés) ──
+    # ── Cohérence des 4 signals (v11.9m — orderbook imbalance ajouté) ──
+    ob_vote = 0
+    if time.time() - st.ob_ts < 10:
+        if st.ob_imbalance > 0.15: ob_vote = 1
+        elif st.ob_imbalance < -0.15: ob_vote = -1
     dir_votes = sum([
         1 if direction=="UP" and oracle_delta>0 else (-1 if direction=="DOWN" and oracle_delta<0 else 0),
         1 if direction=="UP" and spot_oracle_gap>0 else (-1 if direction=="DOWN" and spot_oracle_gap<0 else 0),
         1 if direction=="UP" and ret_3s>0 else (-1 if direction=="DOWN" and ret_3s<0 else 0),
+        ob_vote,  # ✅ v11.9m — orderbook imbalance (4ème signal)
     ])
 
     # ✅ v11.9h — Fix#1 corrigé: ne pas bloquer quand le delta primaire est fort ET dans la bonne direction
@@ -2766,6 +2817,12 @@ async def job_oracle_lag(context):
         st.current_market = market
         token_used = market["token_up"] if direction == "UP" else market["token_down"]
         token_price = await poly.get_token_price(token_used)
+        # ✅ v11.9m — lancer WS CLOB orderbook pour ce slot
+        asset_up = market.get("token_up", "")
+        if asset_up and st.ob_asset_id != asset_up:
+            if hasattr(st,"clob_ws_task") and st.clob_ws_task and not st.clob_ws_task.done():
+                st.clob_ws_task.cancel()
+            st.clob_ws_task = asyncio.create_task(ws_clob_loop(asset_up))
         tpu = token_price if direction == "UP" else 1.0 - token_price
         tpd = 1.0 - tpu
         try:
@@ -2847,7 +2904,7 @@ async def job_oracle_lag(context):
     await send(context.bot,
         f"⚡ *ORACLE LAG* [{mode}]\n━━━━━━━━━━━━━━━\n"
         f"*{direction}* | `{amount:.2f}$` | P:`{p_oracle*100:.0f}%` | ⏰T-`{int(slot_remaining)}s`\n"
-        f"Δslot:`{oracle_delta:+.3f}%` | Gap spot↔oracle:`{spot_oracle_gap:+.3f}%` | Votes:`{dir_votes}/3`\n"
+        f"Δslot:`{oracle_delta:+.3f}%` | Gap:`{spot_oracle_gap:+.3f}%` OB:`{st.ob_imbalance:+.2f}` | Votes:`{dir_votes}/4`\n"
         f"Ret 1s:`{ret_1s:+.3f}%` 3s:`{ret_3s:+.3f}%` 10s:`{ret_10s:+.3f}%`\n"
         f"Token:`{entry_tp:.3f}$` | EV:`{ev*100:+.1f}%` | Frais:`{fee*100:.2f}¢`\n"
         f"Oracle:`${st.oracle_price:,.2f}` → Spot:`${spot_now:,.2f}`\n\n"
