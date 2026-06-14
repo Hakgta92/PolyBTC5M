@@ -61,7 +61,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "11.10c"
+BOT_VERSION = "11.10d"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -1739,12 +1739,18 @@ async def job_check_expiry(context):
         # ✅ Clôture automatique 60s après expiration
         if remaining < -60:
             log.info("Slot expiré depuis >60s — clôture automatique")
-            clob_bal = await fetch_clob_balance()
+            # ✅ v11.10d — attendre settlement Polygon avant lecture solde réel
+            await asyncio.sleep(5)
+            prev_bal = st.bankroll
+            clob_bal = None
+            for _i in range(4):
+                clob_bal = await fetch_clob_balance()
+                if clob_bal and clob_bal > 0: break
+                await asyncio.sleep(3)
             bet = st.bet
             if clob_bal and clob_bal > 0:
-                prev_bal = st.bankroll
                 gross = round(clob_bal - prev_bal, 2)
-                won = gross >= 0
+                won = gross >= -0.05
                 st.bankroll = clob_bal
             else:
                 gross = 0.0; won = False
@@ -1822,11 +1828,20 @@ async def job_take_profit(context):
                 opp_token = st.current_market.get("token_up") if st.bet.get("dir")=="DOWN" else st.current_market.get("token_down")
             result = await poly.sell_position(st.active_token_id, shares_to_sell, opp_token, current_price)
             if result:
-                gross = round((current_price - st.entry_token_price) * shares_to_sell, 2)
-                clob_bal = await fetch_clob_balance()
+                gross_est = round((current_price - st.entry_token_price) * shares_to_sell, 2)
+                # ✅ v11.10d — attendre settlement Polygon (5s) pour vrai solde
+                prev_bal = st.bankroll
+                await asyncio.sleep(5)
+                clob_bal = None
+                for _i in range(4):
+                    clob_bal = await fetch_clob_balance()
+                    if clob_bal and clob_bal > 0: break
+                    await asyncio.sleep(3)
                 if clob_bal and clob_bal > 0:
+                    gross = round(clob_bal - prev_bal, 2)
                     st.bankroll = clob_bal
                 else:
+                    gross = gross_est
                     st.bankroll = max(0.0, st.bankroll + gross)
                 st.pnl += gross
                 bet = st.bet
