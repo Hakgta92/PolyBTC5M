@@ -61,7 +61,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "11.10o"
+BOT_VERSION = "11.10p"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -4052,6 +4052,16 @@ async def cb(update,context):
     if q.data in h: await h[q.data](update,context)
 
 def main():
+    # ✅ v11.10p — Télécharger le state depuis GitHub branche State AVANT st.load()
+    import asyncio as _asyncio
+    async def _pull():
+        ok = await pull_state_from_github()
+        if ok: log.info("✅ State GitHub chargé au démarrage")
+        else: log.warning("⚠️ GitHub pull échoué — state local utilisé")
+    try:
+        _asyncio.run(_pull())
+    except Exception as e:
+        log.warning(f"GitHub pull démarrage: {e}")
     st.load()
     if not st.paper_mode and POLY_PRIVATE_KEY: poly.init_client()
     app=Application.builder().token(TOKEN).build()
