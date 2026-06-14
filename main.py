@@ -61,7 +61,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "11.10p"
+BOT_VERSION = "11.10q"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -3188,47 +3188,87 @@ Format: "• [OBSERVATION]: [SUGGESTION CONCRÈTE]" """
 
 
 async def cmd_learn(update, context):
-    """✅ v10.37 — Affiche ce que le bot a appris: calibrations + patterns + insights Haiku"""
+    """✅ v11.10q — /learn enrichi: patterns détaillés + trades réels + tendances"""
     if not auth(update): return
-    lines = ["🧠 *AUTO-APPRENTISSAGE v10.37*\n━━━━━━━━━━━━━━"]
+    now = time.time()
+    lines = [f"🧠 *AUTO-APPRENTISSAGE v{BOT_VERSION}*\n━━━━━━━━━━━━━━"]
 
-    # Seuils actuels
-    lines.append(f"📐 *Seuils actuels (auto-calibrés):*")
-    lines.append(f"  delta_contra: `{ORACLE_DELTA_CONTRA_MAX:.3f}%` | gap_fort: `{ORACLE_GAP_MIN_STRONG:.3f}%`")
-    lines.append(f"  gap_min: `{ORACLE_ENTRY_DELTA:.3f}%` | token: `{ORACLE_TOKEN_MIN:.2f}$`-`{ORACLE_TOKEN_MAX:.2f}$`")
-    lines.append(f"  EV_min: `{ORACLE_EDGE_MIN*100:.0f}%` | delta_strict: `0.020%`")
+    # ── 1) Seuils actuels ──
+    lines.append(f"📐 *Seuils actuels:*")
+    lines.append(f"  delta_contra:`{ORACLE_DELTA_CONTRA_MAX:.3f}%` | gap_min:`{ORACLE_ENTRY_DELTA:.3f}%`")
+    lines.append(f"  token:`{ORACLE_TOKEN_MIN:.2f}$`-`{ORACLE_TOKEN_MAX:.2f}$` | EV_min:`{ORACLE_EDGE_MIN*100:.0f}%`")
 
-    # Patterns résolus
+    # ── 2) Trades réels WR ──
+    trades = st.trades
+    if trades:
+        real = [t for t in trades if not t.get("paper")]
+        wins_r = sum(1 for t in real if t.get("result")=="WIN")
+        losses_r = len(real) - wins_r
+        pnl_r = sum(t.get("pnl",0) for t in real)
+        wr_r = wins_r/len(real)*100 if real else 0
+        avg_win = sum(t["pnl"] for t in real if t.get("result")=="WIN")/max(wins_r,1)
+        avg_loss = sum(t["pnl"] for t in real if t.get("result")!="WIN")/max(losses_r,1)
+        # Tendances: dernières 24h vs total
+        ts_24h = now - 86400
+        recent = [t for t in real if t.get("ts",0) > ts_24h]
+        wins_24h = sum(1 for t in recent if t.get("result")=="WIN")
+        wr_24h = wins_24h/len(recent)*100 if recent else 0
+        pnl_24h = sum(t.get("pnl",0) for t in recent)
+        lines.append(f"\n💰 *Trades réels:* {len(real)} | WR:`{wr_r:.0f}%` | PnL:`{pnl_r:+.2f}$`")
+        lines.append(f"  Gain moy:`+{avg_win:.2f}$` | Perte moy:`{avg_loss:.2f}$` | R:R:`{abs(avg_win/avg_loss):.2f}`")
+        lines.append(f"  📅 24h: {len(recent)} trades | WR:`{wr_24h:.0f}%` | PnL:`{pnl_24h:+.2f}$`")
+        # Tendance semaine vs hier
+        ts_48h = now - 172800
+        ts_7d = now - 604800
+        week = [t for t in real if t.get("ts",0) > ts_7d]
+        wins_w = sum(1 for t in week if t.get("result")=="WIN")
+        wr_w = wins_w/len(week)*100 if week else 0
+        pnl_w = sum(t.get("pnl",0) for t in week)
+        lines.append(f"  📈 7j: {len(week)} trades | WR:`{wr_w:.0f}%` | PnL:`{pnl_w:+.2f}$`")
+
+    # ── 3) Patterns skips détaillés ──
     resolved = [p for p in st.oracle_patterns if p.get("result") in ("WIN","LOSS")]
-    if resolved:
-        wins = sum(1 for p in resolved if p["result"]=="WIN")
+    resolved_cur = [p for p in resolved if p.get("v") == BOT_VERSION]
+    sample = resolved_cur if len(resolved_cur) >= 5 else resolved
+    label = f"v{BOT_VERSION}" if len(resolved_cur) >= 5 else f"all ({len(resolved_cur)} en v{BOT_VERSION})"
+
+    if sample:
+        wins = sum(1 for p in sample if p["result"]=="WIN")
         by_filter = {}
-        for p in resolved:
+        for p in sample:
             f=p.get("filter","?")
             if f not in by_filter: by_filter[f]={"w":0,"l":0}
             if p["result"]=="WIN": by_filter[f]["w"]+=1
             else: by_filter[f]["l"]+=1
-        lines.append(f"\n📊 *Patterns résolus: {len(resolved)}* (WR: {wins/len(resolved)*100:.0f}%)")
-        for f,v in by_filter.items():
+        lines.append(f"\n📊 *Patterns skips: {len(sample)}* (WR:{wins/len(sample)*100:.0f}%) — {label}")
+        for f,v in sorted(by_filter.items(), key=lambda x: x[1]["w"]+x[1]["l"], reverse=True)[:6]:
             tot=v["w"]+v["l"]
             wr=v["w"]/tot*100 if tot else 0
-            lines.append(f"  `{f}`: {wr:.0f}% ({v['w']}W/{v['l']}L)")
+            emoji = "✅" if wr < 40 else ("⚠️" if wr > 65 else "➖")
+            lines.append(f"  {emoji}`{f}`: {wr:.0f}% ({v['w']}W/{v['l']}L)")
+        # Tendances patterns 24h vs total
+        recent_p = [p for p in sample if p.get("ts",0) > now-86400]
+        if recent_p:
+            wins_p24 = sum(1 for p in recent_p if p["result"]=="WIN")
+            wr_p24 = wins_p24/len(recent_p)*100
+            lines.append(f"  📅 24h: {len(recent_p)} patterns | WR:{wr_p24:.0f}%")
     else:
-        lines.append("\n📊 Pas encore assez de patterns résolus (<15)")
+        lines.append(f"\n📊 Pas encore assez de patterns (<5 en v{BOT_VERSION})")
+        if resolved: lines.append(f"  📦 Historique: {len(resolved)} patterns")
 
-    # Dernière calibration
+    # ── 4) Dernière calibration ──
     if st.calibration_log:
         last=st.calibration_log[-1]
         ts=datetime.fromtimestamp(last["ts"]).strftime("%d/%m %H:%M")
-        lines.append(f"\n🔧 *Dernière calibration:* `{ts}`")
-        for a in last["adjustments"]: lines.append(f"  • {a}")
+        lines.append(f"\n🔧 *Calibration:* `{ts}`")
+        for a in last["adjustments"][:3]: lines.append(f"  • {a}")
 
-    # Insights Haiku
+    # ── 5) Insights Haiku ──
     if st.haiku_insights:
         last_h=[x for x in st.haiku_insights if x["type"]=="haiku"]
         if last_h:
-            lines.append(f"\n🤖 *Dernier insight Haiku:*")
-            lines.append(last_h[-1]["insight"][:300])
+            lines.append(f"\n🤖 *Haiku ({datetime.fromtimestamp(last_h[-1].get('ts',now)).strftime('%d/%m %H:%M')}):*")
+            lines.append(last_h[-1]["insight"][:400])
 
     try:
         await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
