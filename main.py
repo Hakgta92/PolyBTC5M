@@ -3182,6 +3182,16 @@ async def cmd_run(update,context):
         if not poly.init_client():
             await update.message.reply_text("⚠️ Polymarket indispo — paper mode activé",parse_mode="Markdown")
             st.paper_mode=True
+    # ✅ v11.10 — Sync BR immédiate avec CLOB réel au démarrage (plus de décalage BR/CLOB)
+    if not st.paper_mode:
+        try:
+            clob_bal = await fetch_clob_balance()
+            if clob_bal and clob_bal > 0:
+                st.bankroll = round(clob_bal, 2)
+                st.bankroll_ref = round(clob_bal, 2)
+                log.info(f"✅ BR sync démarrage: {clob_bal:.2f}$")
+        except Exception as e:
+            log.warning(f"BR sync démarrage: {e}")
     st.running=True; st.session_start=time.time(); st.daily_ts=time.time()
     st.price_job=context.job_queue.run_repeating(job_price,interval=30,first=5)
     st.macro_job=context.job_queue.run_repeating(job_macro,interval=300,first=8)
