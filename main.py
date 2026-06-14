@@ -61,7 +61,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "11.9h"
+BOT_VERSION = "11.9l"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -2732,36 +2732,21 @@ async def job_oracle_lag(context):
                           "votes":dir_votes,"filter":"votes_delta"})
             return
 
-    # ✅ v10.36 FIX #2 — Filtre tendance 10min (source: -93% pertes dans étude live Polymarket)
-    # Si BTC a bougé contre notre direction sur les 10 dernières minutes → skip
-    # Protège contre les gaps momentanés dans une tendance opposée claire
-    cur_px = st.ws_price if st.ws_price > 0 else spot_now
-    if len(st.price_history) >= 2 and cur_px > 0:
-        old_prices = [x for x in st.price_history if time.time() - x["ts"] >= 540]
-        if old_prices:
-            ref_10min = old_prices[-1]["price"]
-            ch10 = (cur_px - ref_10min) / ref_10min * 100 if ref_10min > 0 else 0
-            if direction == "UP" and ch10 < -ORACLE_TREND_10MIN:
-                log_skip(f"Oracle: UP bloqué — tendance 10min {ch10:+.2f}% (baissière)", direction, features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"filter":"trend10","ch10":ch10})
-                return
-            if direction == "DOWN" and ch10 > ORACLE_TREND_10MIN:
-                log_skip(f"Oracle: DOWN bloqué — tendance 10min {ch10:+.2f}% (haussière)", direction, features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"filter":"trend10","ch10":ch10})
-                return
+    # ✅ v11.9l — tendance 10min SUPPRIMÉ (100% WR sur 4 bloqués)
 
-    # ✅ v11.9g — Nouveau Fix#3: delta doit confirmer le gap (Haiku: ALL WIN delta≥+0.031%)
-    # ret3s supprimé (bruit identique WIN/LOSS). Nouveau check: si gap UP mais delta négatif → skip
-    DELTA_CONTRA_STRICT = 0.020  # Plus strict que Fix#1 pour bloquer les deltas moderément contre
-    if primary_signal == "gap" and direction == "UP" and oracle_delta < -DELTA_CONTRA_STRICT:
+    # ✅ v11.9l Haiku: delta<-0.005% = LOSS garanti (19/19 sur 300 patterns réels)
+    # Plus besoin du DELTA_CONTRA_STRICT — on bloque tout delta négatif pour UP
+    if direction == "UP" and oracle_delta < -0.005:
         log_skip(
-            f"Oracle: gap UP mais delta {oracle_delta:+.3f}%<-{DELTA_CONTRA_STRICT}% (contra trop fort)",
+            f"Oracle: UP bloqué delta {oracle_delta:+.3f}%<0 (Haiku 19/19 LOSS)",
             direction, features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,
-                                  "votes":dir_votes,"filter":"delta_contra"})
+                                  "votes":dir_votes,"filter":"delta_neg"})
         return
-    if primary_signal == "gap" and direction == "DOWN" and oracle_delta > DELTA_CONTRA_STRICT:
+    if direction == "DOWN" and oracle_delta > 0.005:
         log_skip(
-            f"Oracle: gap DOWN mais delta {oracle_delta:+.3f}%>+{DELTA_CONTRA_STRICT}% (contra trop fort)",
+            f"Oracle: DOWN bloqué delta {oracle_delta:+.3f}%>0 (delta positif = contre-signal DOWN)",
             direction, features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,
-                                  "votes":dir_votes,"filter":"delta_contra"})
+                                  "votes":dir_votes,"filter":"delta_neg"})
         return
 
     # ── Récupérer le token ──
