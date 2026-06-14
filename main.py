@@ -61,7 +61,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "11.10r"
+BOT_VERSION = "11.10s"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -4135,8 +4135,41 @@ async def cb(update,context):
     if q.data in h: await h[q.data](update,context)
 
 def main():
+    # ✅ v11.10r — Handler SIGTERM: backup immédiat avant arrêt Railway
+    import signal as _signal, asyncio as _asyncio
+
+    def _on_sigterm(signum, frame):
+        log.info("⚡ SIGTERM reçu — backup d'urgence avant arrêt")
+        st.backup()
+        # Push synchrone vers GitHub
+        try:
+            import base64, urllib.request
+            gh_token = os.getenv("GITHUB_TOKEN","")
+            gh_repo = os.getenv("GITHUB_REPO","")
+            if gh_token and gh_repo:
+                import json as _json
+                data = st.save()
+                state_json = _json.dumps(data)
+                url = f"https://api.github.com/repos/{gh_repo}/contents/polybot_v10_state.json"
+                # Récupérer SHA
+                req = urllib.request.Request(url, headers={"Authorization": f"token {gh_token}", "Accept": "application/vnd.github.v3+json"})
+                try:
+                    resp = urllib.request.urlopen(req, timeout=5)
+                    sha = _json.loads(resp.read()).get("sha","")
+                except: sha = ""
+                # Push
+                content = base64.b64encode(state_json.encode()).decode()
+                body = _json.dumps({"message":"emergency backup","content":content,"branch":"State","sha":sha} if sha else {"message":"emergency backup","content":content,"branch":"State"}).encode()
+                req2 = urllib.request.Request(url, data=body, method="PUT", headers={"Authorization": f"token {gh_token}", "Content-Type": "application/json", "Accept": "application/vnd.github.v3+json"})
+                urllib.request.urlopen(req2, timeout=5)
+                log.info("✅ Emergency backup → GitHub State")
+        except Exception as e:
+            log.warning(f"Emergency backup GitHub: {e}")
+        import sys; sys.exit(0)
+
+    _signal.signal(_signal.SIGTERM, _on_sigterm)
+
     # ✅ v11.10p — Télécharger le state depuis GitHub branche State AVANT st.load()
-    import asyncio as _asyncio
     async def _pull():
         ok = await pull_state_from_github()
         if ok: log.info("✅ State GitHub chargé au démarrage")
