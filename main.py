@@ -61,7 +61,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "11.9l"
+BOT_VERSION = "11.10"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -188,6 +188,24 @@ DASHBOARD_FILE= "/tmp/polybot_dashboard.html"
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO,
     handlers=[logging.FileHandler("polybot_v10.log"), logging.StreamHandler()])
 log = logging.getLogger(__name__)
+
+def expected_token_price(delta_pct: float, time_remaining: float) -> float:
+    """
+    ✅ v11.10 — Modèle token price attendu (source: github.com/Archetapp, observation live)
+    delta_pct: % de move depuis slot open (abs value)
+    time_remaining: secondes restantes
+    Retourne le prix attendu du token gagnant selon le delta.
+    Si marché < expected → mispricing exploitable.
+    """
+    # Ajustement temporel: plus on est proche de la fin, plus le token est pricé
+    time_factor = max(0.5, min(1.0, time_remaining / 60))  # 1.0 à T-60s, 0.5 à T-30s
+    if delta_pct < 0.005:   return 0.50  # coin flip
+    elif delta_pct < 0.020: return 0.50 + (delta_pct - 0.005) / 0.015 * 0.05  # 0.50-0.55
+    elif delta_pct < 0.050: return 0.55 + (delta_pct - 0.020) / 0.030 * 0.10  # 0.55-0.65
+    elif delta_pct < 0.100: return 0.65 + (delta_pct - 0.050) / 0.050 * 0.15  # 0.65-0.80
+    elif delta_pct < 0.150: return 0.80 + (delta_pct - 0.100) / 0.050 * 0.12  # 0.80-0.92
+    else:                    return min(0.97, 0.92 + (delta_pct - 0.150) * 1.0) # 0.92-0.97
+
 
 def taker_fee_per_share(p):
     """
@@ -1537,7 +1555,8 @@ class State:
             "daily_pause_until":self.daily_pause_until,"paper_mode":self.paper_mode,
             "skipped":self.skipped,"pass_reasons":self.pass_reasons[-50:],
             "calib_factor":self.calib_factor,"killed":self.killed,
-            "version":BOT_VERSION,"saved_at":int(time.time())}
+            "version":BOT_VERSION,"saved_at":int(time.time()),
+            "oracle_patterns":self.oracle_patterns[-200:],"calibration_log":self.calibration_log[-20:],"haiku_insights":self.haiku_insights[-20:]}
         try:
             with open(DATA_FILE,"w") as f: json.dump(data,f,indent=2)
         except Exception as e: log.error(f"Save: {e}")
@@ -2835,28 +2854,43 @@ async def job_oracle_lag(context):
     if token_price > ORACLE_TOKEN_MAX:
         log_skip(f"Oracle lag: token {token_price:.2f}$>{ORACLE_TOKEN_MAX}$ (déjà pricé)", direction, features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"filter":"token_max","token":token_price})
         return
+    # ✅ v11.10 — Liquidity extreme: token 0.10-0.51$ autorisé si signal très fort
+    # Source: MEXC/Polymarket — bot a fait $16→$16k en achetant token à $0.01
+    # Condition: delta fort (≥0.05%) + votes ≥ 2 + mispricing élevé
     if token_price < ORACLE_TOKEN_MIN:
-        log_skip(f"Oracle lag: token {token_price:.2f}$<{ORACLE_TOKEN_MIN}$ (trop incertain)", direction, features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"filter":"token_min","token":token_price})
-        return
+        extreme_mispricing = expected_token_price(abs(oracle_delta), slot_remaining) - token_price
+        extreme_signal = (abs(oracle_delta) >= 0.05 and dir_votes >= 2 and
+                         extreme_mispricing > 0.20 and token_price >= 0.10)
+        if not extreme_signal:
+            log_skip(f"Oracle lag: token {token_price:.2f}$<{ORACLE_TOKEN_MIN}$ (trop incertain)", direction, features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"filter":"token_min","token":token_price})
+            return
+        log.info(f"⚡ EXTREME MISPRICING: token={token_price:.2f}$ expected={expected_token_price(abs(oracle_delta),slot_remaining):.2f}$ delta={oracle_delta:+.3f}%")
 
     fee = taker_fee_per_share(token_price)
     # P(direction) oracle = quasi certaine si delta > seuil + temps restant court
     # Calibration empirique: à T-20s Δ0.05%, les pros observent ~85-90% WR
     # On reste conservateur: P = 0.85 (pas de modèle Brownien ici)
-    # ── p_oracle calibré selon la force et le type de signal ──
-    # Gap instantané spot↔oracle = signal plus fort (Binance bouge avant aggregate)
-    # Delta cumulé = signal de tendance
+    # ── p_oracle calibré v11.10 — signal + time-weighting + mispricing ──
     if primary_signal == "gap":
         p_oracle = min(0.93, 0.85 + abs(spot_oracle_gap) * 3.0)
     else:
         p_oracle = min(0.90, 0.80 + abs(oracle_delta) * 2.0)
-    # Bonus si 3/3 signals alignés
+    # Bonus votes alignés
     if dir_votes >= 3: p_oracle = min(0.95, p_oracle + 0.03)
-    # ✅ v10.33 — Tie bias: smart contract → "end price >= start price → UP wins"
-    # Sur les slots quasi-plats (delta <0.01%), UP a un avantage asymétrique
-    # Source: blockeden.xyz/forum (ethereum_emma, confirmation smart contract)
+    if dir_votes >= 4: p_oracle = min(0.96, p_oracle + 0.02)  # ✅ v11.10 OB vote
+    # ✅ v11.10 — Time-weighting: plus proche de T-6s → direction plus lockée
+    # Source: medium.com/@benjamin.bigdev — "probability converges faster than market prices"
+    time_weight_bonus = max(0.0, (35 - slot_remaining) / 35 * 0.04)  # +4% à T-6s, 0% à T-35s
+    p_oracle = min(0.96, p_oracle + time_weight_bonus)
+    # ✅ v11.10 — Mispricing bonus: si token réel < attendu → marché en retard → edge plus fort
+    # Source: github.com/Archetapp — modèle delta→token observé sur live Polymarket
+    expected_tp = expected_token_price(abs(oracle_delta), slot_remaining)
+    mispricing = expected_tp - token_price  # >0 = token sous-évalué = edge
+    if mispricing > 0.05:  # sous-évalué de 5¢+ → vrai lag à exploiter
+        p_oracle = min(0.96, p_oracle + min(0.03, mispricing * 0.3))
+    # Tie bias UP sur slots quasi-plats
     if direction == "UP" and abs(oracle_delta) < 0.01:
-        p_oracle = min(0.95, p_oracle + 0.01)  # +1pt sur UP quasi-plat
+        p_oracle = min(0.96, p_oracle + 0.01)
     ev = p_oracle - token_price - fee
 
     if ev < ORACLE_EDGE_MIN:
@@ -2881,8 +2915,8 @@ async def job_oracle_lag(context):
     conf_score = st.last_conf_score if st.last_conf_score else {"score": 0, "signals": []}
     reasoning = (
         f"⚡ORACLE LAG {direction} | "
-        f"gap={spot_oracle_gap:+.3f}% delta={oracle_delta:+.3f}% votes={dir_votes}/3 | "
-        f"tok={token_price:.3f}$ EV={ev*100:+.1f}% T-{int(slot_remaining)}s")
+        f"gap={spot_oracle_gap:+.3f}% delta={oracle_delta:+.3f}% OB={st.ob_imbalance:+.2f} votes={dir_votes}/4 | "
+        f"tok={token_price:.3f}$ exp={expected_token_price(abs(oracle_delta),slot_remaining):.2f}$ EV={ev*100:+.1f}% T-{int(slot_remaining)}s")
 
     ok = await place_bet(
         context, direction, amount, round(p_oracle, 2),
