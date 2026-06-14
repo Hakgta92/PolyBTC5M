@@ -61,7 +61,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "11.10j"
+BOT_VERSION = "11.10k"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -1606,7 +1606,7 @@ def log_skip(reason, direction=None, features=None):
     if features and direction:
         st.oracle_patterns.append({**features, "direction": direction,
                                     "result": None, "ts": now, "slot_end": entry["slot_end"],
-                                    "open_px": entry["open_px"]})
+                                    "open_px": entry["open_px"], "v": BOT_VERSION})
         # ✅ v11.10f — pas de cap: historique illimité pour Haiku long terme
 
 def live_window_delta():
@@ -3108,14 +3108,17 @@ async def job_haiku_analysis(context):
     resolved = [p for p in st.oracle_patterns if p.get("result") in ("WIN","LOSS")]
     if len(resolved) < 15: return
 
-    sample = resolved[-30:]
+    # ✅ v11.10k — Priorité aux patterns de la version actuelle
+    versioned = [p for p in resolved if p.get("v") == BOT_VERSION]
+    sample = versioned[-30:] if len(versioned) >= 10 else resolved[-30:]
+    version_note = f"v{BOT_VERSION}: {len(versioned)} patterns" if versioned else "mix versions"
     summary = []
     for p in sample:
         summary.append(f"gap={p.get('gap',0):+.3f}% delta={p.get('delta',0):+.3f}% "
                        f"ret3s={p.get('ret3s',0):+.3f}% votes={p.get('votes',0)}/3 "
                        f"filter={p.get('filter','?')} → {p['result']}")
 
-    prompt = f"""Tu analyses les skips d'un bot de trading Polymarket BTC 5min.
+    prompt = f"""Tu analyses les skips d'un bot v{BOT_VERSION} Polymarket BTC 5min ({version_note}).
 Ces trades ont été BLOQUÉS par les filtres mais voici le résultat théorique.
 Trouve des patterns qui pourraient améliorer les seuils de filtrage.
 Réponds en 3 bullet points MAX, très concis, en français.
