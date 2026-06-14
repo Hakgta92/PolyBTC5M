@@ -61,7 +61,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "11.10i"
+BOT_VERSION = "11.10j"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -109,7 +109,7 @@ BPS_TOTAL_MIN      = 2    # ✅ v10.28 FIX — était 5: idem
 BPS_TOTAL_MAX      = 30   # ✅ v10.28 FIX — élargi (le polybacktest mesure l ordre de grandeur, pas le cap exact)
 
 # ✅ v10.24 — Stop loss réintroduit
-STOP_LOSS_MULT     = 0.45  # Vendre si token tombe sous 45% du prix d'entrée (perte >55%)
+STOP_LOSS_MULT     = 0.01  # ✅ v11.10j — désactivé en réel (binaire: tenir jusqu'à résolution)
 
 # ═══════════ v10.23 — NOUVELLES CONSTANTES ═══════════
 # Oracle lag (le meilleur edge: l'oracle bouge en <1s, l'orderbook met ~55s)
