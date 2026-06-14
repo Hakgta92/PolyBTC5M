@@ -1566,7 +1566,10 @@ class State:
         try:
             data=self.save()
             with open(BACKUP_FILE,"w") as f: json.dump(data,f,indent=2)
-            log.info(f"✅ Backup BR:{self.bankroll:.2f}"); return True
+            log.info(f"✅ Backup BR:{self.bankroll:.2f}")
+            if GITHUB_TOKEN and GITHUB_REPO:
+                asyncio.create_task(push_state_to_github())
+            return True
         except Exception as e: log.error(f"Backup: {e}"); return False
 
     def load(self):
@@ -2963,6 +2966,29 @@ async def job_oracle_lag(context):
 
 
 # ═══════════ ✅ v10.37 — AUTO-APPRENTISSAGE ═══════════
+
+async def push_state_to_github():
+    """✅ v11.10f — Push state vers GitHub pour persistance entre redéploiements."""
+    if not GITHUB_TOKEN or not GITHUB_REPO: return
+    try:
+        import base64
+        data = st.save()
+        state_json = json.dumps(data)
+        url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/polybot_v10_state.json"
+        hdrs = {"Authorization": f"token {GITHUB_TOKEN}",
+                "Accept": "application/vnd.github.v3+json",
+                "Content-Type": "application/json"}
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, headers=hdrs) as r:
+                sha = (await r.json()).get("sha","") if r.status==200 else ""
+            content = base64.b64encode(state_json.encode()).decode()
+            body = {"message":f"state {int(time.time())}","content":content}
+            if sha: body["sha"] = sha
+            async with s.put(url, headers=hdrs, json=body) as r:
+                if r.status in (200,201): log.info("✅ State → GitHub")
+                else: log.warning(f"GitHub push {r.status}: {await r.text()}")
+    except Exception as e: log.warning(f"push_state_to_github: {e}")
+
 
 async def job_auto_calibrate(context):
     """
