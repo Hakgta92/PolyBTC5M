@@ -61,7 +61,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "11.10e"
+BOT_VERSION = "11.10f"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -1556,7 +1556,7 @@ class State:
             "skipped":self.skipped,"pass_reasons":self.pass_reasons[-50:],
             "calib_factor":self.calib_factor,"killed":self.killed,
             "version":BOT_VERSION,"saved_at":int(time.time()),
-            "oracle_patterns":self.oracle_patterns[-200:],"calibration_log":self.calibration_log[-20:],"haiku_insights":self.haiku_insights[-20:]}
+            "oracle_patterns":self.oracle_patterns,"calibration_log":self.calibration_log[-20:],"haiku_insights":self.haiku_insights[-20:]}
         try:
             with open(DATA_FILE,"w") as f: json.dump(data,f,indent=2)
         except Exception as e: log.error(f"Save: {e}")
@@ -1605,8 +1605,7 @@ def log_skip(reason, direction=None, features=None):
         st.oracle_patterns.append({**features, "direction": direction,
                                     "result": None, "ts": now, "slot_end": entry["slot_end"],
                                     "open_px": entry["open_px"]})
-        if len(st.oracle_patterns) > 300:
-            st.oracle_patterns = st.oracle_patterns[-300:]
+        # ✅ v11.10f — pas de cap: historique illimité pour Haiku long terme
 
 def live_window_delta():
     """✅ v10.22 — Delta du slot en TEMPS RÉEL (WS prioritaire, fallback dernier tick)"""
