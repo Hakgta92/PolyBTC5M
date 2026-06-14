@@ -61,7 +61,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "11.10f"
+BOT_VERSION = "11.10g"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -1567,7 +1567,9 @@ class State:
             data=self.save()
             with open(BACKUP_FILE,"w") as f: json.dump(data,f,indent=2)
             log.info(f"✅ Backup BR:{self.bankroll:.2f}")
-            if GITHUB_TOKEN and GITHUB_REPO:
+            gh_token = os.getenv("GITHUB_TOKEN","")
+            gh_repo = os.getenv("GITHUB_REPO","")
+            if gh_token and gh_repo:
                 asyncio.create_task(push_state_to_github())
             return True
         except Exception as e: log.error(f"Backup: {e}"); return False
@@ -2969,13 +2971,15 @@ async def job_oracle_lag(context):
 
 async def push_state_to_github():
     """✅ v11.10f — Push state vers GitHub pour persistance entre redéploiements."""
-    if not GITHUB_TOKEN or not GITHUB_REPO: return
+    gh_token = os.getenv("GITHUB_TOKEN","")
+    gh_repo = os.getenv("GITHUB_REPO","")
+    if not gh_token or not gh_repo: return
     try:
         import base64
         data = st.save()
         state_json = json.dumps(data)
-        url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/polybot_v10_state.json"
-        hdrs = {"Authorization": f"token {GITHUB_TOKEN}",
+        url = f"https://api.github.com/repos/{gh_repo}/contents/polybot_v10_state.json"
+        hdrs = {"Authorization": f"token {gh_token}",
                 "Accept": "application/vnd.github.v3+json",
                 "Content-Type": "application/json"}
         async with aiohttp.ClientSession() as s:
