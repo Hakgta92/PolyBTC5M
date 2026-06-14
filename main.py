@@ -1588,8 +1588,12 @@ class State:
                     self.paper_mode=d.get("paper_mode",PAPER_MODE)
                     self.skipped=d.get("skipped",0); self.pass_reasons=d.get("pass_reasons",[])
                     self.calib_factor=d.get("calib_factor",1.0); self.killed=d.get("killed",False)
+                    # ✅ v11.10q — Charger patterns + calibrations depuis JSON
+                    self.oracle_patterns=d.get("oracle_patterns",[])
+                    self.calibration_log=d.get("calibration_log",[])
+                    self.haiku_insights=d.get("haiku_insights",[])
                     age=int((time.time()-d.get("saved_at",0))/60)
-                    log.info(f"✅ State {filepath} ({age}min) BR:{self.bankroll:.2f}"); return
+                    log.info(f"✅ State {filepath} ({age}min) BR:{self.bankroll:.2f} patterns:{len(self.oracle_patterns)}"); return
             except Exception as e: log.error(f"Load {filepath}: {e}")
 
 st=State()
