@@ -61,7 +61,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "11.10m"
+BOT_VERSION = "11.10n"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -1594,6 +1594,14 @@ class State:
 
 st=State()
 
+async def init_state_from_github():
+    """✅ v11.10m — Appelé au premier /run pour charger le state depuis GitHub."""
+    pulled = await pull_state_from_github()
+    if pulled:
+        st.load()
+        log.info(f"✅ State restauré depuis GitHub: BR={st.bankroll:.2f}$")
+
+
 # ─── HELPERS v10.22 ────────────────────────────────────────────────────────
 def log_skip(reason, direction=None, features=None):
     """✅ v10.37 — Log skip + features oracle pour auto-calibration."""
@@ -2974,6 +2982,32 @@ async def job_oracle_lag(context):
 
 # ═══════════ ✅ v10.37 — AUTO-APPRENTISSAGE ═══════════
 
+async def pull_state_from_github():
+    """✅ v11.10m — Télécharge le state depuis GitHub branche State au démarrage."""
+    gh_token = os.getenv("GITHUB_TOKEN","")
+    gh_repo = os.getenv("GITHUB_REPO","")
+    if not gh_token or not gh_repo: return False
+    try:
+        import base64
+        url = f"https://api.github.com/repos/{gh_repo}/contents/polybot_v10_state.json?ref=State"
+        hdrs = {"Authorization": f"token {gh_token}",
+                "Accept": "application/vnd.github.v3+json"}
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, headers=hdrs) as r:
+                if r.status != 200:
+                    log.warning(f"GitHub pull: {r.status}")
+                    return False
+                data = await r.json()
+                content = base64.b64decode(data["content"]).decode()
+                with open(DATA_FILE, "w") as f:
+                    f.write(content)
+                log.info(f"✅ State téléchargé depuis GitHub branche State ({len(content)} bytes)")
+                return True
+    except Exception as e:
+        log.warning(f"pull_state_from_github: {e}")
+        return False
+
+
 async def push_state_to_github():
     """✅ v11.10f — Push state vers GitHub pour persistance entre redéploiements."""
     gh_token = os.getenv("GITHUB_TOKEN","")
@@ -3238,6 +3272,9 @@ async def cmd_run(update,context):
         if not poly.init_client():
             await update.message.reply_text("⚠️ Polymarket indispo — paper mode activé",parse_mode="Markdown")
             st.paper_mode=True
+    # ✅ v11.10m — Charger le state depuis GitHub branche State
+    if not st.running:  # seulement au premier /run
+        await init_state_from_github()
     # ✅ v11.10 — Sync BR immédiate avec CLOB réel au démarrage (plus de décalage BR/CLOB)
     if not st.paper_mode:
         try:
