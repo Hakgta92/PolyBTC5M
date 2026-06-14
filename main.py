@@ -61,7 +61,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "11.10"
+BOT_VERSION = "11.10b"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -2784,19 +2784,19 @@ async def job_oracle_lag(context):
         ob_vote,  # ✅ v11.9m — orderbook imbalance (4ème signal)
     ])
 
-    # ✅ v11.9h — Fix#1 corrigé: ne pas bloquer quand le delta primaire est fort ET dans la bonne direction
-    # BUG v11.9g: delta+0.067% UP bloqué car "delta_is_neutral=False" (0.067>0.032)
-    # alors que 0.067% IS le signal le plus fort → il faut bypasser dans ce cas
-    if dir_votes < 2:
+    # ✅ v11.10b Haiku: votes ≤ -2/4 = consensus DOWN fort = WIN garanti (8/8)
+    if dir_votes <= -2:
+        direction = "DOWN"; primary_signal = "votes"
+        log.info(f"⚡ CONSENSUS DOWN {dir_votes}/4 → override direction=DOWN")
+    elif dir_votes < 2:
         gap_is_strong = abs(spot_oracle_gap) >= ORACLE_GAP_MIN_STRONG
         delta_is_neutral = abs(oracle_delta) < ORACLE_DELTA_CONTRA_MAX
-        # ✅ Nouveau: si delta EST le signal primaire ET dans la bonne direction → bypass
         delta_confirms = (primary_signal == "delta" and
                           ((direction=="UP" and oracle_delta > 0) or
                            (direction=="DOWN" and oracle_delta < 0)))
         if not (gap_is_strong or delta_is_neutral or delta_confirms):
             log_skip(
-                f"Oracle: votes={dir_votes}/3 gap={spot_oracle_gap:+.3f}% delta={oracle_delta:+.3f}% "
+                f"Oracle: votes={dir_votes}/4 gap={spot_oracle_gap:+.3f}% delta={oracle_delta:+.3f}% "
                 f"(gap pas fort ET delta contre trop fort)", direction,
                 features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,
                           "votes":dir_votes,"filter":"votes_delta"})
@@ -2804,6 +2804,12 @@ async def job_oracle_lag(context):
 
     # ✅ v11.9l — tendance 10min SUPPRIMÉ (100% WR sur 4 bloqués)
 
+    # ✅ v11.10b Haiku: ret3s < -0.040% = pires pertes systématiques
+    if ret_3s < -0.040:
+        log_skip(f"Oracle: ret3s {ret_3s:+.3f}%<-0.040% (Haiku: pires pertes)",
+                 direction, features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,
+                                       "votes":dir_votes,"filter":"ret3s_extreme"})
+        return
     # ✅ v11.9l Haiku: delta<-0.005% = LOSS garanti (19/19 sur 300 patterns réels)
     # Plus besoin du DELTA_CONTRA_STRICT — on bloque tout delta négatif pour UP
     if direction == "UP" and oracle_delta < -0.005:
