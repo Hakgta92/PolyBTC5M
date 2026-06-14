@@ -61,7 +61,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "11.10b"
+BOT_VERSION = "11.10c"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -2804,12 +2804,8 @@ async def job_oracle_lag(context):
 
     # ✅ v11.9l — tendance 10min SUPPRIMÉ (100% WR sur 4 bloqués)
 
-    # ✅ v11.10b Haiku: ret3s < -0.040% = pires pertes systématiques
-    if ret_3s < -0.040:
-        log_skip(f"Oracle: ret3s {ret_3s:+.3f}%<-0.040% (Haiku: pires pertes)",
-                 direction, features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,
-                                       "votes":dir_votes,"filter":"ret3s_extreme"})
-        return
+    # ✅ v11.10c — ret3s_extreme supprimé (76% WR sur 21 trades bloqués = trop strict)
+    # Source: /learn 14/06 — ret3sextreme: 76% (16W/5L) → on bloquait des gagnants
     # ✅ v11.9l Haiku: delta<-0.005% = LOSS garanti (19/19 sur 300 patterns réels)
     # Plus besoin du DELTA_CONTRA_STRICT — on bloque tout delta négatif pour UP
     if direction == "UP" and oracle_delta < -0.005:
