@@ -61,7 +61,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "11.10g"
+BOT_VERSION = "11.10h"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -1570,7 +1570,11 @@ class State:
             gh_token = os.getenv("GITHUB_TOKEN","")
             gh_repo = os.getenv("GITHUB_REPO","")
             if gh_token and gh_repo:
-                asyncio.create_task(push_state_to_github())
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop and loop.is_running():
+                        loop.create_task(push_state_to_github())
+                except Exception: pass
             return True
         except Exception as e: log.error(f"Backup: {e}"); return False
 
