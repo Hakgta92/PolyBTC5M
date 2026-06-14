@@ -61,7 +61,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "11.10l"
+BOT_VERSION = "11.10m"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -1556,7 +1556,8 @@ class State:
             "skipped":self.skipped,"pass_reasons":self.pass_reasons[-50:],
             "calib_factor":self.calib_factor,"killed":self.killed,
             "version":BOT_VERSION,"saved_at":int(time.time()),
-            "oracle_patterns":self.oracle_patterns,"calibration_log":self.calibration_log[-20:],"haiku_insights":self.haiku_insights[-20:]}
+            "oracle_patterns":self.oracle_patterns,
+            "pass_reasons":self.pass_reasons[-500:],"calibration_log":self.calibration_log[-20:],"haiku_insights":self.haiku_insights[-20:]}
         try:
             with open(DATA_FILE,"w") as f: json.dump(data,f,indent=2)
         except Exception as e: log.error(f"Save: {e}")
@@ -3253,7 +3254,7 @@ async def cmd_run(update,context):
     st.tick_job=context.job_queue.run_repeating(job_tick,interval=30,first=10)
     st.snipe_job=context.job_queue.run_repeating(job_snipe,interval=10,first=12)  # ✅ v10.22
     st.tp_job=context.job_queue.run_repeating(job_take_profit,interval=TAKE_PROFIT_CHECK,first=10)
-    st.backup_job=context.job_queue.run_repeating(job_backup,interval=600,first=60)
+    st.backup_job=context.job_queue.run_repeating(job_backup,interval=120,first=60)  # ✅ v11.10m — 2min
     st.recap_job=context.job_queue.run_repeating(job_daily_recap,interval=3600,first=60)
     context.job_queue.run_repeating(job_check_expiry,interval=30,first=15)
     context.job_queue.run_repeating(job_ws_watchdog_all,interval=30,first=1)  # ✅ v10.23 tous les WS
