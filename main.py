@@ -61,7 +61,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "11.10t"
+BOT_VERSION = "11.10u"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -133,7 +133,7 @@ KILL_SWITCH_LOSSES  = 5      # Pertes consécutives → arrêt total (au-delà d
 # L'orderbook Polymarket met 30-55s à suivre → fenêtre d'arb
 # Strategy: si oracle a bougé X% depuis slot open ET token gagnant encore pas cher → BUY
 ORACLE_ENTRY_DELTA  = 0.02  # ✅ v11.10n — 0.02% min (delta +0.011% = bruit, trade perdu -3$)
-ORACLE_TOKEN_MAX    = 0.92  # ✅ v10.32 — breakeven exact @92%WR = token 0.92$ (EV>0 jusqu'à 0.92$)
+ORACLE_TOKEN_MAX    = 0.60  # ✅ v11.10u — 0.60$ max (R:R breakeven à 62% WR, gain moy +2.33$)
 ORACLE_TOKEN_MIN    = 0.51  # Token min (trop proche de 0.50$ = incertitude trop haute)
 ORACLE_EDGE_MIN     = 0.15  # ✅ v11.10t — EV min 15% (bloque token>0.68$)
 ORACLE_WINDOW_START = 35    # Fenêtre normale: T-35s→T-6s (source: dev.to/fatherson)
@@ -1670,9 +1670,7 @@ def register_trade_result(won):
         st.worst_streak=min(st.worst_streak,st.streak)
         st.win_streak_count=0
         if st.consec>=MAX_CONSEC_LOSS: st.cooldown_until=time.time()+COOLDOWN_MIN*60
-        # ✅ v11.9j — mode conservateur désactivé (h24)
-        if False and st.consec>=CONSERVATIVE_AFTER_LOSSES:  # désactivé
-            pass  # st.conservative_until=time.time()+2*3600
+        # ✅ v11.10u — mode conservateur SUPPRIMÉ définitivement
         if st.consec>=KILL_SWITCH_LOSSES:  # ✅ v10.23 — arrêt total
             st.killed=True; st.running=False
 
