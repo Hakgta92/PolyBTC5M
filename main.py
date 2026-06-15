@@ -2800,6 +2800,92 @@ async def job_snipe(context):
         f"₿`${st.ws_price:,.2f}` Δslot:`{delta_pct:+.3f}%` σ:`{sigma:.4f}`\n\n"
         f"💭 _{reasoning}_")
 
+async def ws_clob_loop(asset_id_up: str):
+    """v12.4 — OB imbalance BTC via CLOB WebSocket Polymarket."""
+    if not asset_id_up: return
+    url = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+    sub = {"assets_ids": [asset_id_up], "type": "market"}
+    st.ob_asset_id = asset_id_up; st.ob_imbalance = 0.0
+    log.info(f"✅ WS CLOB OB BTC démarré")
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.ws_connect(url, heartbeat=10, timeout=aiohttp.ClientTimeout(total=300)) as ws:
+                await ws.send_json(sub)
+                async for msg in ws:
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        try:
+                            raw = json.loads(msg.data)
+                            msgs = raw if isinstance(raw, list) else [raw]
+                            for m in msgs:
+                                if not isinstance(m, dict): continue
+                                etype = m.get("event_type") or m.get("type","")
+                                if etype not in ("book","price_change","tick_size_change"): continue
+                                bids = m.get("bids") or []; asks = m.get("asks") or []
+                                bid_vol = ask_vol = 0.0
+                                for b in bids:
+                                    try:
+                                        if isinstance(b,dict): bid_vol+=float(b.get("size",0))
+                                        elif isinstance(b,(list,tuple)) and len(b)>=2: bid_vol+=float(b[1])
+                                    except: pass
+                                for a in asks:
+                                    try:
+                                        if isinstance(a,dict): ask_vol+=float(a.get("size",0))
+                                        elif isinstance(a,(list,tuple)) and len(a)>=2: ask_vol+=float(a[1])
+                                    except: pass
+                                total = bid_vol + ask_vol
+                                if total > 0:
+                                    st.ob_imbalance = round((bid_vol-ask_vol)/total,3)
+                                    st.ob_ts = time.time()
+                        except Exception as pe: log.debug(f"CLOB BTC parse: {pe}")
+                    elif msg.type in (aiohttp.WSMsgType.CLOSED,aiohttp.WSMsgType.ERROR): break
+    except Exception as e: log.warning(f"WS CLOB BTC: {e}")
+    st.ob_imbalance = 0.0
+
+async def ws_clob_loop_asset(asset_id_up: str, asset: str):
+    """v12.4 — OB imbalance ETH/SOL via CLOB WebSocket."""
+    if not asset_id_up: return
+    url = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+    sub = {"assets_ids": [asset_id_up], "type": "market"}
+    if asset=="ETH": st.eth_ob_asset_id=asset_id_up; st.eth_ob_imbalance=0.0
+    else: st.sol_ob_asset_id=asset_id_up; st.sol_ob_imbalance=0.0
+    log.info(f"✅ WS CLOB OB {asset} démarré")
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.ws_connect(url, heartbeat=10, timeout=aiohttp.ClientTimeout(total=300)) as ws:
+                await ws.send_json(sub)
+                async for msg in ws:
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        try:
+                            raw = json.loads(msg.data)
+                            msgs = raw if isinstance(raw, list) else [raw]
+                            for m in msgs:
+                                if not isinstance(m, dict): continue
+                                etype = m.get("event_type") or m.get("type","")
+                                if etype not in ("book","price_change","tick_size_change"): continue
+                                bids = m.get("bids") or []; asks = m.get("asks") or []
+                                bid_vol = ask_vol = 0.0
+                                for b in bids:
+                                    try:
+                                        if isinstance(b,dict): bid_vol+=float(b.get("size",0))
+                                        elif isinstance(b,(list,tuple)) and len(b)>=2: bid_vol+=float(b[1])
+                                    except: pass
+                                for a in asks:
+                                    try:
+                                        if isinstance(a,dict): ask_vol+=float(a.get("size",0))
+                                        elif isinstance(a,(list,tuple)) and len(a)>=2: ask_vol+=float(a[1])
+                                    except: pass
+                                total = bid_vol + ask_vol
+                                if total > 0:
+                                    imb = round((bid_vol-ask_vol)/total,3)
+                                    if asset=="ETH": st.eth_ob_imbalance=imb; st.eth_ob_ts=time.time()
+                                    else: st.sol_ob_imbalance=imb; st.sol_ob_ts=time.time()
+                        except Exception as pe: log.debug(f"CLOB {asset} parse: {pe}")
+                    elif msg.type in (aiohttp.WSMsgType.CLOSED,aiohttp.WSMsgType.ERROR): break
+    except Exception as e: log.warning(f"WS CLOB {asset}: {e}")
+    if asset=="ETH": st.eth_ob_imbalance=0.0
+    else: st.sol_ob_imbalance=0.0
+
+
 async def job_oracle_lag(context):
     """v12.4 — Oracle lag BTC — même logique propre qu'ETH/SOL."""
     if not st.running or st.killed: return
@@ -3026,6 +3112,14 @@ async def job_oracle_lag_asset(context, asset:str):
     token_used=market["token_up"] if direction=="UP" else market["token_down"]
     token_price=await poly.get_token_price(token_used)
     if not token_price or token_price<=0: return
+    # ✅ v12.4 — Lancer WS CLOB OB pour ETH/SOL
+    asset_up_ob = market.get("token_up","")
+    if asset=="ETH" and asset_up_ob and st.eth_ob_asset_id != asset_up_ob:
+        if st.eth_clob_ws_task and not st.eth_clob_ws_task.done(): st.eth_clob_ws_task.cancel()
+        st.eth_clob_ws_task = asyncio.create_task(ws_clob_loop_asset(asset_up_ob,"ETH"))
+    elif asset=="SOL" and asset_up_ob and st.sol_ob_asset_id != asset_up_ob:
+        if st.sol_clob_ws_task and not st.sol_clob_ws_task.done(): st.sol_clob_ws_task.cancel()
+        st.sol_clob_ws_task = asyncio.create_task(ws_clob_loop_asset(asset_up_ob,"SOL"))
     if token_price>ORACLE_TOKEN_MAX:
         log_skip(f"{symbol}: token {token_price:.2f}$>{ORACLE_TOKEN_MAX}$ (déjà pricé)",direction,
                  features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"filter":"tokenmax","token":token_price}); return
