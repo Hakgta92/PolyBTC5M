@@ -61,7 +61,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "11.10u"
+BOT_VERSION = "11.10w"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -133,7 +133,7 @@ KILL_SWITCH_LOSSES  = 5      # Pertes consécutives → arrêt total (au-delà d
 # L'orderbook Polymarket met 30-55s à suivre → fenêtre d'arb
 # Strategy: si oracle a bougé X% depuis slot open ET token gagnant encore pas cher → BUY
 ORACLE_ENTRY_DELTA  = 0.02  # ✅ v11.10n — 0.02% min (delta +0.011% = bruit, trade perdu -3$)
-ORACLE_TOKEN_MAX    = 0.60  # ✅ v11.10u — 0.60$ max (R:R breakeven à 62% WR, gain moy +2.33$)
+ORACLE_TOKEN_MAX    = 0.65  # ✅ v11.10w — 0.65$ max
 ORACLE_TOKEN_MIN    = 0.51  # Token min (trop proche de 0.50$ = incertitude trop haute)
 ORACLE_EDGE_MIN     = 0.15  # ✅ v11.10t — EV min 15% (bloque token>0.68$)
 ORACLE_WINDOW_START = 35    # Fenêtre normale: T-35s→T-6s (source: dev.to/fatherson)
@@ -1557,6 +1557,7 @@ class State:
             "skipped":self.skipped,
             "calib_factor":self.calib_factor,"killed":self.killed,
             "version":BOT_VERSION,"saved_at":int(time.time()),
+            "delta_contra_max":ORACLE_DELTA_CONTRA_MAX,
             "oracle_patterns":self.oracle_patterns,
             "pass_reasons":self.pass_reasons[-500:],
             "calibration_log":self.calibration_log,
@@ -1593,6 +1594,12 @@ class State:
                     self.calib_factor=d.get("calib_factor",1.0); self.killed=d.get("killed",False)
                     # ✅ v11.10q — Charger patterns + calibrations depuis JSON
                     self.oracle_patterns=d.get("oracle_patterns",[])
+                    # ✅ v11.10v — Restaurer les seuils auto-calibrés
+                    global ORACLE_DELTA_CONTRA_MAX
+                    saved_dcm = d.get("delta_contra_max", 0)
+                    if saved_dcm > 0 and saved_dcm < 0.050:
+                        ORACLE_DELTA_CONTRA_MAX = saved_dcm
+                        log.info(f"✅ delta_contra_max restauré: {saved_dcm:.3f}%")
                     self.calibration_log=d.get("calibration_log",[])
                     self.haiku_insights=d.get("haiku_insights",[])
                     age=int((time.time()-d.get("saved_at",0))/60)
@@ -2843,6 +2850,22 @@ async def job_oracle_lag(context):
 
     # ✅ v11.10c — ret3s_extreme supprimé (76% WR sur 21 trades bloqués = trop strict)
     # Source: /learn 14/06 — ret3sextreme: 76% (16W/5L) → on bloquait des gagnants
+    # ✅ v11.10v Fix#A — ret3s extrême < -0.05% = BTC chute brutale → bloquer
+    if ret_3s < -0.055:
+        log_skip(
+            f"Oracle: ret3s {ret_3s:+.3f}%<-0.055% (chute brutale BTC)",
+            direction, features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,
+                                  "votes":dir_votes,"filter":"ret3s_brutal"})
+        return
+
+    # ✅ v11.10v Fix#B — gap négatif + votes faibles = signal contradictoire
+    if direction == "UP" and spot_oracle_gap < 0 and dir_votes <= 1:
+        log_skip(
+            f"Oracle: UP bloqué gap {spot_oracle_gap:+.3f}%<0 + votes={dir_votes}/4 (contradictoire)",
+            direction, features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,
+                                  "votes":dir_votes,"filter":"gap_neg_votes"})
+        return
+
     # ✅ v11.9l Haiku: delta<-0.005% = LOSS garanti (19/19 sur 300 patterns réels)
     # Plus besoin du DELTA_CONTRA_STRICT — on bloque tout delta négatif pour UP
     if direction == "UP" and oracle_delta < -0.005:
@@ -3349,9 +3372,11 @@ async def cmd_run(update,context):
     context.job_queue.run_repeating(job_staged_entry,interval=5,first=14)     # ✅ v10.23 2e tranche
     context.job_queue.run_repeating(job_oracle_lag,interval=2,first=16)       # ✅ v10.30 oracle lag (T-35s→T-6s)
     context.job_queue.run_repeating(job_sync_balance,interval=900,first=10)    # ✅ v11.10s — sync CLOB 15min
-    context.job_queue.run_repeating(job_auto_calibrate,interval=7200,first=300)  # ✅ v10.37 seuils auto
+    # ✅ v11.10w — auto-calibration désactivée (seuils gérés manuellement)
+    # context.job_queue.run_repeating(job_auto_calibrate,interval=7200,first=300)  # ✅ v10.37 seuils auto
     context.job_queue.run_repeating(job_pattern_memory,interval=3600,first=600)  # ✅ v10.37 mémoire patterns
-    context.job_queue.run_repeating(job_haiku_analysis,interval=7200,first=900)  # ✅ v10.37 Haiku insights
+    # ✅ v11.10w — Haiku désactivé
+    # context.job_queue.run_repeating(job_haiku_analysis,interval=7200,first=900)
     st.fg=await fetch_fear_greed(); st.btc24=await fetch_btc_24h(); sess=session_ctx()
     clob_bal = await fetch_clob_balance()
     if clob_bal is not None and clob_bal > 0:
@@ -3494,17 +3519,23 @@ async def cmd_status(update,context):
     ob_txt=st.last_ob["desc"] if st.last_ob else "N/A"
     liq_txt=st.last_liq["desc"] if st.last_liq else "N/A"
     min_score,min_diff,min_mom=get_session_thresholds(sess["session"])
-    await update.message.reply_text(
-        f"📊 *STATUS v{BOT_VERSION}* [{'📄' if st.paper_mode else '💰'}]\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    fg_val = st.fg.get('value', 50) if st.fg else 50
+    msg = (
+        f"📊 *STATUS v{BOT_VERSION}*\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{'🟢 EN COURS' if st.running else '🔴 ARRÊTÉ'} | {'✅ CLOB' if poly.ready else '❌ CLOB'} | WS:{'✅' if st.ws_connected else '❌'}\n\n"
-        f"₿`${st.price:,.2f}` | F&G:`{st.fg['value']}` | `{sess['session']}`\n"
+        f"₿`${st.price:,.2f}` | F&G:`{fg_val}` | `{sess['session']}`\n"
         f"Seuils: score≥`{min_score}` mom≥`{min_mom}`\n"
         f"📊 `{ob_txt}` | 💸 `{liq_txt}`\n"
         f"🎯 {score_info}{fair_info}\n\n"
         f"💰 BR:`{st.bankroll:.2f}$` | ROI:`{roi()}` | PnL:`{fmt(st.pnl)}`\n"
         f"📅 Perte jour:`{dl:.1f}%/{DAILY_LOSS_MAX*100:.0f}%`{pause_info}\n"
-        f"🎲 Bet:`{bet_info}` | 🚫 Refusés:`{st.skipped}` | ⏱`{upt()}`",
-        parse_mode="Markdown")
+        f"🎲 Bet:`{bet_info}` | 🚫 Refusés:`{st.skipped}` | ⏱`{upt()}`"
+    )
+    try:
+        await update.message.reply_text(msg, parse_mode="Markdown")
+    except Exception as e:
+        log.warning(f"cmd_status markdown: {e}")
+        await update.message.reply_text(msg.replace("*","").replace("`",""))
 
 async def cmd_balance(update,context):
     if not auth(update): return
