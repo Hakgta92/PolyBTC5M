@@ -1,3 +1,4 @@
+
 """
 POLYMARKET BOT v12.1 — BTC/ETH/SOL Oracle Lag | TA RSI+EMA | Multi-asset
 NOUVEAUTÉS v10.29 — CORRECTIONS MAJEURES:
@@ -61,7 +62,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "12.3"
+BOT_VERSION = "12.4"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -133,7 +134,7 @@ KILL_SWITCH_LOSSES  = 5      # Pertes consécutives → arrêt total (au-delà d
 # L'orderbook Polymarket met 30-55s à suivre → fenêtre d'arb
 # Strategy: si oracle a bougé X% depuis slot open ET token gagnant encore pas cher → BUY
 ORACLE_ENTRY_DELTA  = 0.02  # ✅ v12.1 — 0.02% min delta
-ORACLE_TOKEN_MAX    = 0.65  # ✅ v12.1 — 0.65$ max R:R optimal
+ORACLE_TOKEN_MAX    = 0.68  # ✅ v12.4 — 0.68$ max (EV +0.02$/trade à 70% WR)
 ORACLE_TOKEN_MIN    = 0.51  # Token min (trop proche de 0.50$ = incertitude trop haute)
 ORACLE_EDGE_MIN     = 0.15  # ✅ v12.1 — EV min 15%
 ORACLE_WINDOW_START = 25    # ✅ v12.1 — T-25s→T-5s BTC
