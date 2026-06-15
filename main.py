@@ -61,7 +61,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "11.10s"
+BOT_VERSION = "11.10t"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -135,7 +135,7 @@ KILL_SWITCH_LOSSES  = 5      # Pertes consécutives → arrêt total (au-delà d
 ORACLE_ENTRY_DELTA  = 0.02  # ✅ v11.10n — 0.02% min (delta +0.011% = bruit, trade perdu -3$)
 ORACLE_TOKEN_MAX    = 0.92  # ✅ v10.32 — breakeven exact @92%WR = token 0.92$ (EV>0 jusqu'à 0.92$)
 ORACLE_TOKEN_MIN    = 0.51  # Token min (trop proche de 0.50$ = incertitude trop haute)
-ORACLE_EDGE_MIN     = 0.08  # EV minimum après frais (8%)
+ORACLE_EDGE_MIN     = 0.15  # ✅ v11.10t — EV min 15% (bloque token>0.68$)
 ORACLE_WINDOW_START = 35    # Fenêtre normale: T-35s→T-6s (source: dev.to/fatherson)
 ORACLE_WINDOW_END   = 6     # T-6s = dernier moment sûr (latence ordre ~2-3s)
 # ✅ v10.32 — Mode T-10s (source: github.com/Archetapp — T-10s "direction quasi lockée")
@@ -3380,6 +3380,7 @@ async def cmd_run(update,context):
     context.job_queue.run_repeating(job_ws_watchdog_all,interval=30,first=1)  # ✅ v10.23 tous les WS
     context.job_queue.run_repeating(job_staged_entry,interval=5,first=14)     # ✅ v10.23 2e tranche
     context.job_queue.run_repeating(job_oracle_lag,interval=2,first=16)       # ✅ v10.30 oracle lag (T-35s→T-6s)
+    context.job_queue.run_repeating(job_sync_balance,interval=900,first=10)    # ✅ v11.10s — sync CLOB 15min
     context.job_queue.run_repeating(job_auto_calibrate,interval=7200,first=300)  # ✅ v10.37 seuils auto
     context.job_queue.run_repeating(job_pattern_memory,interval=3600,first=600)  # ✅ v10.37 mémoire patterns
     context.job_queue.run_repeating(job_haiku_analysis,interval=7200,first=900)  # ✅ v10.37 Haiku insights
