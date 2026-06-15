@@ -1,3 +1,4 @@
+
 """
 POLYMARKET BTC BOT v10.29 — FRAIS CORRIGÉS + FEE_FILTER SUPPRIMÉ
 NOUVEAUTÉS v10.29 — CORRECTIONS MAJEURES:
@@ -61,7 +62,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "11.10z"
+BOT_VERSION = "12.0"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -136,8 +137,8 @@ ORACLE_ENTRY_DELTA  = 0.02  # ✅ v11.10n — 0.02% min (delta +0.011% = bruit, 
 ORACLE_TOKEN_MAX    = 0.65  # ✅ v11.10w — 0.65$ max
 ORACLE_TOKEN_MIN    = 0.51  # Token min (trop proche de 0.50$ = incertitude trop haute)
 ORACLE_EDGE_MIN     = 0.15  # ✅ v11.10t — EV min 15% (bloque token>0.68$)
-ORACLE_WINDOW_START = 35    # Fenêtre normale: T-35s→T-6s (source: dev.to/fatherson)
-ORACLE_WINDOW_END   = 6     # T-6s = dernier moment sûr (latence ordre ~2-3s)
+ORACLE_WINDOW_START = 25    # ✅ v12 — T-25s (source: scalper article, direction lockée)
+ORACLE_WINDOW_END   = 5     # ✅ v12 — T-5s
 # ✅ v10.32 — Mode T-10s (source: github.com/Archetapp — T-10s "direction quasi lockée")
 ORACLE_ULTRA_WINDOW = 12    # Passe ultra-précise si T-12s→T-6s ET EV exceptionnelle
 ORACLE_ULTRA_EV_MIN = 0.05  # EV min pour passe ultra (moins strict car WR > 95% à T-10s)
@@ -2982,7 +2983,7 @@ async def job_oracle_lag(context):
     gap_direction = None
     if spot_now > 0 and st.oracle_price > 0:
         spot_oracle_gap = (spot_now - st.oracle_price) / st.oracle_price * 100
-        if abs(spot_oracle_gap) >= 0.015:  # ✅ v11.10e Haiku — 1.5bps (gap<0.015% = bruit ret3s)
+        if abs(spot_oracle_gap) >= 0.025:  # ✅ v12 — 2.5bps BTC (0.05% trop strict)nt 0.05% de move significatif)
             gap_direction = "UP" if spot_oracle_gap > 0 else "DOWN"
 
     # ── Feature 3: returns 1s/3s/10s BTC (momentum court terme) ──
@@ -2995,6 +2996,7 @@ async def job_oracle_lag(context):
             old = [p for t,p in pts if t <= cutoff]
             return (spot_now - old[-1]) / old[-1] * 100 if old and old[-1]>0 else 0.0
         ret_1s = ret_over(1); ret_3s = ret_over(3); ret_10s = ret_over(10)
+        ret_15s = ret_over(15)  # ✅ v11.10z — momentum 15s (source: scalper article)
 
     # ── Décision direction: combinaison des 3 features ──
     # Priorité 1: gap spot↔oracle (plus immédiat)
@@ -3024,7 +3026,7 @@ async def job_oracle_lag(context):
     dir_votes = sum([
         1 if direction=="UP" and oracle_delta>0 else (-1 if direction=="DOWN" and oracle_delta<0 else 0),
         1 if direction=="UP" and spot_oracle_gap>0 else (-1 if direction=="DOWN" and spot_oracle_gap<0 else 0),
-        1 if direction=="UP" and ret_3s>0 else (-1 if direction=="DOWN" and ret_3s<0 else 0),
+        1 if direction=="UP" and ret_15s>0 else (-1 if direction=="DOWN" and ret_15s<0 else 0),  # ✅ v11.10z 15s
         ob_vote,   # orderbook imbalance
         ta_vote,   # ✅ v11.10z TA score (RSI+EMA+Mom)
     ])
@@ -3202,7 +3204,7 @@ async def job_oracle_lag(context):
         f"⚡ *ORACLE LAG* [{mode}]\n━━━━━━━━━━━━━━━\n"
         f"*{direction}* | `{amount:.2f}$` | P:`{p_oracle*100:.0f}%` | ⏰T-`{int(slot_remaining)}s`\n"
         f"Δslot:`{oracle_delta:+.3f}%` | Gap:`{spot_oracle_gap:+.3f}%` OB:`{st.ob_imbalance:+.2f}` TA:`{ta_score}` | Votes:`{dir_votes}/5`\n"
-        f"Ret 1s:`{ret_1s:+.3f}%` 3s:`{ret_3s:+.3f}%` 10s:`{ret_10s:+.3f}%`\n"
+        f"Ret 3s:`{ret_3s:+.3f}%` 15s:`{ret_15s:+.3f}%` | Momentum 15s confirme\n"
         f"Token:`{entry_tp:.3f}$` | EV:`{ev*100:+.1f}%` | Frais:`{fee*100:.2f}¢`\n"
         f"Oracle:`${st.oracle_price:,.2f}` → Spot:`${spot_now:,.2f}`\n\n"
         f"💭 _{reasoning}_")
@@ -3270,7 +3272,9 @@ async def job_oracle_lag_asset(context, asset: str):
     now = time.time()
     cur_slot = int(now // 300) * 300
     slot_remaining = cur_slot + 300 - now
-    if slot_remaining > 35 or slot_remaining < 6: return
+    # ✅ v12 — Fenêtre adaptative par asset
+    win_start = 20 if asset == "SOL" else 25
+    if slot_remaining > win_start or slot_remaining < 5: return
 
     # Prix et oracle selon l'asset
     if asset == "ETH":
@@ -3299,8 +3303,10 @@ async def job_oracle_lag_asset(context, asset: str):
     spot_oracle_gap = (spot - oracle) / oracle * 100 if oracle > 0 else 0
 
     # Direction
+    # ✅ v12 — Gap adaptatif par asset
+    gap_min_asset = 0.030 if asset in ("ETH","SOL") else 0.025
     gap_dir = None
-    if abs(spot_oracle_gap) >= ORACLE_ENTRY_DELTA * 1.5:
+    if abs(spot_oracle_gap) >= gap_min_asset:
         gap_dir = "UP" if spot_oracle_gap > 0 else "DOWN"
     delta_dir = None
     if abs(oracle_delta) >= ORACLE_ENTRY_DELTA:
