@@ -191,6 +191,12 @@ logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logg
     handlers=[logging.FileHandler("polybot_v10.log"), logging.StreamHandler()])
 log = logging.getLogger(__name__)
 
+def auth(update):
+    """Vérifie que l'utilisateur est autorisé."""
+    uid = update.effective_user.id if update.effective_user else 0
+    return uid == ALLOWED_UID or ALLOWED_UID == 0
+
+
 def taker_fee_per_share(p):
     """
     ✅ v10.29 — FORMULE CORRIGÉE (source: startpolymarket.com, docs Polymarket juin 2026)
