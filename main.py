@@ -2794,286 +2794,150 @@ async def job_snipe(context):
         f"💭 _{reasoning}_")
 
 async def job_oracle_lag(context):
-    """
-    ✅ v10.30 — ORACLE LAG STRATEGY (l'unique edge prouvé sur BTC 5min)
-    Sources: medium.com/mountain-movers (mai 2026), dev.to/fatherson (juin 2026)
-
-    PRINCIPE:
-    - L'oracle Chainlink (qui RÈGLE le marché) update en <1s
-    - L'orderbook Polymarket met 30-55s à suivre
-    - Si oracle a bougé ≥0.05% depuis slot open ET token gagnant encore ≤0.58$
-      → le marché propose encore 0.54-0.57$ sur un côté qui vaut ~0.90-0.95$
-      → edge réel de 30-40%
-
-    FENÊTRE: T-35s → T-6s (source: dev.to → T-6s = dernier moment sûr)
-    SORTIE: résolution automatique du slot (pas de stop loss — on tient)
-    """
+    """v12.4 — Oracle lag BTC — même logique propre qu'ETH/SOL."""
     if not st.running or st.killed: return
-    now_ts = time.time()
-    slot_remaining = 300 - (now_ts % 300)
-
-    # ✅ v11.6 — Hors fenêtre: juste alimenter gap_history, rien logguer
-    if not (ORACLE_WINDOW_END <= slot_remaining <= ORACLE_WINDOW_START):
-        if st.oracle_connected and st.oracle_price > 0:
-            spot_chk = consensus_price()
-            g_chk = (spot_chk - st.oracle_price) / st.oracle_price * 100 if st.oracle_price > 0 else 0
-            st.gap_history.append((time.time(), g_chk))
-        return
-
-    if st.last_trade_slot == int(now_ts // 300) * 300:
-        log_skip(f"BTC: slot déjà tradé (T-{int(slot_remaining)}s)", None); return
-    if check_daily():
-        log_skip(f"Oracle: pause journalière (T-{int(slot_remaining)}s)", None); return
-    if in_cd():
-        log_skip(f"Oracle: cooldown actif (T-{int(slot_remaining)}s)", None); return
-    if trades_last_hour(st.trades) >= MAX_TRADES_PER_H:
-        log_skip(f"Oracle: max {MAX_TRADES_PER_H} trades/h atteint (T-{int(slot_remaining)}s)", None); return
-
-    # ── Signal oracle (v10.32 — 3 features documentées par les pros) ──
     now = time.time()
+    cur_slot = int(now // 300) * 300
+    slot_remaining = cur_slot + 300 - now
+    if slot_remaining > ORACLE_WINDOW_START or slot_remaining < ORACLE_WINDOW_END: return
+
     if not st.oracle_connected or st.oracle_price <= 0 or st.oracle_slot_open <= 0:
         log_skip(f"BTC: WS non dispo (T-{int(slot_remaining)}s)", None); return
-    if now - st.oracle_ts > ORACLE_MIN_FRESH_S:
-        log_skip(f"Oracle: tick périmé {int(now-st.oracle_ts)}s (T-{int(slot_remaining)}s)", None); return
-    cur_slot = int(now // 300) * 300
-    if st.oracle_slot_ts != cur_slot:
-        log_skip(f"Oracle: pas de slot open (T-{int(slot_remaining)}s)", None); return
+    if now - st.oracle_ts > 15:
+        log_skip(f"BTC: tick périmé {int(now-st.oracle_ts)}s (T-{int(slot_remaining)}s)", None); return
+    if st.last_trade_slot == cur_slot:
+        log_skip(f"BTC: slot déjà tradé (T-{int(slot_remaining)}s)", None); return
 
-    # ── Feature 1: delta cumulé depuis slot open (signal de direction) ──
-    oracle_delta = (st.oracle_price - st.oracle_slot_open) / st.oracle_slot_open * 100
-
-    # ── Feature 2: gap INSTANTANÉ spot vs oracle (le vrai lag à exploiter) ──
-    # Source: dev.to/fatherson — "Coinbase↔Chainlink price gap"
-    # Si spot a déjà bougé MAIS oracle pas encore → orderbook va bouger dans seconds
     spot_now = consensus_price()
-    spot_oracle_gap = 0.0
-    gap_direction = None
-    if spot_now > 0 and st.oracle_price > 0:
-        spot_oracle_gap = (spot_now - st.oracle_price) / st.oracle_price * 100
-        # ✅ v11.1 — Alimenter l'historique du gap pour le check de persistance
-        st.gap_history.append((time.time(), spot_oracle_gap))
-        if abs(spot_oracle_gap) >= 0.01:   # ✅ v10.33 — 1bps (Data Streams sub-sec: le lag est bref)
-            gap_direction = "UP" if spot_oracle_gap > 0 else "DOWN"
+    if spot_now <= 0: return
 
-    # ── Feature 3: returns 1s/3s/10s BTC (momentum court terme) ──
-    # Source: dev.to/fatherson — "1s/3s/10s BTC returns"
-    pts = list(st.ws_prices)  # deque de (ts, price)
-    ret_1s = ret_3s = ret_10s = 0.0
-    if pts and spot_now > 0:
-        def ret_over(secs):
-            cutoff = now - secs
-            old = [p for t,p in pts if t <= cutoff]
-            return (spot_now - old[-1]) / old[-1] * 100 if old and old[-1]>0 else 0.0
-        ret_1s = ret_over(1); ret_3s = ret_over(3); ret_10s = ret_over(10)
+    # Ret 3s/15s
+    pts = list(st.ws_prices)
+    def ret_over(secs):
+        cutoff = now - secs
+        old = [p for t,p in pts if t <= cutoff]
+        return (spot_now - old[-1]) / old[-1] * 100 if old and old[-1] > 0 else 0.0
+    ret_3s = ret_over(3); ret_15s = ret_over(15)
 
-    # ── Décision direction v11.1: combinaison intelligente gap + delta ──
-    # Si gap ET delta se contredisent fortement → le delta (tendance slot) l'emporte
-    # Données empiriques: gap faible (<0.05%) + delta fort (>0.03%) contre → suivre delta
-    # Cas 19:19: gap+0.03% UP + delta-0.04% DOWN → le bot UP → bloqué → aurait dû être DOWN
-    gap_strong = abs(spot_oracle_gap) >= FILTER_GAP_STRONG    # 0.05%
-    delta_strong = abs(oracle_delta) >= ORACLE_ENTRY_DELTA     # 0.03%
-    gap_vs_delta_conflict = (
-        gap_direction is not None and delta_strong and
-        gap_direction != ("UP" if oracle_delta > 0 else "DOWN")
-    )
+    oracle_delta = (st.oracle_price - st.oracle_slot_open) / st.oracle_slot_open * 100
+    spot_oracle_gap = (spot_now - st.oracle_price) / st.oracle_price * 100
 
-    if gap_strong and not gap_vs_delta_conflict:
-        # Gap fort ET pas de conflit → gap prime (lag oracle clair)
-        direction = gap_direction
-        primary_signal = "gap"
-        signal_strength = abs(spot_oracle_gap)
-    elif delta_strong and (not gap_direction or gap_vs_delta_conflict):
-        # Delta fort ET gap faible ou en conflit → suivre delta (tendance slot)
-        direction = "UP" if oracle_delta > 0 else "DOWN"
-        primary_signal = "delta"
-        signal_strength = abs(oracle_delta)
-    elif gap_direction and not gap_vs_delta_conflict:
-        # Gap faible mais pas de conflit → gap modéré accepté
-        direction = gap_direction
-        primary_signal = "gap"
-        signal_strength = abs(spot_oracle_gap)
-    else:
-        log_skip(f"BTC: Δ{oracle_delta:+.3f}% gap{spot_oracle_gap:+.3f}% (→ skip: delta et gap trop faibles)", None)
-        return
+    gap_dir = ("UP" if spot_oracle_gap > 0 else "DOWN") if abs(spot_oracle_gap) >= 0.025 else None
+    delta_dir = ("UP" if oracle_delta > 0 else "DOWN") if abs(oracle_delta) >= ORACLE_ENTRY_DELTA else None
+    primary_signal = "gap" if gap_dir else "delta"
+    direction = gap_dir or delta_dir
 
-    # ── Cohérence des 3 signals (v10.36 — filtres renforcés) ──
+    # Filtre ret3s brutal
+    if ret_3s < -0.055:
+        log_skip(f"BTC: ret3s {ret_3s:+.3f}%<-0.055% (chute brutale)", direction,
+                 features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":0,"filter":"ret3s_brutal","asset":"BTC"}); return
+
+    if not direction:
+        log_skip(f"BTC: Δ{oracle_delta:+.3f}% gap{spot_oracle_gap:+.3f}% (→ skip: delta et gap trop faibles)", None,
+                 features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":0,"filter":"weak_signal","asset":"BTC"}); return
+
+    if direction == "UP" and spot_oracle_gap < 0:
+        log_skip(f"BTC: UP bloqué gap négatif (→ skip: gap négatif)", direction,
+                 features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":0,"filter":"gap_neg","asset":"BTC"}); return
+    if direction == "UP" and oracle_delta < -0.005:
+        log_skip(f"BTC: delta {oracle_delta:+.3f}%<0 (→ skip: delta négatif LOSS garanti)", direction,
+                 features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":0,"filter":"delta_neg","asset":"BTC"}); return
+    if direction == "DOWN" and oracle_delta > 0.005:
+        log_skip(f"BTC: delta {oracle_delta:+.3f}%>0 (→ skip: contre DOWN)", direction,
+                 features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":0,"filter":"delta_contra","asset":"BTC"}); return
+
+    # TA score
+    price_hist = [{"price":p,"ts":t} for t,p in pts]
+    ta_score, ta_dir, _ = compute_ta_score(price_hist, "BTC")
+    ta_vote = 1 if ta_dir=="UP" else (-1 if ta_dir=="DOWN" else 0)
+
+    # OB vote
+    ob_vote = 0
+    if time.time() - st.ob_ts < 10:
+        if st.ob_imbalance > 0.15: ob_vote = 1
+        elif st.ob_imbalance < -0.15: ob_vote = -1
+
+    # Volume spike
+    vols = list(st.ws_volumes)
+    vol_vote = 0
+    if len(vols) >= 5:
+        vol_5s = sum(q for t,q in vols if now-t<=5)
+        vol_avg = sum(q for t,q in vols if now-t<=30) / 6
+        if vol_avg > 0 and vol_5s / vol_avg > 2.0: vol_vote = 1 if direction=="UP" else -1
+
     dir_votes = sum([
         1 if direction=="UP" and oracle_delta>0 else (-1 if direction=="DOWN" and oracle_delta<0 else 0),
         1 if direction=="UP" and spot_oracle_gap>0 else (-1 if direction=="DOWN" and spot_oracle_gap<0 else 0),
-        1 if direction=="UP" and ret_3s>0 else (-1 if direction=="DOWN" and ret_3s<0 else 0),
+        1 if direction=="UP" and ret_15s>0 else (-1 if direction=="DOWN" and ret_15s<0 else 0),
+        ob_vote, ta_vote,
     ])
 
-    # ✅ v10.36 FIX #1 — Votes=1/3 uniquement si gap fort OU delta neutre
-    # Source: trade perdu (delta -0.053%, gap +0.037%, votes 1/3)
-    # → gap seul ne suffit pas si la tendance du slot est clairement contre
-    if dir_votes < 2:
-        gap_is_strong = abs(spot_oracle_gap) >= ORACLE_GAP_MIN_STRONG  # gap fort = signal fiable seul
-        delta_is_neutral = abs(oracle_delta) < ORACLE_DELTA_CONTRA_MAX  # delta quasi-plat = pas de contre-signal
-        if not (gap_is_strong or delta_is_neutral):
-            log_skip(
-                f"Oracle: votes={dir_votes}/3 gap={spot_oracle_gap:+.3f}% delta={oracle_delta:+.3f}% "
-                f"(gap pas assez fort ET delta contre trop fort)", direction,
-                features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,
-                          "votes":dir_votes,"filter":"votes_delta"})
-            return
+    # Chainlink frais
+    chainlink_age = now - st.oracle_chainlink_ts if st.oracle_chainlink_ts > 0 else 999
 
-    # ✅ v10.36 FIX #2 — Filtre tendance 10min (source: -93% pertes dans étude live Polymarket)
-    # Si BTC a bougé contre notre direction sur les 10 dernières minutes → skip
-    # Protège contre les gaps momentanés dans une tendance opposée claire
-    cur_px = st.ws_price if st.ws_price > 0 else spot_now
-    if len(st.price_history) >= 2 and cur_px > 0:
-        old_prices = [x for x in st.price_history if time.time() - x["ts"] >= 540]
-        if old_prices:
-            ref_10min = old_prices[-1]["price"]
-            ch10 = (cur_px - ref_10min) / ref_10min * 100 if ref_10min > 0 else 0
-            if direction == "UP" and ch10 < -ORACLE_TREND_10MIN:
-                log_skip(f"Oracle: UP bloqué — tendance 10min {ch10:+.2f}% (baissière)", direction, features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"filter":"trend10","ch10":ch10})
-                return
-            if direction == "DOWN" and ch10 > ORACLE_TREND_10MIN:
-                log_skip(f"Oracle: DOWN bloqué — tendance 10min {ch10:+.2f}% (haussière)", direction, features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"filter":"trend10","ch10":ch10})
-                return
+    # Marché
+    cur_slug = f"btc-updown-5m-{cur_slot}"
+    market = st.current_market
+    if not market or market.get("market_slug") != cur_slug:
+        market = await poly.find_btc_5min_market()
+    if not market:
+        log_skip(f"BTC: marché non trouvé (T-{int(slot_remaining)}s)", direction,
+                 features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"filter":"no_market","asset":"BTC"}); return
+    st.current_market = market
+    token_used = market["token_up"] if direction=="UP" else market["token_down"]
+    token_price = await poly.get_token_price(token_used)
+    if not token_price or token_price <= 0: return
 
-    # ✅ v11.1 FIX #3 REMPLACÉ — Persistance du gap (ret3s était du bruit)
-    # Donnée empirique: 18:54 ret3s<0 → 0/6 WIN, 18:59 ret3s<0 → 6/6 WIN
-    # → ret3s n'est PAS prédictif. Le vrai signal = le gap qui TIENT dans le temps.
-    # Un gap artefact se referme en <5s. Un vrai lag reste >10s.
-    if primary_signal == "gap" and dir_votes < 3:
-        now_ts_check = time.time()
-        # Regarder les 15 dernières secondes de gap_history
-        recent_gaps = [(t, g) for t, g in st.gap_history
-                       if now_ts_check - t <= 15 and now_ts_check - t >= 2]
-        if len(recent_gaps) >= 3:
-            # Le gap doit être resté du même côté sur au moins 2/3 des points récents
-            same_side = sum(1 for _, g in recent_gaps
-                            if (direction=="UP" and g > 0) or (direction=="DOWN" and g < 0))
-            persist_ratio = same_side / len(recent_gaps)
-            if persist_ratio < 0.60:  # gap pas persistant = artefact
-                log_skip(
-                    f"Oracle: gap {direction} non persistant ({persist_ratio*100:.0f}% des 15s, besoin 60%)",
-                    direction, features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,
-                                         "votes":dir_votes,"filter":"gap_persist",
-                                         "persist_ratio":persist_ratio})
-                return
-            # Ajouter persist_ratio dans le message pour debug
-            gap_persist_info = f" persist={persist_ratio*100:.0f}%"
-        else:
-            # Pas assez d'historique (bot vient de démarrer) → check ret3s fallback
-            ret_ok = (direction == "UP" and ret_3s >= -0.03) or                      (direction == "DOWN" and ret_3s <= 0.03)
-            if not ret_ok:
-                log_skip(
-                    f"Oracle: gap {direction} ret3s={ret_3s:+.3f}% (pas d'historique, fallback)",
-                    direction, features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,
-                                         "votes":dir_votes,"filter":"ret3s_fallback"})
-                return
-            gap_persist_info = " (fallback ret3s)"
-    else:
-        gap_persist_info = ""
+    asset_up = market.get("token_up","")
+    if asset_up and st.ob_asset_id != asset_up:
+        if hasattr(st,"clob_ws_task") and st.clob_ws_task and not st.clob_ws_task.done():
+            st.clob_ws_task.cancel()
+        st.clob_ws_task = asyncio.create_task(ws_clob_loop(asset_up))
 
-    # ── Récupérer le token ──
-    if st.paper_mode:
-        # Paper: simuler le token à ~0.54$ (lag non pricé)
-        token_price = 0.54
-        tpu = token_price if direction == "UP" else 1.0 - token_price
-        tpd = 1.0 - tpu
-        market_end = cur_slot + 300
-    else:
-        cur_slug = f"btc-updown-5m-{cur_slot}"
-        market = st.current_market
-        if not market or market.get("market_slug") != cur_slug:
-            market = await poly.find_btc_5min_market()
-        if not market:
-            log_skip("Oracle lag: aucun marché actif", direction); return
-        st.current_market = market
-        token_used = market["token_up"] if direction == "UP" else market["token_down"]
-        token_price = await poly.get_token_price(token_used)
-        tpu = token_price if direction == "UP" else 1.0 - token_price
-        tpd = 1.0 - tpu
-        try:
-            market_end = datetime.fromisoformat(
-                market.get("end_date","").replace("Z","+00:00")).timestamp()
-        except:
-            market_end = cur_slot + 300
-
-    # ── Vérifications edge ──
     if token_price > ORACLE_TOKEN_MAX:
-        log_skip(f"Oracle lag: token {token_price:.2f}$>{ORACLE_TOKEN_MAX}$ (déjà pricé)", direction)
-        return
+        log_skip(f"BTC: token {token_price:.2f}$>{ORACLE_TOKEN_MAX}$ (→ skip: marché a déjà pricé la direction)", direction,
+                 features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"filter":"tokenmax","token":token_price,"asset":"BTC"}); return
     if token_price < ORACLE_TOKEN_MIN:
-        log_skip(f"Oracle lag: token {token_price:.2f}$<{ORACLE_TOKEN_MIN}$ (trop incertain)", direction)
-        return
+        log_skip(f"BTC: token {token_price:.2f}$<{ORACLE_TOKEN_MIN}$ (→ skip: trop incertain)", direction,
+                 features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"filter":"tokenmin","token":token_price,"asset":"BTC"}); return
 
     fee = taker_fee_per_share(token_price)
-    # P(direction) oracle = quasi certaine si delta > seuil + temps restant court
-    # Calibration empirique: à T-20s Δ0.05%, les pros observent ~85-90% WR
-    # On reste conservateur: P = 0.85 (pas de modèle Brownien ici)
-    # ── p_oracle calibré selon la force et le type de signal ──
-    # Gap instantané spot↔oracle = signal plus fort (Binance bouge avant aggregate)
-    # Delta cumulé = signal de tendance
-    if primary_signal == "gap":
-        p_oracle = min(0.93, 0.85 + abs(spot_oracle_gap) * 3.0)
-    else:
-        p_oracle = min(0.90, 0.80 + abs(oracle_delta) * 2.0)
-    # Bonus si 3/3 signals alignés
+    p_oracle = min(0.93, 0.85 + abs(spot_oracle_gap)*3.0) if primary_signal=="gap" else min(0.90, 0.80 + abs(oracle_delta)*2.0)
     if dir_votes >= 3: p_oracle = min(0.95, p_oracle + 0.03)
-    # ✅ v10.33 — Tie bias: smart contract → "end price >= start price → UP wins"
-    # Sur les slots quasi-plats (delta <0.01%), UP a un avantage asymétrique
-    # Source: blockeden.xyz/forum (ethereum_emma, confirmation smart contract)
-    if direction == "UP" and abs(oracle_delta) < 0.01:
-        p_oracle = min(0.95, p_oracle + 0.01)  # +1pt sur UP quasi-plat
+    if dir_votes >= 4: p_oracle = min(0.96, p_oracle + 0.02)
+    if chainlink_age < 2.0: p_oracle = min(0.97, p_oracle + 0.03)
     ev = p_oracle - token_price - fee
 
     if ev < ORACLE_EDGE_MIN:
-        log_skip(
-            f"Oracle lag: EV {ev*100:+.1f}%<{ORACLE_EDGE_MIN*100:.0f}% "
-            f"(P:{p_oracle:.2f} tok:{token_price:.2f}$)", direction)
-        return
+        log_skip(f"BTC: EV {ev*100:+.1f}%<{ORACLE_EDGE_MIN*100:.0f}% (→ skip: edge insuffisant)", direction,
+                 features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"filter":"ev","token":token_price,"ev":ev,"asset":"BTC"}); return
 
-    # ✅ v10.32 — gap calculé dans Feature 2 (spot_now = consensus_price())
-    # Cohérence vérifiée par dir_votes >= 1 (au moins 2 signals alignés)
-    spot = spot_now  # alias pour le message final
-
-    # ── Kelly sizing ──
-    payout = round(1 / token_price, 2) if token_price > 0 else 1.0
+    payout = round(1/token_price, 2)
     amount = kelly_bet(st.bankroll, p_oracle, payout, token_price, ev_bonus=True)
-    if amount < MIN_BET_USD or st.bankroll < amount:
-        return
+    if amount < MIN_BET_USD: return
 
-    sess = session_ctx()
-    conf_score = st.last_conf_score if st.last_conf_score else {"score": 0, "signals": []}
-    reasoning = (
-        f"⚡ORACLE LAG {direction} | "
-        f"gap={spot_oracle_gap:+.3f}% delta={oracle_delta:+.3f}% votes={dir_votes}/3 | "
-        f"tok={token_price:.3f}$ EV={ev*100:+.1f}% T-{int(slot_remaining)}s")
+    tpu = market["token_up"]; tpd = market["token_down"]
+    try: market_end = datetime.fromisoformat(market.get("end_date","").replace("Z","+00:00")).timestamp()
+    except: market_end = cur_slot + 300
+    sess = session_ctx(); conf_score = {"score":0,"signals":[]}
+    reasoning = (f"⚡ORACLE LAG BTC {direction} | gap={spot_oracle_gap:+.3f}% delta={oracle_delta:+.3f}% "
+                 f"OB={st.ob_imbalance:+.2f} votes={dir_votes}/5 | tok={token_price:.3f}$ EV={ev*100:+.1f}% T-{int(slot_remaining)}s")
 
-    ok = await place_bet(
-        context, direction, amount, round(p_oracle, 2),
-        reasoning, conf_score, sess, tpu, tpd, market_end, source="snipe")
+    ok = await place_bet(context, direction, amount, round(p_oracle,2), reasoning, conf_score, sess, tpu, tpd, market_end, source="snipe")
     if not ok: return
 
-    st.last_decision = {
-        "dir": direction, "conf": round(p_oracle, 2), "size": amount,
-        "reasoning": reasoning, "risk": "LOW", "trade": True,
-        "kelly_pct": round(amount / st.bankroll * 100, 1) if st.bankroll > 0 else 0}
-    st.last_fair = {
-        "p_up": round(p_oracle if direction=="UP" else 1-p_oracle, 3),
-        "ev": round(ev, 3), "t_rem": int(slot_remaining),
-        "fee": round(fee, 4), "mode": "ORACLE_LAG",
-        "oracle_delta": round(oracle_delta, 4)}
-
+    st.last_trade_slot = cur_slot
     mode = "💰 RÉEL" if not st.paper_mode else "📄 paper"
     entry_tp = st.entry_token_price if not st.paper_mode else token_price
     await send(context.bot,
-        f"⚡ *ORACLE LAG* [{mode}]\n━━━━━━━━━━━━━━━\n"
+        f"⚡ *ORACLE LAG ₿ BTC* [{mode}]\n━━━━━━━━━━━━━━━\n"
         f"*{direction}* | `{amount:.2f}$` | P:`{p_oracle*100:.0f}%` | ⏰T-`{int(slot_remaining)}s`\n"
-        f"Δslot:`{oracle_delta:+.3f}%` | Gap:`{spot_oracle_gap:+.3f}%`{gap_persist_info} | Votes:`{dir_votes}/3`\n"
-        f"Ret 1s:`{ret_1s:+.3f}%` 3s:`{ret_3s:+.3f}%` 10s:`{ret_10s:+.3f}%`\n"
+        f"Δslot:`{oracle_delta:+.3f}%` | Gap:`{spot_oracle_gap:+.3f}%` OB:`{st.ob_imbalance:+.2f}` TA:`{ta_score}` | Votes:`{dir_votes}/5`\n"
+        f"Ret 3s:`{ret_3s:+.3f}%` 15s:`{ret_15s:+.3f}%`\n"
         f"Token:`{entry_tp:.3f}$` | EV:`{ev*100:+.1f}%` | Frais:`{fee*100:.2f}¢`\n"
         f"Oracle:`${st.oracle_price:,.2f}` → Spot:`${spot_now:,.2f}`\n\n"
         f"💭 _{reasoning}_")
 
-
-
-# ═══════════ ✅ v10.37 — AUTO-APPRENTISSAGE ═══════════
 
 async def job_oracle_lag_asset(context, asset:str):
     """v12.4 — Oracle lag ETH/SOL identique à BTC."""
