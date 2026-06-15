@@ -2806,7 +2806,7 @@ async def job_oracle_lag(context):
     FENÊTRE: T-35s → T-6s (source: dev.to → T-6s = dernier moment sûr)
     SORTIE: résolution automatique du slot (pas de stop loss — on tient)
     """
-    if not st.running or st.killed or st.bet: return
+    if not st.running or st.killed: return
     now_ts = time.time()
     slot_remaining = 300 - (now_ts % 300)
 
@@ -2819,7 +2819,7 @@ async def job_oracle_lag(context):
         return
 
     if st.last_trade_slot == int(now_ts // 300) * 300:
-        log_skip(f"Oracle: slot déjà tradé (T-{int(slot_remaining)}s)", None); return
+        log_skip(f"BTC: slot déjà tradé (T-{int(slot_remaining)}s)", None); return
     if check_daily():
         log_skip(f"Oracle: pause journalière (T-{int(slot_remaining)}s)", None); return
     if in_cd():
@@ -2830,7 +2830,7 @@ async def job_oracle_lag(context):
     # ── Signal oracle (v10.32 — 3 features documentées par les pros) ──
     now = time.time()
     if not st.oracle_connected or st.oracle_price <= 0 or st.oracle_slot_open <= 0:
-        log_skip(f"Oracle: WS non dispo (T-{int(slot_remaining)}s)", None); return
+        log_skip(f"BTC: WS non dispo (T-{int(slot_remaining)}s)", None); return
     if now - st.oracle_ts > ORACLE_MIN_FRESH_S:
         log_skip(f"Oracle: tick périmé {int(now-st.oracle_ts)}s (T-{int(slot_remaining)}s)", None); return
     cur_slot = int(now // 300) * 300
@@ -2891,7 +2891,7 @@ async def job_oracle_lag(context):
         primary_signal = "gap"
         signal_strength = abs(spot_oracle_gap)
     else:
-        log_skip(f"Oracle: Δ{oracle_delta:+.3f}% gap{spot_oracle_gap:+.3f}% (signals faibles ou conflit)", None)
+        log_skip(f"BTC: Δ{oracle_delta:+.3f}% gap{spot_oracle_gap:+.3f}% (→ skip: delta et gap trop faibles)", None)
         return
 
     # ── Cohérence des 3 signals (v10.36 — filtres renforcés) ──
