@@ -61,7 +61,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "12.1"
+BOT_VERSION = "12.2"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -588,6 +588,34 @@ class PolyClient:
             self.client_version = "v1"
             log.info("✅ Polymarket CLOB V1 initialisé"); return True
         except Exception as e: log.error(f"Polymarket init: {e}"); return False
+
+    async def get_market_by_slug(self, slug: str):
+        """✅ v12.2 — Récupère un marché par slug (BTC/ETH/SOL)"""
+        headers={"User-Agent":"Mozilla/5.0","Accept":"application/json",
+                 "Referer":"https://polymarket.com/","Origin":"https://polymarket.com"}
+        for endpoint in ["/events","/markets"]:
+            try:
+                async with aiohttp.ClientSession(headers=headers) as s:
+                    async with s.get(f"{POLY_GAMMA}{endpoint}",params={"slug":slug},
+                                     timeout=aiohttp.ClientTimeout(total=10)) as r:
+                        if r.status==200:
+                            data=await r.json()
+                            items=data if isinstance(data,list) else data.get("events",data.get("markets",[]))
+                            for item in items:
+                                if slug in item.get("slug",""):
+                                    markets=item.get("markets",[item])
+                                    for m in markets:
+                                        ids=m.get("clobTokenIds","[]")
+                                        if isinstance(ids,str):
+                                            try: ids=json.loads(ids)
+                                            except: ids=[]
+                                        if len(ids)>=2:
+                                            return {"token_up":ids[0],"token_down":ids[1],
+                                                "question":item.get("title",item.get("question",slug)),
+                                                "condition_id":m.get("conditionId",""),
+                                                "end_date":m.get("endDate",""),"market_slug":slug}
+            except Exception as e: log.warning(f"get_market_by_slug {slug}{endpoint}: {e}")
+        return None
 
     async def find_btc_5min_market(self):
         now=int(time.time()); current_ts=(now//300)*300
@@ -3534,7 +3562,7 @@ async def cmd_learn(update, context):
     """✅ v11.10r — /learn: merge mémoire RAM + JSON branche State en temps réel"""
     if not auth(update): return
     now = time.time()
-    lines = [f"🧠 *AUTO-APPRENTISSAGE v{BOT_VERSION}*\n━━━━━━━━━━━━━━"]
+    lines = [f"🧠 *AUTO-APPRENTISSAGE*\n━━━━━━━━━━━━━━"]
 
     # ── 0) Données en RAM (chargées depuis GitHub au démarrage) ──
     merged_patterns = st.oracle_patterns
@@ -3602,7 +3630,7 @@ async def cmd_learn(update, context):
             wr_p24 = wins_p24/len(recent_p)*100
             lines.append(f"  📅 24h: {len(recent_p)} patterns | WR:{wr_p24:.0f}%")
     else:
-        lines.append(f"\n📊 Pas encore assez de patterns (<5 en v{BOT_VERSION})")
+        lines.append(f"\n📊 Pas encore assez de patterns (<5 pour cette version)")
         if resolved: lines.append(f"  📦 Historique: {len(resolved)} patterns")
 
     # ── 4) Dernière calibration ──
@@ -3641,7 +3669,7 @@ async def cmd_start(update,context):
     if not auth(update): return
     w=POLY_FUNDER_WALLET or POLY_PROXY_WALLET or "?"
     await update.message.reply_text(
-        f"🧠 *POLYMARKET BOT v{BOT_VERSION} — R:R FIX*\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🧠 *POLYMARKET BOT — BTC/ETH/SOL*\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"Mode:*{'📄 PAPER' if st.paper_mode else '💰 RÉEL'}* | API:{'✅' if poly.ready else '❌'}\n"
         f"Wallet:`{w[:6]}...{w[-4:]}`\n\n"
         f"🆕 v10.27 — Basé sur 29,060 trades réels:\n"
@@ -3814,7 +3842,7 @@ async def cmd_backup(update,context):
             log.warning(f"cmd_backup github: {e}")
     status = "✅ Local + GitHub State" if gh_ok else ("✅ Local seulement" if ok else "❌ Échoué")
     await update.message.reply_text(
-        f"💾 *BACKUP v{BOT_VERSION}*\n{status}\n"
+        f"💾 *BACKUP*\n{status}\n"
         f"BR:`{st.bankroll:.2f}$` | ROI:`{roi()}`\n"
         f"Trades:`{len(st.trades)}` | Patterns:`{len(st.oracle_patterns)}` | Passes:`{len(st.pass_reasons)}`",
         parse_mode="Markdown")
@@ -3848,7 +3876,7 @@ async def cmd_status(update,context):
     min_score,min_diff,min_mom=get_session_thresholds(sess["session"])
     fg_val = st.fg.get('value', 50) if st.fg else 50
     msg = (
-        f"📊 *STATUS v{BOT_VERSION}*\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 *STATUS*\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{'🟢 EN COURS' if st.running else '🔴 ARRÊTÉ'} | {'✅ CLOB' if poly.ready else '❌ CLOB'} | WS:{'✅' if st.ws_connected else '❌'}\n\n"
         f"₿`${st.price:,.2f}` Ξ`${st.eth_price:,.0f}` ◎`${st.sol_price:,.0f}` | F&G:`{fg_val}` | `{sess['session']}`\n"
         f"Seuils: score≥`{min_score}` mom≥`{min_mom}`\n"
@@ -3904,7 +3932,7 @@ async def cmd_market(update,context):
     now_ts = int(time.time())
     cur_slot = int(now_ts // 300) * 300
     slot_rem = cur_slot + 300 - now_ts
-    lines = [f"🎯 *MARCHÉS ACTIFS v{BOT_VERSION}*\n━━━━━━━━━━━━━━━━━━━━━━━━\n⏰ T-`{int(slot_rem)}s` avant résolution\n"]
+    lines = [f"🎯 *MARCHÉS ACTIFS — BTC/ETH/SOL*\n━━━━━━━━━━━━━━\n⏰ T-`{int(slot_rem)}s` avant résolution\n"]
     for label, prefix, oracle_px, slot_open in [
         ("₿ BTC", "btc-updown-5m", st.oracle_price, st.oracle_slot_open),
         ("Ξ ETH", "eth-updown-5m", st.eth_oracle_price, st.eth_oracle_slot_open),
@@ -4219,7 +4247,7 @@ async def cmd_oracle(update,context):
 
     try:
         await update.message.reply_text(
-            f"🔗 *ORACLE v12.0 — BTC/ETH/SOL*\n━━━━━━━━━━━━━━\n"
+            f"🔗 *ORACLE CHAINLINK — BTC/ETH/SOL*\n━━━━━━━━━━━━━━\n"
             f"*₿ BTC* | Oracle:`${oracle:,.2f}` | Tick:`{tick_age}s` {'✅' if st.oracle_connected else '❌'}\n"
             f"  Δslot:`{oracle_delta:+.3f}%` | Gap spot↔oracle:`{spot_gap:+.3f}%`\n"
             f"  Spot:`${spot:,.2f}`{tie_note}\n"
