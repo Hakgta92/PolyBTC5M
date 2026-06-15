@@ -1,5 +1,5 @@
 """
-POLYMARKET BTC BOT v10.29 — FRAIS CORRIGÉS + FEE_FILTER SUPPRIMÉ
+POLYMARKET BOT v12.1 — BTC/ETH/SOL Oracle Lag | TA RSI+EMA | Multi-asset
 NOUVEAUTÉS v10.29 — CORRECTIONS MAJEURES:
 
 SOURCES VÉRIFIÉES (juin 2026):
@@ -61,7 +61,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "12.0"
+BOT_VERSION = "12.1"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -109,7 +109,7 @@ BPS_TOTAL_MIN      = 2    # ✅ v10.28 FIX — était 5: idem
 BPS_TOTAL_MAX      = 30   # ✅ v10.28 FIX — élargi (le polybacktest mesure l ordre de grandeur, pas le cap exact)
 
 # ✅ v10.24 — Stop loss réintroduit
-STOP_LOSS_MULT     = 0.01  # ✅ v11.10j — désactivé en réel (binaire: tenir jusqu'à résolution)
+STOP_LOSS_MULT     = 0.01  # ✅ v12.1 — désactivé (binaire: pas de stop)
 
 # ═══════════ v10.23 — NOUVELLES CONSTANTES ═══════════
 # Oracle lag (le meilleur edge: l'oracle bouge en <1s, l'orderbook met ~55s)
@@ -132,12 +132,12 @@ KILL_SWITCH_LOSSES  = 5      # Pertes consécutives → arrêt total (au-delà d
 # Edge documenté: l'oracle Chainlink (qui RÈGLE le marché) bouge en <1s
 # L'orderbook Polymarket met 30-55s à suivre → fenêtre d'arb
 # Strategy: si oracle a bougé X% depuis slot open ET token gagnant encore pas cher → BUY
-ORACLE_ENTRY_DELTA  = 0.02  # ✅ v11.10n — 0.02% min (delta +0.011% = bruit, trade perdu -3$)
-ORACLE_TOKEN_MAX    = 0.65  # ✅ v11.10w — 0.65$ max
+ORACLE_ENTRY_DELTA  = 0.02  # ✅ v12.1 — 0.02% min delta
+ORACLE_TOKEN_MAX    = 0.65  # ✅ v12.1 — 0.65$ max R:R optimal
 ORACLE_TOKEN_MIN    = 0.51  # Token min (trop proche de 0.50$ = incertitude trop haute)
-ORACLE_EDGE_MIN     = 0.15  # ✅ v11.10t — EV min 15% (bloque token>0.68$)
-ORACLE_WINDOW_START = 25    # ✅ v12 — T-25s (source: scalper article, direction lockée)
-ORACLE_WINDOW_END   = 5     # ✅ v12 — T-5s
+ORACLE_EDGE_MIN     = 0.15  # ✅ v12.1 — EV min 15%
+ORACLE_WINDOW_START = 25    # ✅ v12.1 — T-25s→T-5s BTC
+ORACLE_WINDOW_END   = 5     # ✅ v12.1 — T-5s
 # ✅ v10.32 — Mode T-10s (source: github.com/Archetapp — T-10s "direction quasi lockée")
 ORACLE_ULTRA_WINDOW = 12    # Passe ultra-précise si T-12s→T-6s ET EV exceptionnelle
 ORACLE_ULTRA_EV_MIN = 0.05  # EV min pour passe ultra (moins strict car WR > 95% à T-10s)
@@ -158,11 +158,11 @@ TRAILING_STOP_MULT  = 0.01  # ✅ v11.9l — désactivé (seuil impossible = jam
 TAKE_PROFIT_CHECK   = 15   # ✅ v10.22 — 15s (avant: 30s, trop lent sur du 5min)
 POLY_FEE            = 0.02 # Legacy: estimation flat pour le paper mode uniquement
 MAX_CONSEC_LOSS     = 2
-COOLDOWN_MIN        = 0    # ✅ v11.9j — Cooldown supprimé (h24)
+COOLDOWN_MIN        = 0    # ✅ v12.1 — pas de cooldown (h24)24)
 MAX_TRADES_PER_H    = 6   # ✅ v11.9j — 6/h    # ✅ v10.26 — Max 3/heure (supprimé la limite 1, garde-fou à 3)
 CONSERVATIVE_AFTER_LOSSES = 2
 BOOST_AFTER_WINS    = 999
-DAILY_LOSS_MAX      = 0.99  # ✅ v11.9j — Pause journalière désactivée (h24)
+DAILY_LOSS_MAX      = 0.99  # ✅ v12.1 — pause journalière désactivée (h24)
 DAILY_PAUSE_H       = 3
 
 # ✅ v10.21 — Seuils relevés (+2 partout): -73% de trades = 7x moins de pertes (source v3 testée réel)
