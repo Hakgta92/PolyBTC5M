@@ -3200,41 +3200,10 @@ async def cmd_learn(update, context):
     now = time.time()
     lines = [f"🧠 *AUTO-APPRENTISSAGE v{BOT_VERSION}*\n━━━━━━━━━━━━━━"]
 
-    # ── 0) Charger JSON depuis GitHub State en temps réel et merger avec RAM ──
-    try:
-        gh_token = os.getenv("GITHUB_TOKEN","")
-        gh_repo = os.getenv("GITHUB_REPO","")
-        if gh_token and gh_repo:
-            import base64
-            url = f"https://api.github.com/repos/{gh_repo}/contents/polybot_v10_state.json?ref=State"
-            hdrs = {"Authorization": f"token {gh_token}", "Accept": "application/vnd.github.v3+json"}
-            import aiohttp as _aiohttp
-            async with _aiohttp.ClientSession() as s:
-                async with s.get(url, headers=hdrs) as r:
-                    if r.status == 200:
-                        d = await r.json()
-                        data = json.loads(base64.b64decode(d["content"]))
-                        # Merger patterns GitHub + RAM (dédupliquer par ts)
-                        gh_patterns = data.get("oracle_patterns", [])
-                        ram_patterns = st.oracle_patterns
-                        all_ts = {p["ts"] for p in ram_patterns}
-                        merged_patterns = ram_patterns + [p for p in gh_patterns if p["ts"] not in all_ts]
-                        # Merger trades
-                        gh_trades = data.get("trades", [])
-                        ram_trades = st.trades
-                        all_trade_ts = {t["ts"] for t in ram_trades}
-                        merged_trades = ram_trades + [t for t in gh_trades if t["ts"] not in all_trade_ts]
-                        lines.append(f"📡 GitHub State: +{len(merged_patterns)-len(ram_patterns)} patterns | +{len(merged_trades)-len(ram_trades)} trades")
-                    else:
-                        merged_patterns = st.oracle_patterns
-                        merged_trades = st.trades
-        else:
-            merged_patterns = st.oracle_patterns
-            merged_trades = st.trades
-    except Exception as e:
-        merged_patterns = st.oracle_patterns
-        merged_trades = st.trades
-        lines.append(f"⚠️ GitHub State inaccessible: {e}")
+    # ── 0) Données en RAM (chargées depuis GitHub au démarrage) ──
+    merged_patterns = st.oracle_patterns
+    merged_trades = st.trades
+    lines.append(f"📊 {len(merged_patterns)} patterns | {len(merged_trades)} trades en mémoire")
 
     # ── 1) Seuils actuels ──
     lines.append(f"📐 *Seuils actuels:*")
