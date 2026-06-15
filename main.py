@@ -2965,8 +2965,12 @@ async def job_oracle_lag_asset(context, asset:str):
         last_ts=st.sol_last_trade_slot; slug_prefix="sol-updown-5m"
         symbol="SOL"; emoji="◎"; ws_prices=st.sol_ws_prices
     else: return
-    if spot<=0 or oracle<=0 or slot_open<=0: return
-    if now-spot_ts>5 or now-oracle_ts>15: return
+    if spot<=0 or oracle<=0 or slot_open<=0:
+        log_skip(f"{symbol}: données manquantes spot={spot:.2f} oracle={oracle:.2f}", None); return
+    if now-spot_ts>5:
+        log_skip(f"{symbol}: prix spot périmé {int(now-spot_ts)}s", None); return
+    if now-oracle_ts>15:
+        log_skip(f"{symbol}: oracle périmé {int(now-oracle_ts)}s", None); return
     if last_ts==cur_slot: return
     # Ret 3s/15s
     pts=list(ws_prices)
