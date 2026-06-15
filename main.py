@@ -1704,10 +1704,12 @@ async def send(bot,text,parse_mode="Markdown"):
 
 # ─── JOBS ──────────────────────────────────────────────────────────────────
 async def job_backup(context):
-    # ✅ v10.23 — Auto-calibration sigma à chaque backup
-    factor, _ = calibrate_sigma()
-    st.calib_factor = factor
+    """v12.4 — Backup local + GitHub State toutes les 2min."""
+    try: factor, _ = calibrate_sigma(); st.calib_factor = factor
+    except: pass
     st.backup()
+    await push_state_to_github()
+    log.info("✅ Backup auto → GitHub State")
 
 async def job_daily_recap(context):
     """✅ v10.16 — Résumé 22h + rapport hebdo dimanche + alerte bot arrêté"""
