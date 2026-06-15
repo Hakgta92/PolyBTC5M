@@ -2187,7 +2187,7 @@ async def ws_oracle_loop():
     while True:
         try:
             async with aiohttp.ClientSession() as s:
-                async with s.ws_connect(url, heartbeat=20) as ws:
+                async with s.ws_connect(url, heartbeat=3) as ws:  # ✅ v12.1 PING 3s
                     await ws.send_json(sub)
                     st.oracle_connected=True
                     log.info("✅ WS Oracle Chainlink connecté")
@@ -2214,24 +2214,30 @@ async def ws_oracle_loop():
         await asyncio.sleep(5)
 
 async def ws_oracle_eth_loop():
-    """✅ v11.10y — Feed Chainlink ETH/USD de Polymarket (même source que résolution)"""
+    """✅ v12.1 — Feed Chainlink ETH/USD Polymarket (PING 5s requis selon docs.polymarket.com)"""
     url = "wss://ws-live-data.polymarket.com"
     sub = {"action":"subscribe","subscriptions":[
         {"topic":"crypto_prices_chainlink","type":"*","filters":'{"symbol":"eth/usd"}'}]}
     while True:
         try:
             async with aiohttp.ClientSession() as s:
-                async with s.ws_connect(url, heartbeat=20) as ws:
+                async with s.ws_connect(url, heartbeat=3) as ws:  # ✅ v12.1 PING 3s (docs: required every 5s)
                     await ws.send_json(sub)
                     log.info("✅ WS Oracle ETH/USD connecté")
                     async for msg in ws:
                         if msg.type == aiohttp.WSMsgType.TEXT:
                             try: d = json.loads(msg.data)
                             except: continue
+                            # ✅ Filtrer uniquement les updates (pas les snapshots historiques)
+                            if d.get("type") not in ("update", "*"): continue
                             payload = d.get("payload", {})
                             val = payload.get("value")
-                            if val and float(val) > 0:
-                                p = float(val); now = time.time()
+                            ts_ms = payload.get("timestamp", 0)
+                            now = time.time()
+                            # ✅ Vérifier fraîcheur: rejeter données >30s (stale)
+                            if ts_ms > 0 and (now - ts_ms/1000) > 30: continue
+                            if val and float(val) > 100:  # ETH > $100 (sanity check)
+                                p = float(val)
                                 st.eth_oracle_price = p; st.eth_oracle_ts = now
                                 slot_start = int(now // 300) * 300
                                 if st.eth_oracle_slot_ts != slot_start:
@@ -2239,27 +2245,32 @@ async def ws_oracle_eth_loop():
                                     st.eth_oracle_slot_open = p
                         elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR): break
         except Exception as e: log.warning(f"WS Oracle ETH: {e}")
-        await asyncio.sleep(5)
+        await asyncio.sleep(3)
 
 async def ws_oracle_sol_loop():
-    """✅ v11.10y — Feed Chainlink SOL/USD de Polymarket"""
+    """✅ v12.1 — Feed Chainlink SOL/USD Polymarket (PING 5s requis selon docs.polymarket.com)"""
     url = "wss://ws-live-data.polymarket.com"
     sub = {"action":"subscribe","subscriptions":[
         {"topic":"crypto_prices_chainlink","type":"*","filters":'{"symbol":"sol/usd"}'}]}
     while True:
         try:
             async with aiohttp.ClientSession() as s:
-                async with s.ws_connect(url, heartbeat=20) as ws:
+                async with s.ws_connect(url, heartbeat=3) as ws:  # ✅ v12.1 PING 3s
                     await ws.send_json(sub)
                     log.info("✅ WS Oracle SOL/USD connecté")
                     async for msg in ws:
                         if msg.type == aiohttp.WSMsgType.TEXT:
                             try: d = json.loads(msg.data)
                             except: continue
+                            if d.get("type") not in ("update", "*"): continue
                             payload = d.get("payload", {})
                             val = payload.get("value")
-                            if val and float(val) > 0:
-                                p = float(val); now = time.time()
+                            ts_ms = payload.get("timestamp", 0)
+                            now = time.time()
+                            # ✅ Fraîcheur + sanity check SOL > $5
+                            if ts_ms > 0 and (now - ts_ms/1000) > 30: continue
+                            if val and float(val) > 5:
+                                p = float(val)
                                 st.sol_oracle_price = p; st.sol_oracle_ts = now
                                 slot_start = int(now // 300) * 300
                                 if st.sol_oracle_slot_ts != slot_start:
@@ -2267,7 +2278,7 @@ async def ws_oracle_sol_loop():
                                     st.sol_oracle_slot_open = p
                         elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR): break
         except Exception as e: log.warning(f"WS Oracle SOL: {e}")
-        await asyncio.sleep(5)
+        await asyncio.sleep(3)
 
 
 async def job_ws_watchdog_all(context):
@@ -3055,7 +3066,7 @@ async def job_oracle_lag(context):
     # ✅ v11.10v Fix#A — ret3s extrême < -0.05% = BTC chute brutale → bloquer
     if ret_3s < -0.055:
         log_skip(
-            f"Oracle: ret3s {ret_3s:+.3f}%<-0.055% (chute brutale BTC)",
+            f"BTC Oracle: ret3s {ret_3s:+.3f}%<-0.055% (chute brutale)",
             direction, features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,
                                   "votes":dir_votes,"filter":"ret3s_brutal"})
         return
