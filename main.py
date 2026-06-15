@@ -88,6 +88,12 @@ POLY_HOST          = "https://clob.polymarket.com"
 POLY_GAMMA         = "https://gamma-api.polymarket.com"
 POLY_CHAIN_ID      = 137
 
+# ✅ v12.4 — Filtres oracle (alias pour compatibilité save/load)
+FILTER_RET3S          = -0.055  # ret3s min (chute brutale)
+FILTER_DELTA_CONTRA   = 0.017   # delta contra max
+FILTER_GAP_STRONG     = 0.025   # gap fort BTC
+
+
 MIN_BET_USD     = 2.0   # Minimum absolu
 FAIR_EDGE_MIN   = 0.08
 MAX_BET_USD     = 8.0   # ✅ v10.26 — Max 8$ (setup exceptionnel sur BR 35$ = ~23%)
@@ -1585,7 +1591,8 @@ class State:
             "haiku_insights":self.haiku_insights[-20:],
             "filter_ret3s":FILTER_RET3S,
             "filter_delta_contra":FILTER_DELTA_CONTRA,
-            "filter_gap_strong":FILTER_GAP_STRONG}
+            "filter_gap_strong":FILTER_GAP_STRONG,
+            "delta_contra_max":ORACLE_DELTA_CONTRA_MAX}
         try:
             with open(DATA_FILE,"w") as f: json.dump(data,f,indent=2)
         except Exception as e: log.error(f"Save: {e}")
