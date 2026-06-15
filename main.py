@@ -3647,7 +3647,7 @@ async def cmd_learn(update, context):
     lines.append(f"  delta_contra:`{ORACLE_DELTA_CONTRA_MAX:.3f}%` | gap_min:`{ORACLE_ENTRY_DELTA:.3f}%`")
     lines.append(f"  token:`{ORACLE_TOKEN_MIN:.2f}$`-`{ORACLE_TOKEN_MAX:.2f}$` | EV_min:`{ORACLE_EDGE_MIN*100:.0f}%`")
 
-    # ── 2) Trades réels WR ──
+    # ── 2) Trades réels WR global ──
     trades = merged_trades
     if trades:
         real = [t for t in trades if not t.get("paper")]
@@ -3676,7 +3676,17 @@ async def cmd_learn(update, context):
         pnl_w = sum(t.get("pnl",0) for t in week)
         lines.append(f"  📈 7j: {len(week)} trades | WR:`{wr_w:.0f}%` | PnL:`{pnl_w:+.2f}$`")
 
-    # ── 3) Patterns skips détaillés ──
+    # ── 2b) Trades par asset ──
+    if trades:
+        real = [t for t in trades if not t.get("paper")]
+        for asset_tag, emoji in [("BTC","₿"),("ETH","Ξ"),("SOL","◎")]:
+            at = [t for t in real if t.get("asset",asset_tag if asset_tag=="BTC" else None)==asset_tag]
+            if at:
+                w_at = sum(1 for t in at if t.get("result")=="WIN")
+                pnl_at = sum(t.get("pnl",0) for t in at)
+                lines.append(f"  {emoji} {asset_tag}: {len(at)} trades WR:`{w_at/len(at)*100:.0f}%` PnL:`{pnl_at:+.2f}$`")
+
+    # ── 3) Patterns skips par asset ──
     resolved = [p for p in merged_patterns if p.get("result") in ("WIN","LOSS")]
     resolved_cur = [p for p in resolved if p.get("v") == BOT_VERSION]
     sample = resolved_cur if len(resolved_cur) >= 5 else resolved
@@ -3684,6 +3694,7 @@ async def cmd_learn(update, context):
 
     if sample:
         wins = sum(1 for p in sample if p["result"]=="WIN")
+        # Stats globales par filtre
         by_filter = {}
         for p in sample:
             f=p.get("filter","?")
@@ -3696,12 +3707,18 @@ async def cmd_learn(update, context):
             wr=v["w"]/tot*100 if tot else 0
             emoji = "✅" if wr < 40 else ("⚠️" if wr > 65 else "➖")
             lines.append(f"  {emoji}`{f}`: {wr:.0f}% ({v['w']}W/{v['l']}L)")
-        # Tendances patterns 24h vs total
+        # Stats par asset
+        for asset_tag, emoji in [("BTC","₿"),("ETH","Ξ"),("◎","◎")]:
+            real_tag = "SOL" if emoji=="◎" else asset_tag
+            ap = [p for p in sample if p.get("asset","BTC")==real_tag]
+            if ap:
+                w_ap = sum(1 for p in ap if p["result"]=="WIN")
+                lines.append(f"  {emoji} {real_tag}: {len(ap)} patterns WR:{w_ap/len(ap)*100:.0f}%")
+        # 24h
         recent_p = [p for p in sample if p.get("ts",0) > now-86400]
         if recent_p:
             wins_p24 = sum(1 for p in recent_p if p["result"]=="WIN")
-            wr_p24 = wins_p24/len(recent_p)*100
-            lines.append(f"  📅 24h: {len(recent_p)} patterns | WR:{wr_p24:.0f}%")
+            lines.append(f"  📅 24h: {len(recent_p)} patterns | WR:{wins_p24/len(recent_p)*100:.0f}%")
     else:
         lines.append(f"\n📊 Pas encore assez de patterns (<5 pour cette version)")
         if resolved: lines.append(f"  📦 Historique: {len(resolved)} patterns")
