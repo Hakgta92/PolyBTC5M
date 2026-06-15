@@ -2966,21 +2966,21 @@ async def job_oracle_lag(context):
         return
 
     if st.last_trade_slot == int(now_ts // 300) * 300:
-        log_skip(f"Oracle: slot déjà tradé (T-{int(slot_remaining)}s)", None); return
+        log_skip(f"BTC: slot déjà tradé (T-{int(slot_remaining)}s)", None); return
     # ✅ v11.9j — Pauses supprimées: bot tourne h24 pour accumuler données
     # Seul le kill switch reste (KILL_SWITCH_LOSSES = 5 pertes consécutives)
     if trades_last_hour(st.trades) >= MAX_TRADES_PER_H:
-        log_skip(f"Oracle: max {MAX_TRADES_PER_H} trades/h atteint (T-{int(slot_remaining)}s)", None); return
+        log_skip(f"BTC: max {MAX_TRADES_PER_H} trades/h atteint (T-{int(slot_remaining)}s)", None); return
 
     # ── Signal oracle ──
     now = time.time()
     if not st.oracle_connected or st.oracle_price <= 0 or st.oracle_slot_open <= 0:
-        log_skip(f"Oracle: WS non dispo (T-{int(slot_remaining)}s)", None); return
+        log_skip(f"BTC: WS non dispo (T-{int(slot_remaining)}s)", None); return
     if now - st.oracle_ts > ORACLE_MIN_FRESH_S:
-        log_skip(f"Oracle: tick périmé {int(now-st.oracle_ts)}s (T-{int(slot_remaining)}s)", None); return
+        log_skip(f"BTC: tick périmé {int(now-st.oracle_ts)}s (T-{int(slot_remaining)}s)", None); return
     cur_slot = int(now // 300) * 300
     if st.oracle_slot_ts != cur_slot:
-        log_skip(f"Oracle: pas de slot open oracle (T-{int(slot_remaining)}s)", None); return
+        log_skip(f"BTC: pas de slot open oracle (T-{int(slot_remaining)}s)", None); return
 
     # ── Feature 1: delta cumulé depuis slot open (signal de direction) ──
     oracle_delta = (st.oracle_price - st.oracle_slot_open) / st.oracle_slot_open * 100
@@ -3074,7 +3074,7 @@ async def job_oracle_lag(context):
     # ✅ v11.10v Fix#B — gap négatif + votes faibles = signal contradictoire
     if direction == "UP" and spot_oracle_gap < 0 and dir_votes <= 1:
         log_skip(
-            f"Oracle: UP bloqué gap {spot_oracle_gap:+.3f}%<0 + votes={dir_votes}/4 (contradictoire)",
+            f"BTC: UP bloqué gap {spot_oracle_gap:+.3f}%<0 + votes={dir_votes}/5 (→ skip: gap négatif + peu de votes)",
             direction, features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,
                                   "votes":dir_votes,"filter":"gap_neg_votes"})
         return
@@ -3083,7 +3083,7 @@ async def job_oracle_lag(context):
     # Plus besoin du DELTA_CONTRA_STRICT — on bloque tout delta négatif pour UP
     if direction == "UP" and oracle_delta < -0.005:
         log_skip(
-            f"Oracle: UP bloqué delta {oracle_delta:+.3f}%<0 (Haiku 19/19 LOSS)",
+            f"BTC: UP bloqué delta {oracle_delta:+.3f}%<0 (→ skip: delta négatif LOSS garanti)",
             direction, features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,
                                   "votes":dir_votes,"filter":"delta_neg"})
         return
@@ -3127,7 +3127,7 @@ async def job_oracle_lag(context):
 
     # ── Vérifications edge ──
     if token_price > ORACLE_TOKEN_MAX:
-        log_skip(f"Oracle lag: token {token_price:.2f}$>{ORACLE_TOKEN_MAX}$ (déjà pricé)", direction, features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"filter":"token_max","token":token_price})
+        log_skip(f"BTC: token {token_price:.2f}$>{ORACLE_TOKEN_MAX}$ (→ skip: marché a déjà pricé la direction)", direction, features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"filter":"token_max","token":token_price})
         return
     # ✅ v11.10 — Liquidity extreme: token 0.10-0.51$ autorisé si signal très fort
     # Source: MEXC/Polymarket — bot a fait $16→$16k en achetant token à $0.01
@@ -3137,7 +3137,7 @@ async def job_oracle_lag(context):
         extreme_signal = (abs(oracle_delta) >= 0.05 and dir_votes >= 2 and
                          extreme_mispricing > 0.20 and token_price >= 0.10)
         if not extreme_signal:
-            log_skip(f"Oracle lag: token {token_price:.2f}$<{ORACLE_TOKEN_MIN}$ (trop incertain)", direction, features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"filter":"token_min","token":token_price})
+            log_skip(f"BTC: token {token_price:.2f}$<{ORACLE_TOKEN_MIN}$ (→ skip: trop incertain)", direction, features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"filter":"token_min","token":token_price})
             return
         log.info(f"⚡ EXTREME MISPRICING: token={token_price:.2f}$ expected={expected_token_price(abs(oracle_delta),slot_remaining):.2f}$ delta={oracle_delta:+.3f}%")
 
@@ -3929,145 +3929,6 @@ async def cmd_market(update,context):
     try: await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
     except: await update.message.reply_text("\n".join(lines).replace("*","").replace("`",""))
 
-async def cmd_score(update,context):
-    if not auth(update): return
-    await update.message.reply_text("⏳ Calcul score...")
-    c1=await fetch_klines("1m",60); c5=await fetch_klines("5m",50)
-    c15=await fetch_klines("15m",40); c1h=await fetch_klines("1h",30); c4h=await fetch_klines("4h",20)
-    if c5:
-        st.c5=deque(c5,maxlen=100); st.c15=deque(c15,maxlen=100)
-        st.c1h=deque(c1h,maxlen=100); st.c1=deque(c1,maxlen=100); st.c4h=deque(c4h,maxlen=50)
-        st.price=c5[-1]["close"]
-    st.fg=await fetch_fear_greed()
-    ob=await fetch_orderbook_imbalance(); liq=await fetch_liquidations()
-    eth_klines=await fetch_eth_klines("5m",30)
-    i1=compute_ind(list(st.c1)); i5=compute_ind(list(st.c5)); i15=compute_ind(list(st.c15))
-    i1h=compute_ind(list(st.c1h)); i4h=compute_ind(list(st.c4h)) if st.c4h else {}
-    sess=session_ctx(); adv=compute_advanced_signals(list(st.c5),list(st.c1),list(st.c4h) if st.c4h else None)
-    direction_guess="UP" if i5.get("ema_bull") else "DOWN"
-    eth_bonus,eth_desc=compute_eth_correlation(eth_klines,direction_guess) if eth_klines else (0,"ETH N/A")
-    # ✅ v10.22 — Delta du slot en TEMPS RÉEL (avant: valeur périmée du dernier tick)
-    wd_w,wd_pct=live_window_delta()
-    st.window_delta=wd_w; st.window_delta_pct=wd_pct
-    cs=compute_confluence_score(i1,i5,i15,i1h,i4h,st.fg,sess,adv,ob,liq,eth_bonus,eth_desc,st.btc24,wd_w,wd_pct)
-    mom=compute_momentum_score(i1,i5,i15)
-    st.last_conf_score=cs; st.last_mom_score=mom; st.last_ob=ob; st.last_liq=liq
-    st.last_eth_klines=eth_klines
-    _,_,min_mom=get_session_thresholds(sess["session"], cs.get("score",0))
-    tu=0.5; td=0.5; token_txt=""
-    if not st.paper_mode and poly.ready:
-        m=await poly.find_btc_5min_market()
-        if not m and st.current_market:
-            m=st.current_market
-        if m:
-            tu=await poly.get_token_price(m["token_up"])
-            td=await poly.get_token_price(m["token_down"])
-            token_txt=f"\n🟢 UP:`{tu:.3f}$` x{round(1/tu,2) if tu>0 else '?'} | 🔴 DOWN:`{td:.3f}$` x{round(1/td,2) if td>0 else '?'}"
-    mom_e="🔥" if mom>=7 else "⚡" if mom>=4 else "💤"
-    sigs="\n".join(f"  • {s}" for s in cs["signals"])
-    await update.message.reply_text(
-        f"🎯 *SCORE v{BOT_VERSION}*\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"₿`${st.price:,.2f}` | `{sess['session']}` | Δslot:`{wd_pct:+.3f}%`{token_txt}\n"
-        f"`{eth_desc}` | `{ob['desc'] if ob else 'N/A'}`\n"
-        f"💸 `{liq['desc'] if liq else 'N/A'}`\n\n"
-        f"🟢 UP:`{cs['score_up']:.1f}` 🔴 DOWN:`{cs['score_dn']:.1f}`\n"
-        f"Diff:`{cs['diff']:.1f}/{cs['min_diff']}` → {'✅ TRADEABLE' if cs['tradeable'] else '❌ PASS'}\n"
-        f"⚡ Mom:`{mom}/10`(seuil:`{min_mom}`) {mom_e}\n\nSignaux:\n{sigs or '  Aucun'}",
-        parse_mode="Markdown")
-
-async def cmd_signal(update,context):
-    if not auth(update): return
-    await update.message.reply_text("⏳ Analyse complète...")
-    c1=await fetch_klines("1m",60); c5=await fetch_klines("5m",50)
-    c15=await fetch_klines("15m",40); c1h=await fetch_klines("1h",30); c4h=await fetch_klines("4h",20)
-    if c5:
-        st.c1=deque(c1,maxlen=100); st.c5=deque(c5,maxlen=100); st.c15=deque(c15,maxlen=100)
-        st.c1h=deque(c1h,maxlen=100); st.c4h=deque(c4h,maxlen=50); st.price=c5[-1]["close"]
-    st.fg=await fetch_fear_greed(); st.btc24=await fetch_btc_24h()
-    ob=await fetch_orderbook_imbalance(); liq=await fetch_liquidations()
-    eth_klines=await fetch_eth_klines("5m",30)
-    st.last_eth_klines=eth_klines
-    i1=compute_ind(list(st.c1)); i5=compute_ind(list(st.c5)); i15=compute_ind(list(st.c15))
-    i1h=compute_ind(list(st.c1h)); i4h=compute_ind(list(st.c4h)) if st.c4h else {}
-    sess=session_ctx(); adv=compute_advanced_signals(list(st.c5),list(st.c1),list(st.c4h) if st.c4h else None)
-    direction_guess="UP" if i5.get("ema_bull") else "DOWN"
-    eth_bonus,eth_desc=compute_eth_correlation(eth_klines,direction_guess) if eth_klines else (0,"ETH N/A")
-    # ✅ v10.22 — Delta du slot en TEMPS RÉEL
-    wd_w,wd_pct=live_window_delta()
-    st.window_delta=wd_w; st.window_delta_pct=wd_pct
-    cs=compute_confluence_score(i1,i5,i15,i1h,i4h,st.fg,sess,adv,ob,liq,eth_bonus,eth_desc,st.btc24,wd_w,wd_pct)
-    mom=compute_momentum_score(i1,i5,i15)
-    st.last_conf_score=cs; st.last_mom_score=mom; st.last_ob=ob; st.last_liq=liq
-    tu=0.5; td=0.5
-    if not st.paper_mode and poly.ready:
-        m=await poly.find_btc_5min_market()
-        if not m and st.current_market:
-            m=st.current_market
-        if m:
-            tu=await poly.get_token_price(m["token_up"])
-            td=await poly.get_token_price(m["token_down"])
-            st.current_market=m
-    d=await claude_decide(i1,i5,i15,i1h,i4h,adv,st.trades[-15:],st.bankroll,st.consec,
-                          st.fg,st.btc24,sess,cs,mom,tu,td,ob,liq,eth_desc)
-    st.last_decision=d
-    dir_e="🟢" if d["dir"]=="UP" else "🔴" if d["dir"]=="DOWN" else "⚪"
-    risk_e={"LOW":"🟢","MEDIUM":"🟡","HIGH":"🔴"}.get(d.get("risk","MEDIUM"),"🟡")
-    payout=round(1/(tu if d["dir"]=="UP" else td),2) if d["dir"] else 0
-    kelly_info=f" Kelly:`{d.get('kelly_pct',0):.1f}%`(`{d.get('size',0):.2f}$`)" if d.get("trade") else ""
-    eth_e="✅" if eth_bonus>0 else "⚠️" if eth_bonus<0 else "➖"
-    await update.message.reply_text(
-        f"🧠 *ANALYSE v{BOT_VERSION}*\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{dir_e} *{d['dir'] or 'PASS'}* | {risk_e} | `{d['conf']*100:.0f}%`\n"
-        f"Score:`{cs['score']:.1f}` Mom:`{mom}/10` Payout:x`{payout}`{kelly_info}\n"
-        f"Δslot:`{wd_pct:+.3f}%` | Ξ{eth_e}`{eth_desc}` | `{ob['desc'] if ob else 'N/A'}`\n"
-        f"₿`${i5.get('price',0):,.2f}` | F&G:`{st.fg['value']}` | `{sess['session']}`\n\n"
-        f"💭 _{d['reasoning']}_",parse_mode="Markdown")
-
-    # ✅ v10.14d — Si Claude dit trade=True, placer l'ordre directement depuis /signal
-    if d.get("trade") and d.get("dir") and not st.bet and not st.paper_mode and st.current_market:
-        amount = d.get("size", 0)
-        if amount >= MIN_BET_USD and st.bankroll >= amount:
-            market_end = 0
-            try:
-                ed = st.current_market.get("end_date", "")
-                if ed:
-                    from datetime import timezone
-                    dt = datetime.fromisoformat(ed.replace("Z", "+00:00"))
-                    market_end = dt.timestamp()
-            except: pass
-            if market_end > 0 and (market_end - time.time()) < 60:
-                await update.message.reply_text("⏰ Slot expire trop tôt — ordre annulé")
-                return
-            token_used = st.current_market["token_up"] if d["dir"]=="UP" else st.current_market["token_down"]
-            # ✅ v10.22 — Refetch du prix juste avant l'ordre (Claude a pris 10-25s)
-            entry_tp = await poly.get_token_price(token_used)
-            if entry_tp <= 0: entry_tp = tu if d["dir"]=="UP" else td
-            order_id = await poly.place_market_order(token_used, amount, "BUY")
-            if order_id:
-                st.bet = {"dir":d["dir"],"amount":amount,"conf":d["conf"],"entry":st.price,
-                    "reasoning":d["reasoning"],"ts":int(time.time()),"score":cs["score"],"session":sess["session"]}
-                st.active_order_id = order_id; st.active_token_id = token_used
-                st.entry_token_price = entry_tp; st.shares_bought = round(amount/entry_tp,4) if entry_tp>0 else 0
-                st.token_price_peak = 1.0; st.trailing_active = False; st.bet_expiry = market_end
-                await update.message.reply_text(
-                    f"🎯 *Ordre placé depuis /signal !*\n"
-                    f"*{d['dir']}* `{amount:.2f}$` | Token:`{entry_tp:.3f}$`\n"
-                    f"ID:`{order_id}`",parse_mode="Markdown")
-            else:
-                await update.message.reply_text("⚠️ Ordre refusé depuis /signal")
-
-async def cmd_ai(update,context):
-    if not auth(update): return
-    d=st.last_decision
-    if not d: await update.message.reply_text("⏳ Lance /signal d'abord."); return
-    dir_e="🟢" if d.get("dir")=="UP" else "🔴" if d.get("dir")=="DOWN" else "⚪"
-    risk_e={"LOW":"🟢","MEDIUM":"🟡","HIGH":"🔴"}.get(d.get("risk","MEDIUM"),"🟡")
-    await update.message.reply_text(
-        f"🧠 *DERNIÈRE DÉCISION*\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{dir_e} *{d.get('dir') or 'PASS'}* | {risk_e} | `{d.get('conf',0)*100:.0f}%`\n"
-        f"Trade:`{'OUI ✅' if d.get('trade') else 'NON ❌'}` | Kelly:`{d.get('size',0):.2f}$`(`{d.get('kelly_pct',0):.1f}%`)\n\n"
-        f"💭 _{d.get('reasoning','—')}_",parse_mode="Markdown")
-
 async def cmd_trades(update,context):
     if not auth(update): return
     trades=st.trades[-8:][::-1]
@@ -4086,25 +3947,6 @@ async def cmd_trades(update,context):
         # Fallback sans Markdown si caractères spéciaux dans les raisons
         clean = [l.replace("*","").replace("`","").replace("_","") for l in lines]
         await update.message.reply_text("\n".join(clean))
-
-async def cmd_history(update,context):
-    """✅ v10.17 — 20 derniers trades avec détails complets"""
-    if not auth(update): return
-    trades=st.trades[-20:][::-1]
-    if not trades: await update.message.reply_text("📈 Aucun trade dans l'historique."); return
-    lines=["📋 *HISTORIQUE 20 TRADES*\n━━━━━━━━━━━━━━━━━━━━━━━━"]
-    total_pnl=0
-    for t in trades:
-        ts=datetime.fromtimestamp(t["ts"]).strftime("%d/%m %H:%M")
-        emoji="✅" if t["result"]=="WIN" else "❌"
-        mode="💰" if not t.get("paper",True) else "📄"
-        pnl=t["pnl"]; total_pnl+=pnl
-        score=t.get("score",0); sess=t.get("session","?")
-        lines.append(f"{emoji}{mode} `{t['dir']}` `{fmt(pnl)}$` score:`{score:.0f}` `{sess}` `{ts}`")
-    wins=sum(1 for t in trades if t["result"]=="WIN")
-    wr=wins/len(trades)*100
-    lines.append(f"\n📊 WR:`{wr:.0f}%` | PnL total:`{fmt(total_pnl)}$`")
-    await update.message.reply_text("\n".join(lines),parse_mode="Markdown")
 
 async def cmd_stats(update,context):
     if not auth(update): return
@@ -4135,33 +3977,6 @@ async def cmd_stats(update,context):
         f"Gain moy:`+{aw:.2f}$` | Perte moy:`-{al:.2f}$`\n\n"
         f"📊 WR par session (7j):{sess_txt or ' Pas assez de données'}{hour_txt}\n\n"
         f"💡 `/recap` 24h | `/passes` WR skips | `/dashboard` HTML",
-        parse_mode="Markdown")
-
-async def cmd_autotune(update,context):
-    """✅ v10.23 — Ajuste les seuils selon le WR théorique des skips résolus."""
-    if not auth(update): return
-    resolved=[p for p in st.pass_reasons if p.get("resolved")]
-    if len(resolved)<15:
-        await update.message.reply_text(f"⏳ Pas assez de skips résolus (`{len(resolved)}`/15) pour auto-tune.",parse_mode="Markdown")
-        return
-    w=sum(1 for p in resolved if p["resolved"]=="WIN")
-    twr=w/len(resolved)*100
-    sess=session_ctx()["session"]
-    cur=SESSION_THRESHOLDS.get(sess,(10,3.5,4))
-    msg=""
-    if twr>=60:
-        # Les filtres ratent trop de gagnants → desserrer la session courante de -1
-        new=(max(6,cur[0]-1),max(1.5,cur[1]-0.5),max(2,cur[2]-1))
-        SESSION_THRESHOLDS[sess]=new
-        msg=f"🔓 *Desserré* {sess}: score≥`{new[0]}` mom≥`{new[2]}`\n_(WR skips {twr:.0f}% — trop de gagnants ratés)_"
-    elif twr<=45:
-        new=(cur[0]+1,cur[1]+0.5,cur[2]+1)
-        SESSION_THRESHOLDS[sess]=new
-        msg=f"🔒 *Resserré* {sess}: score≥`{new[0]}` mom≥`{new[2]}`\n_(WR skips {twr:.0f}% — skips justifiés)_"
-    else:
-        msg=f"➖ {sess} inchangé (WR skips `{twr:.0f}%`, zone neutre 45-60%)"
-    await update.message.reply_text(
-        f"⚙️ *AUTO-TUNE*\nWR théorique skips: `{twr:.0f}%` ({w}/{len(resolved)})\n{msg}",
         parse_mode="Markdown")
 
 async def cmd_passes(update,context):
@@ -4196,7 +4011,7 @@ async def cmd_passes(update,context):
         lines.append(f"\n📊 *WR théorique des skips:* `{twr:.0f}%` ({w}/{len(resolved)})")
         if len(resolved)>=AUTOTUNE_MIN_SKIPS and twr>=58:
             lines.append(f"_⚠️ {len(resolved)} skips résolus, WR {twr:.0f}% >58% — filtres trop stricts._")
-            lines.append("_💡 `/turbo` pour tester des seuils -2 sur 15min, ou on baisse en dur._")
+            lines.append("_💡 WR élevé = filtres peut-être trop stricts. Tape `/learn` pour analyser._")
         elif twr>=58: lines.append("_⚠️ >58% mais peu de données — continue._")
         elif twr<=52: lines.append("_✅ ~50% — les filtres ne coûtent rien, le marché était plat_")
         else: lines.append("_➖ Zone grise — encore besoin de données_")
@@ -4242,54 +4057,6 @@ async def cmd_reset(update,context):
     for f in [DATA_FILE,BACKUP_FILE]:
         if os.path.exists(f): os.remove(f)
     await update.message.reply_text("🔄 *Reset complet.*",parse_mode="Markdown")
-
-async def cmd_cooldown(update,context):
-    if not auth(update): return
-    st.cooldown_until=0; st.consec=0; st.daily_pause_until=0
-    await update.message.reply_text("✅ Cooldown + pause reset.",parse_mode="Markdown")
-
-async def cmd_fair(update,context):
-    """✅ v10.21 — Fair value du slot actuel (modèle Brownien) + frais v10.22"""
-    if not auth(update): return
-    sigma = realized_vol()
-    t_rem = int(300 - (time.time() % 300))
-    if not st.ws_connected or sigma <= 0:
-        await update.message.reply_text("⏳ WebSocket Binance pas encore prêt — relance dans 1min.")
-        return
-    cur = st.ws_price
-    delta_live = (cur - st.slot_open_price) / st.slot_open_price * 100 if st.slot_open_price > 0 else 0.0
-    p_up = fair_prob_up(delta_live, t_rem, sigma)
-    snipe_zone = SNIPE_LAST_MIN <= t_rem < ENTRY_LAST_SECONDS
-    await update.message.reply_text(
-        f"⚖️ *FAIR VALUE* (Brownien)\n━━━━━━━━━━━━━━\n"
-        f"₿`${cur:,.2f}` | Slot open:`${st.slot_open_price:,.2f}`\n"
-        f"Δ:`{delta_live:+.3f}%` | ⏰`{t_rem}s` {'🎯SNIPE zone' if snipe_zone else ''} | σ:`{sigma:.4f}`\n\n"
-        f"🟢 P(UP):`{p_up*100:.0f}%` | 🔴 P(DOWN):`{(1-p_up)*100:.0f}%`\n\n"
-        f"💡 Normal: EV≥{FAIR_EDGE_MIN*100:.0f}pts | SNIPE: P≥{SNIPE_MIN_PROB*100:.0f}% + EV≥{SNIPE_EDGE_MIN*100:.0f}pts\n"
-        f"_(frais taker déduits automatiquement)_",
-        parse_mode="Markdown")
-
-async def cmd_sellcheck(update,context):
-    """✅ v10.20d — Affiche le PnL actuel sans vendre"""
-    if not auth(update): return
-    if not st.bet:
-        await update.message.reply_text("❌ Aucune position active."); return
-    if not st.active_token_id:
-        await update.message.reply_text("❌ Pas de token actif."); return
-    current_price = await poly.get_token_price(st.active_token_id)
-    if current_price <= 0 or st.entry_token_price <= 0:
-        await update.message.reply_text("❌ Prix non disponible."); return
-    gain_mult = current_price / st.entry_token_price
-    gross = round((current_price - st.entry_token_price) * st.shares_bought, 2)
-    emoji = "✅" if gross >= 0 else "❌"
-    remaining = int((st.bet_expiry - time.time())) if st.bet_expiry > 0 else 0
-    await update.message.reply_text(
-        f"💰 *Position actuelle*\n━━━━━━━━━━━━━━\n"
-        f"{emoji} `{st.bet['dir']}` | x`{gain_mult:.2f}` | PnL:`{fmt(gross)}$`\n"
-        f"Token: `{st.entry_token_price:.3f}$` → `{current_price:.3f}$`\n"
-        f"⏰ Expire dans: `{remaining}s`\n\n"
-        f"Tape `/sell` pour vendre maintenant.",
-        parse_mode="Markdown")
 
 async def cmd_sell(update,context):
     """✅ v10.19d — Vente manuelle immédiate de la position active"""
@@ -4341,22 +4108,6 @@ async def cmd_sell(update,context):
         st.backup()
     else:
         await update.message.reply_text("⚠️ Vente échouée — réessaie ou attends la résolution auto.")
-
-async def cmd_turbo(update,context):
-    """✅ v10.17 — Mode turbo: seuils réduits pendant 15min"""
-    if not auth(update): return
-    if time.time() < st.turbo_until:
-        remaining = int((st.turbo_until - time.time()) / 60)
-        await update.message.reply_text(f"⚡ Turbo déjà actif — encore `{remaining}min`",parse_mode="Markdown")
-        return
-    st.turbo_until = time.time() + 15*60
-    sess = session_ctx()
-    min_score,min_diff,min_mom = get_session_thresholds(sess["session"])
-    await update.message.reply_text(
-        f"⚡ *MODE TURBO activé 15min*\n"
-        f"Seuils: score≥`{max(7,min_score-2)}` mom≥`{max(2,min_mom-1)}`\n"
-        f"Utilise `/score` pour voir les signaux en temps réel",
-        parse_mode="Markdown")
 
 async def run_backtest(days=2):
     """
@@ -4485,23 +4236,6 @@ async def cmd_oracle(update,context):
         await update.message.reply_text(f"❌ Erreur oracle: {str(e)[:100]}")
 
 
-async def cmd_calib(update,context):
-    """✅ v10.23 — État de la calibration sigma"""
-    if not auth(update): return
-    factor, desc = calibrate_sigma()
-    await update.message.reply_text(
-        f"🎚 *CALIBRATION σ*\n━━━━━━━━━━━━━━\n"
-        f"Facteur actuel:`×{st.calib_factor:.2f}` | VOL_SAFETY effectif:`{VOL_SAFETY*st.calib_factor:.2f}`\n"
-        f"{desc}\n\n"
-        f"_>1 = bot prudent (était surconfiant) | <1 = bot agressif_",
-        parse_mode="Markdown")
-
-async def cmd_revive(update,context):
-    """✅ v10.23 — Réarme le kill-switch"""
-    if not auth(update): return
-    st.killed=False; st.consec=0; st.cooldown_until=0
-    await update.message.reply_text("✅ Kill-switch réarmé. `/run` pour relancer.", parse_mode="Markdown")
-
 async def cb(update,context):
     q=update.callback_query; await q.answer()
     h={"status":cmd_status,"ai":cmd_ai,"trades":cmd_trades,"stats":cmd_stats,
@@ -4557,12 +4291,15 @@ def main():
     app=Application.builder().token(TOKEN).build()
     for name,handler in [
         ("start",cmd_start),("run",cmd_run),("stop",cmd_stop),("status",cmd_status),
-        ("ai",cmd_ai),("signal",cmd_signal),("score",cmd_score),("trades",cmd_trades),
+("trades",cmd_trades),
         ("stats",cmd_stats),("fear",cmd_fear),("passes",cmd_passes),("market",cmd_market),
-        ("balance",cmd_balance),("paper",cmd_paper),("cooldown",cmd_cooldown),("reset",cmd_reset),
+        ("balance",cmd_balance),("paper",cmd_paper),
+("reset",cmd_reset),
         ("setbalance",cmd_setbalance),("backup",cmd_backup),("recap",cmd_recap),("dashboard",cmd_dashboard),
-        ("history",cmd_history),("turbo",cmd_turbo),("sell",cmd_sell),("sellcheck",cmd_sellcheck),("fair",cmd_fair),
-        ("backtest",cmd_backtest),("oracle",cmd_oracle),("calib",cmd_calib),("learn",cmd_learn),("revive",cmd_revive),("autotune",cmd_autotune)]:
+("sell",cmd_sell),
+        ("backtest",cmd_backtest),("oracle",cmd_oracle),
+("learn",cmd_learn),
+]:
         app.add_handler(CommandHandler(name,handler))
     app.add_handler(CallbackQueryHandler(cb))
     log.info(f"🧠 PolyBot v{BOT_VERSION} démarré")
