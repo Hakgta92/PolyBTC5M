@@ -1609,14 +1609,16 @@ class State:
         self.token_price_peak=0.0; self.trailing_active=False
         # ✅ v11.9m — Orderbook imbalance (Strategy 2)
         self.ob_imbalance=0.0; self.ob_ts=0.0; self.ob_asset_id=""; self.clob_ws_task=None
-        # ✅ v11.10y — Multi-asset: ETH + SOL
+        # ✅ v12.2 — Multi-asset: ETH + SOL
         # ETH
         self.eth_price=0.0; self.eth_ts=0; self.eth_ws_task=None
+        self.eth_ws_prices=deque()  # historique prix ETH pour ret_over
         self.eth_oracle_price=0.0; self.eth_oracle_ts=0.0
         self.eth_oracle_slot_open=0.0; self.eth_oracle_slot_ts=0
         self.eth_last_trade_slot=0
         # SOL
         self.sol_price=0.0; self.sol_ts=0; self.sol_ws_task=None
+        self.sol_ws_prices=deque()  # historique prix SOL pour ret_over
         self.sol_oracle_price=0.0; self.sol_oracle_ts=0.0
         self.sol_oracle_slot_open=0.0; self.sol_oracle_slot_ts=0
         self.sol_last_trade_slot=0
@@ -2180,6 +2182,10 @@ async def ws_eth_loop():
                             if "p" in d:
                                 st.eth_price = float(d["p"])
                                 st.eth_ts = time.time()
+                                now_e = time.time()
+                                st.eth_ws_prices.append((now_e, float(d["p"])))
+                                while st.eth_ws_prices and now_e - st.eth_ws_prices[0][0] > 120:
+                                    st.eth_ws_prices.popleft()
                         elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR): break
         except Exception as e: log.warning(f"WS ETH: {e}")
         await asyncio.sleep(5)
@@ -2198,6 +2204,10 @@ async def ws_sol_loop():
                             if "p" in d:
                                 st.sol_price = float(d["p"])
                                 st.sol_ts = time.time()
+                                now_s = time.time()
+                                st.sol_ws_prices.append((now_s, float(d["p"])))
+                                while st.sol_ws_prices and now_s - st.sol_ws_prices[0][0] > 120:
+                                    st.sol_ws_prices.popleft()
                         elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR): break
         except Exception as e: log.warning(f"WS SOL: {e}")
         await asyncio.sleep(5)
@@ -3305,103 +3315,144 @@ async def push_state_to_github():
 
 
 async def job_oracle_lag_asset(context, asset: str):
-    """✅ v11.10y — Oracle lag pour ETH et SOL (même logique que BTC)"""
+    """✅ v12.2 — Oracle lag ETH/SOL — même logique complète que BTC"""
     if not st.running or st.killed: return
     now = time.time()
     cur_slot = int(now // 300) * 300
     slot_remaining = cur_slot + 300 - now
-    # ✅ v12 — Fenêtre adaptative par asset
     win_start = 20 if asset == "SOL" else 25
     if slot_remaining > win_start or slot_remaining < 5: return
 
-    # Prix et oracle selon l'asset
     if asset == "ETH":
         spot = st.eth_price; spot_ts = st.eth_ts
         oracle = st.eth_oracle_price; oracle_ts = st.eth_oracle_ts
-        slot_open = st.eth_oracle_slot_open; slot_ts = st.eth_oracle_slot_ts
-        last_trade_slot = st.eth_last_trade_slot
-        slug_prefix = "eth-updown-5m"
-        symbol = "ETH"
+        slot_open = st.eth_oracle_slot_open; last_trade_slot = st.eth_last_trade_slot
+        slug_prefix = "eth-updown-5m"; symbol = "ETH"; emoji = "Ξ"
+        ws_prices = st.eth_ws_prices
     elif asset == "SOL":
         spot = st.sol_price; spot_ts = st.sol_ts
         oracle = st.sol_oracle_price; oracle_ts = st.sol_oracle_ts
-        slot_open = st.sol_oracle_slot_open; slot_ts = st.sol_oracle_slot_ts
-        last_trade_slot = st.sol_last_trade_slot
-        slug_prefix = "sol-updown-5m"
-        symbol = "SOL"
+        slot_open = st.sol_oracle_slot_open; last_trade_slot = st.sol_last_trade_slot
+        slug_prefix = "sol-updown-5m"; symbol = "SOL"; emoji = "◎"
+        ws_prices = st.sol_ws_prices
     else: return
 
-    if spot <= 0 or oracle <= 0 or slot_open <= 0:
-        return  # oracle pas encore connecté
+    if spot <= 0 or oracle <= 0 or slot_open <= 0: return
     if now - spot_ts > 5 or now - oracle_ts > 15: return
-    # ✅ v12 — Log dans pass_reasons pour /passes ETH/SOL
     if last_trade_slot == cur_slot: return
 
-    # Calcul signal (même logique BTC)
+    # ── Ret 3s/15s ──
+    pts = list(ws_prices)
+    def ret_over_asset(secs):
+        cutoff = now - secs
+        old = [p for t,p in pts if t <= cutoff]
+        return (spot - old[-1]) / old[-1] * 100 if old and old[-1]>0 else 0.0
+    ret_3s = ret_over_asset(3); ret_15s = ret_over_asset(15)
+
+    # ── Gap + Delta ──
     oracle_delta = (oracle - slot_open) / slot_open * 100 if slot_open > 0 else 0
     spot_oracle_gap = (spot - oracle) / oracle * 100 if oracle > 0 else 0
-
-    # Direction
-    # ✅ v12 — Gap adaptatif par asset
-    gap_min_asset = 0.030 if asset in ("ETH","SOL") else 0.025
-    gap_dir = None
-    if abs(spot_oracle_gap) >= gap_min_asset:
-        gap_dir = "UP" if spot_oracle_gap > 0 else "DOWN"
-    delta_dir = None
-    if abs(oracle_delta) >= ORACLE_ENTRY_DELTA:
-        delta_dir = "UP" if oracle_delta > 0 else "DOWN"
-
+    gap_dir = ("UP" if spot_oracle_gap > 0 else "DOWN") if abs(spot_oracle_gap) >= 0.030 else None
+    delta_dir = ("UP" if oracle_delta > 0 else "DOWN") if abs(oracle_delta) >= ORACLE_ENTRY_DELTA else None
+    primary_signal = "gap" if gap_dir else "delta"
     direction = gap_dir or delta_dir
-    if not direction:
-        st.pass_reasons.append({"ts":time.time(),"dir":None,"reason":f"{symbol}: Δ{oracle_delta:+.3f}% gap{spot_oracle_gap:+.3f}% (signals faibles)","result":None})
+
+    # ── Filtre ret3s brutal ──
+    if ret_3s < -0.055:
+        log_skip(f"{symbol}: ret3s {ret_3s:+.3f}% (→ skip: chute brutale)", direction,
+                 features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":0,"filter":"ret3s_brutal"})
         return
 
-    # Filtre delta négatif
+    if not direction:
+        log_skip(f"{symbol}: Δ{oracle_delta:+.3f}% gap{spot_oracle_gap:+.3f}% (→ skip: signaux trop faibles)", None,
+                 features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":0,"filter":"weak_signal"})
+        return
+
+    if direction == "UP" and spot_oracle_gap < 0:
+        log_skip(f"{symbol}: UP bloqué gap négatif (→ skip: gap négatif)", direction,
+                 features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":0,"filter":"gap_neg"})
+        return
     if direction == "UP" and oracle_delta < -0.005:
-        st.pass_reasons.append({"ts":time.time(),"dir":direction,"reason":f"{symbol}: delta {oracle_delta:+.3f}%<0 (LOSS)","result":None})
+        log_skip(f"{symbol}: delta {oracle_delta:+.3f}%<0 (→ skip: delta négatif)", direction,
+                 features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":0,"filter":"delta_neg"})
         return
     if direction == "DOWN" and oracle_delta > 0.005:
-        st.pass_reasons.append({"ts":time.time(),"dir":direction,"reason":f"{symbol}: delta {oracle_delta:+.3f}%>0 (contre DOWN)","result":None})
+        log_skip(f"{symbol}: delta {oracle_delta:+.3f}%>0 (→ skip: contre DOWN)", direction,
+                 features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":0,"filter":"delta_contra"})
         return
 
-    # Filtre ret3s brutal (si disponible)
-    # Pas de ret3s multi-asset pour l'instant, skip ce filtre
+    # ── TA Score ──
+    price_hist = [{"price":p,"ts":t} for t,p in pts]
+    ta_score, ta_dir, _ = compute_ta_score(price_hist, asset)
+    ta_vote = 1 if ta_dir=="UP" else (-1 if ta_dir=="DOWN" else 0)
 
-    # Récupérer le marché
+    # ── Votes /5 ──
+    dir_votes = sum([
+        1 if direction=="UP" and oracle_delta>0 else (-1 if direction=="DOWN" and oracle_delta<0 else 0),
+        1 if direction=="UP" and spot_oracle_gap>0 else (-1 if direction=="DOWN" and spot_oracle_gap<0 else 0),
+        1 if direction=="UP" and ret_15s>0 else (-1 if direction=="DOWN" and ret_15s<0 else 0),
+        0,  # OB (pas de CLOB WS ETH/SOL)
+        ta_vote,
+    ])
+
+    # ── Marché ──
     market = await poly.get_market_by_slug(f"{slug_prefix}-{cur_slot}")
-    if not market: return
+    if not market:
+        log_skip(f"{symbol}: marché non trouvé", direction,
+                 features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"filter":"no_market"})
+        return
     token_used = market["token_up"] if direction == "UP" else market["token_down"]
     token_price = await poly.get_token_price(token_used)
     if not token_price or token_price <= 0: return
-    if token_price > ORACLE_TOKEN_MAX or token_price < ORACLE_TOKEN_MIN: return
 
+    if token_price > ORACLE_TOKEN_MAX:
+        log_skip(f"{symbol}: token {token_price:.2f}$>{ORACLE_TOKEN_MAX}$ (→ skip: déjà pricé)", direction,
+                 features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"filter":"tokenmax","token":token_price})
+        return
+    if token_price < ORACLE_TOKEN_MIN:
+        log_skip(f"{symbol}: token {token_price:.2f}$<{ORACLE_TOKEN_MIN}$ (→ skip: trop incertain)", direction,
+                 features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"filter":"tokenmin","token":token_price})
+        return
+
+    # ── EV ──
     fee = taker_fee_per_share(token_price)
-    p_oracle = min(0.93, 0.80 + abs(oracle_delta) * 2.0)
+    p_oracle = min(0.93, 0.85 + abs(spot_oracle_gap)*3.0) if primary_signal=="gap" else min(0.90, 0.80 + abs(oracle_delta)*2.0)
+    if dir_votes >= 3: p_oracle = min(0.95, p_oracle + 0.03)
     ev = p_oracle - token_price - fee
-    if ev < ORACLE_EDGE_MIN: return
+    if ev < ORACLE_EDGE_MIN:
+        log_skip(f"{symbol}: EV {ev*100:+.1f}%<{ORACLE_EDGE_MIN*100:.0f}% (→ skip: edge insuffisant)", direction,
+                 features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"filter":"ev","token":token_price,"ev":ev})
+        return
 
-    # Placer le trade
-    amount = kelly_bet(st.bankroll, p_oracle, token_price)
+    # ── Kelly ──
+    payout = round(1/token_price, 2)
+    amount = kelly_bet(st.bankroll, p_oracle, payout, token_price, ev_bonus=True)
     if amount < MIN_BET_USD: return
 
-    log.info(f"⚡ ORACLE LAG {symbol} {direction} | delta={oracle_delta:+.3f}% gap={spot_oracle_gap:+.3f}% tok={token_price:.3f}$ EV={ev*100:.1f}%")
-    result = await poly.place_order(token_used, amount, direction)
-    if result:
-        if asset == "ETH": st.eth_last_trade_slot = cur_slot
-        elif asset == "SOL": st.sol_last_trade_slot = cur_slot
-        # ✅ v12 — Logguer le trade ETH/SOL dans l'historique avec tag asset
-        st.trades.append({"ts":time.time(),"dir":direction,"amount":amount,
-                          "token":token_price,"asset":asset,"result":None,"pnl":0})
-        st.skipped = max(0, st.skipped)
-        emoji = "Ξ" if asset == "ETH" else "◎"
-        mode = "💰 RÉEL" if not st.paper_mode else "📄 paper"
-        await send(context.bot,
-            f"⚡ *ORACLE LAG {emoji} {symbol}* [{mode}]\n━━━━━━━━━━━━━━━\n"
-            f"*{direction}* | `{amount:.2f}$` | P:`{p_oracle*100:.0f}%` | ⏰T-`{int(slot_remaining)}s`\n"
-            f"Δslot:`{oracle_delta:+.3f}%` | Gap:`{spot_oracle_gap:+.3f}%`\n"
-            f"Token:`{token_price:.3f}$` | EV:`{ev*100:+.1f}%`\n"
-            f"Oracle:`${oracle:,.2f}` → Spot:`${spot:,.2f}`\n\n"
-            f"💭 _⚡ORACLE LAG {symbol} {direction} | gap={spot_oracle_gap:+.3f}% delta={oracle_delta:+.3f}% | tok={token_price:.3f}$ EV={ev*100:+.1f}% T-{int(slot_remaining)}s_")
+    log.info(f"⚡ {symbol} {direction} | delta={oracle_delta:+.3f}% gap={spot_oracle_gap:+.3f}% tok={token_price:.3f}$ EV={ev*100:.1f}% votes={dir_votes}/5")
+
+    tpu = market["token_up"]; tpd = market["token_down"]
+    market_end = market.get("end_date","")
+    sess = session_ctx(); conf_score = {"score":0,"signals":[]}
+    reasoning = f"⚡ORACLE LAG {symbol} {direction} | gap={spot_oracle_gap:+.3f}% delta={oracle_delta:+.3f}% TA={ta_score} votes={dir_votes}/5 | tok={token_price:.3f}$ EV={ev*100:+.1f}% T-{int(slot_remaining)}s"
+
+    ok = await place_bet(context, direction, amount, round(p_oracle,2), reasoning, conf_score, sess, tpu, tpd, market_end, source="snipe")
+    if not ok: return
+
+    if asset == "ETH": st.eth_last_trade_slot = cur_slot
+    elif asset == "SOL": st.sol_last_trade_slot = cur_slot
+
+    mode = "💰 RÉEL" if not st.paper_mode else "📄 paper"
+    entry_tp = st.entry_token_price if not st.paper_mode else token_price
+    await send(context.bot,
+        f"⚡ *ORACLE LAG {emoji} {symbol}* [{mode}]\n━━━━━━━━━━━━━━━\n"
+        f"*{direction}* | `{amount:.2f}$` | P:`{p_oracle*100:.0f}%` | ⏰T-`{int(slot_remaining)}s`\n"
+        f"Δslot:`{oracle_delta:+.3f}%` | Gap:`{spot_oracle_gap:+.3f}%` TA:`{ta_score}` | Votes:`{dir_votes}/5`\n"
+        f"Ret 3s:`{ret_3s:+.3f}%` 15s:`{ret_15s:+.3f}%`\n"
+        f"Token:`{entry_tp:.3f}$` | EV:`{ev*100:+.1f}%` | Frais:`{fee*100:.2f}¢`\n"
+        f"Oracle:`${oracle:,.2f}` → Spot:`${spot:,.2f}`\n\n"
+        f"💭 _{reasoning}_")
+
 
 async def job_oracle_lag_eth(context):
     await job_oracle_lag_asset(context, "ETH")
