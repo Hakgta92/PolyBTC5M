@@ -3709,7 +3709,8 @@ async def cmd_run(update,context):
     await update.message.reply_text(
         f"▶️ *Bot v{BOT_VERSION} démarré !*\nMode:*{'📄 PAPER' if st.paper_mode else '💰 RÉEL'}*\n"
         f"Session:`{sess['session']}` | Seuils: score≥`{min_score}` mom≥`{min_mom}`\n"
-        f"⚡ ORACLE LAG actif: T-35s→T-6s | gap≥1bps / delta≥{int(ORACLE_ENTRY_DELTA*10000)}bps\n"
+        f"⚡ BTC T-25→T-5s | ETH T-25→T-5s | SOL T-20→T-5s\n"
+        f"  gap≥2.5/3bps | delta≥{int(ORACLE_ENTRY_DELTA*10000)}bps | Token≤{ORACLE_TOKEN_MAX}$ | EV≥{int(ORACLE_EDGE_MIN*100)}%\n"
         f"BR:`{st.bankroll:.2f}$` | ROI:`{roi()}`\n"
         f"📊 `{ob_txt}` | 💸 `{liq_txt}`\n"
         f"Récap auto: 22h Paris 🕙",
@@ -3800,12 +3801,23 @@ async def cmd_setbalance(update,context):
         await update.message.reply_text("❌ Ex: `/setbalance 55.11`",parse_mode="Markdown")
 
 async def cmd_backup(update,context):
+    """✅ v12.1 — Backup local + GitHub State"""
     if not auth(update): return
-    ok=st.backup()
+    await update.message.reply_text("💾 Backup en cours...")
+    ok = st.backup()
+    gh_ok = False
     if ok:
-        await update.message.reply_text(f"💾 *Backup*\nBR:`{st.bankroll:.2f}$` | ROI:`{roi()}` | Trades:`{len(st.trades)}`",parse_mode="Markdown")
-    else:
-        await update.message.reply_text("❌ Backup échoué.")
+        try:
+            await push_state_to_github()
+            gh_ok = True
+        except Exception as e:
+            log.warning(f"cmd_backup github: {e}")
+    status = "✅ Local + GitHub State" if gh_ok else ("✅ Local seulement" if ok else "❌ Échoué")
+    await update.message.reply_text(
+        f"💾 *BACKUP v{BOT_VERSION}*\n{status}\n"
+        f"BR:`{st.bankroll:.2f}$` | ROI:`{roi()}`\n"
+        f"Trades:`{len(st.trades)}` | Patterns:`{len(st.oracle_patterns)}` | Passes:`{len(st.pass_reasons)}`",
+        parse_mode="Markdown")
 
 async def cmd_status(update,context):
     if not auth(update): return
@@ -3886,22 +3898,36 @@ async def cmd_balance(update,context):
         parse_mode="Markdown")
 
 async def cmd_market(update,context):
+    """✅ v12.1 — Marchés actifs BTC + ETH + SOL"""
     if not auth(update): return
-    await update.message.reply_text("⏳ Recherche marché...")
-    market=await poly.find_btc_5min_market()
-    if not market: await update.message.reply_text("❌ Aucun marché BTC 5min trouvé."); return
-    tu=await poly.get_token_price(market["token_up"]); td=await poly.get_token_price(market["token_down"])
-    pu=round(1/tu,2) if tu>0 else 0; pd=round(1/td,2) if td>0 else 0
-    ku=kelly_bet(st.bankroll,0.6,pu); kd=kelly_bet(st.bankroll,0.6,pd)
-    fee_u=taker_fee_per_share(tu)*100; fee_d=taker_fee_per_share(td)*100
-    liq=st.last_liq; ob=st.last_ob
-    await update.message.reply_text(
-        f"🎯 *MARCHÉ ACTIF*\n━━━━━━━━━━━━━━━━━━━━━━━━\n_{market['question']}_\n\n"
-        f"🟢 UP:`{tu:.3f}$`→x`{pu}` Kelly≈`{ku:.2f}$` frais:`{fee_u:.2f}¢`\n"
-        f"🔴 DOWN:`{td:.3f}$`→x`{pd}` Kelly≈`{kd:.2f}$` frais:`{fee_d:.2f}¢`\n"
-        f"Fin:`{market.get('end_date','?')}`\n\n"
-        f"📊 `{ob['desc'] if ob else 'N/A'}` | 💸 `{liq['desc'] if liq else 'N/A'}`",
-        parse_mode="Markdown")
+    await update.message.reply_text("⏳ Recherche marchés BTC/ETH/SOL...")
+    now_ts = int(time.time())
+    cur_slot = int(now_ts // 300) * 300
+    slot_rem = cur_slot + 300 - now_ts
+    lines = [f"🎯 *MARCHÉS ACTIFS v{BOT_VERSION}*\n━━━━━━━━━━━━━━━━━━━━━━━━\n⏰ T-`{int(slot_rem)}s` avant résolution\n"]
+    for label, prefix, oracle_px, slot_open in [
+        ("₿ BTC", "btc-updown-5m", st.oracle_price, st.oracle_slot_open),
+        ("Ξ ETH", "eth-updown-5m", st.eth_oracle_price, st.eth_oracle_slot_open),
+        ("◎ SOL", "sol-updown-5m", st.sol_oracle_price, st.sol_oracle_slot_open),
+    ]:
+        try:
+            market = await poly.get_market_by_slug(f"{prefix}-{cur_slot}")
+            if not market: lines.append(f"{label}: ❌ marché non trouvé"); continue
+            tu = await poly.get_token_price(market["token_up"])
+            td = await poly.get_token_price(market["token_down"])
+            delta = (oracle_px-slot_open)/slot_open*100 if slot_open>0 else 0
+            ev_u = (0.85-tu-taker_fee_per_share(tu))*100 if tu>0 else 0
+            ev_d = (0.85-td-taker_fee_per_share(td))*100 if td>0 else 0
+            ok_u = "✅" if tu<=ORACLE_TOKEN_MAX and ev_u>=ORACLE_EDGE_MIN*100 else "❌"
+            ok_d = "✅" if td<=ORACLE_TOKEN_MAX and ev_d>=ORACLE_EDGE_MIN*100 else "❌"
+            lines.append(
+                f"*{label}* Oracle:`${oracle_px:,.2f}` Δ:`{delta:+.3f}%`\n"
+                f"  🟢 UP:`{tu:.3f}$` EV:`{ev_u:.0f}%` {ok_u} | 🔴 DOWN:`{td:.3f}$` EV:`{ev_d:.0f}%` {ok_d}")
+        except Exception as e:
+            lines.append(f"{label}: ⚠️ erreur")
+    lines.append(f"\n🎯 Token≤`{ORACLE_TOKEN_MAX}$` | EV≥`{int(ORACLE_EDGE_MIN*100)}%`")
+    try: await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    except: await update.message.reply_text("\n".join(lines).replace("*","").replace("`",""))
 
 async def cmd_score(update,context):
     if not auth(update): return
@@ -4143,12 +4169,26 @@ async def cmd_passes(update,context):
     if not auth(update): return
     passes=st.pass_reasons[-12:][::-1]
     if not passes: await update.message.reply_text("✅ Aucun PASS."); return
-    lines=["🚫 *DERNIERS PASS*"]
+    lines=["🚫 *DERNIERS PASS — BTC/ETH/SOL*"]
     for p in passes:
         res=p.get("resolved")
         emoji="✅" if res=="WIN" else "❌" if res=="LOSS" else "⏳" if p.get("dir") else "—"
         d=f"`{p.get('dir')}` " if p.get("dir") else ""
-        lines.append(f"`{datetime.fromtimestamp(p['ts']).strftime('%H:%M')}` {emoji} {d}{p['reason']}")
+        reason = p.get("reason","?")
+        # Rendre la raison lisible
+        reason = (reason
+            .replace("Oracle lag: token","token")
+            .replace("Oracle lag: ","")
+            .replace("Oracle: ","")
+            .replace("(trop incertain)","→ skip: trop cher à acheter")
+            .replace("(déjà pricé)","→ skip: marché a déjà pricé la direction")
+            .replace("(chute brutale BTC)","→ skip: BTC chute fort en 3s")
+            .replace("(chute brutale)","→ skip: chute forte en 3s")
+            .replace("(Haiku 19/19 LOSS)","→ skip: Haiku confirme LOSS garanti")
+            .replace("(gap pas fort ET delta contre trop fort)","→ skip: gap faible + delta contre")
+            .replace("(signal contradictoire)","→ skip: gap négatif + peu de votes")
+            .replace("signals faibles","→ skip: delta et gap trop faibles"))
+        lines.append(f"`{datetime.fromtimestamp(p['ts']).strftime('%H:%M')}` {emoji} {d}{reason}")
     resolved=[p for p in st.pass_reasons if p.get("resolved")]
     if resolved:
         w=sum(1 for p in resolved if p["resolved"]=="WIN")
