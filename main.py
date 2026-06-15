@@ -1737,10 +1737,16 @@ def log_skip(reason, direction=None, features=None):
              "resolved": None}
     st.pass_reasons.append(entry)
     if features and direction:
+        # ✅ v12.2 — Détecter l'asset depuis le reason ou features
+        asset_tag = "BTC"
+        if reason.startswith("ETH:") or reason.startswith("[ETH]") or "ETH:" in reason[:5]:
+            asset_tag = "ETH"
+        elif reason.startswith("SOL:") or reason.startswith("[SOL]") or "SOL:" in reason[:5]:
+            asset_tag = "SOL"
         st.oracle_patterns.append({**features, "direction": direction,
                                     "result": None, "ts": now, "slot_end": entry["slot_end"],
-                                    "open_px": entry["open_px"], "v": BOT_VERSION})
-        # ✅ v11.10f — pas de cap: historique illimité pour Haiku long terme
+                                    "open_px": entry["open_px"], "v": BOT_VERSION,
+                                    "asset": asset_tag})
 
 def live_window_delta():
     """✅ v10.22 — Delta du slot en TEMPS RÉEL (WS prioritaire, fallback dernier tick)"""
@@ -3575,23 +3581,35 @@ async def job_haiku_analysis(context):
     version_note = f"v{BOT_VERSION}: {len(versioned)} patterns" if versioned else "mix versions"
     summary = []
     for p in sample:
-        summary.append(f"gap={p.get('gap',0):+.3f}% delta={p.get('delta',0):+.3f}% "
-                       f"ret3s={p.get('ret3s',0):+.3f}% votes={p.get('votes',0)}/3 "
+        asset = p.get("asset", "BTC")  # ✅ v12.2 — tag asset dans les patterns
+        summary.append(f"[{asset}] gap={p.get('gap',0):+.3f}% delta={p.get('delta',0):+.3f}% "
+                       f"ret3s={p.get('ret3s',0):+.3f}% votes={p.get('votes',0)}/5 "
                        f"filter={p.get('filter','?')} → {p['result']}")
 
-    prompt = f"""Tu analyses les skips d'un bot v{BOT_VERSION} Polymarket BTC 5min ({version_note}).
-Ces trades ont été BLOQUÉS par les filtres mais voici le résultat théorique.
-Trouve des patterns qui pourraient améliorer les seuils de filtrage.
-Réponds en 3 bullet points MAX, très concis, en français.
+    # Stats par asset
+    btc_p = [p for p in sample if p.get("asset","BTC")=="BTC"]
+    eth_p = [p for p in sample if p.get("asset")=="ETH"]
+    sol_p = [p for p in sample if p.get("asset")=="SOL"]
+    asset_note = f"BTC:{len(btc_p)} ETH:{len(eth_p)} SOL:{len(sol_p)} patterns"
 
-Données ({len(sample)} skips résolus):
+    prompt = f"""Tu analyses les skips d'un bot v{BOT_VERSION} Polymarket MULTI-ASSET 5min ({version_note}).
+Le bot trade BTC, ETH et SOL simultanément avec oracle lag Chainlink.
+Ces trades ont été BLOQUÉS par les filtres mais voici le résultat théorique.
+Répartition: {asset_note}
+
+Paramètres actuels:
+- BTC: gap≥0.025% | fenêtre T-25s→T-5s
+- ETH: gap≥0.030% | fenêtre T-25s→T-5s  
+- SOL: gap≥0.030% | fenêtre T-20s→T-5s
+- Commun: delta≥0.020% | token_max={ORACLE_TOKEN_MAX:.2f}$ | EV≥{ORACLE_EDGE_MIN*100:.0f}% | delta_contra={ORACLE_DELTA_CONTRA_MAX:.3f}%
+
+Données ({len(sample)} skips résolus — chaque ligne indique l'asset [BTC/ETH/SOL]):
 {chr(10).join(summary)}
 
-Paramètres actuels: ret3s_seuil={ORACLE_GAP_CONFIRM_RET:.3f}% delta_contra={ORACLE_DELTA_CONTRA_MAX:.3f}% gap_fort={ORACLE_GAP_MIN_STRONG:.3f}%
-Seuils actuels: gap_min={ORACLE_ENTRY_DELTA:.3f}% token_max={ORACLE_TOKEN_MAX:.2f}$
-
-Identifie uniquement les patterns statistiquement significatifs (≥5 trades similaires).
-Format: "• [OBSERVATION]: [SUGGESTION CONCRÈTE]" """
+Identifie uniquement des patterns statistiquement significatifs (≥5 trades similaires).
+Si un pattern est spécifique à un asset (ex: SOL plus volatile), précise-le.
+Réponds en 3 bullet points MAX, très concis, en français.
+Format: "• [ASSET ou COMMUN] [OBSERVATION]: [SUGGESTION CONCRÈTE]" """
 
     try:
         async with aiohttp.ClientSession() as s:
