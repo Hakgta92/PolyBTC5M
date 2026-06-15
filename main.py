@@ -3901,7 +3901,7 @@ async def cmd_autotune(update,context):
 async def cmd_passes(update,context):
     """✅ v10.22 — Affiche les skips AVEC leur résultat théorique + WR des refus"""
     if not auth(update): return
-    passes=st.pass_reasons[-12:][::-1]
+    passes=sorted(st.pass_reasons[-50:], key=lambda x: x.get("ts",0))[-12:][::-1]
     if not passes: await update.message.reply_text("✅ Aucun PASS."); return
     lines=["🚫 *DERNIERS PASS — BTC/ETH/SOL*"]
     for p in passes:
@@ -4188,10 +4188,10 @@ async def cmd_oracle(update,context):
             f"₿ BTC | Oracle:`${oracle:,.2f}` | Tick:`{tick_age}s` {'✅' if st.oracle_connected else '❌'}\n"
             f"  Δslot:`{oracle_delta:+.3f}%` | Gap spot↔oracle:`{spot_gap:+.3f}%`\n"
             f"  Spot:`${spot:,.2f}`\n  → {btc_rec}\n\n"
-            f"Ξ ETH | Oracle:`${eth_o:,.2f}` {'✅' if eth_ok else '❌'}\n"
+            f"Ξ ETH | Oracle:`${eth_o:,.2f}` | Tick:`{int(now-st.eth_oracle_ts) if st.eth_oracle_ts>0 else 999}s` {'✅' if eth_ok else '❌'}\n"
             f"  Δslot:`{eth_d:+.3f}%` | Gap:`{eth_g:+.3f}%` | ETH:`${st.eth_price:,.2f}`\n"
             f"  → {eth_rec}\n\n"
-            f"◎ SOL | Oracle:`${sol_o:,.2f}` {'✅' if sol_ok else '❌'}\n"
+            f"◎ SOL | Oracle:`${sol_o:,.2f}` | Tick:`{int(now-st.sol_oracle_ts) if st.sol_oracle_ts>0 else 999}s` {'✅' if sol_ok else '❌'}\n"
             f"  Δslot:`{sol_d:+.3f}%` | Gap:`{sol_g:+.3f}%` | SOL:`${st.sol_price:,.2f}`\n"
             f"  → {sol_rec}\n\n"
             f"WS: {' | '.join(srcs)}",
