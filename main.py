@@ -3372,11 +3372,9 @@ async def cmd_run(update,context):
     context.job_queue.run_repeating(job_staged_entry,interval=5,first=14)     # ✅ v10.23 2e tranche
     context.job_queue.run_repeating(job_oracle_lag,interval=2,first=16)       # ✅ v10.30 oracle lag (T-35s→T-6s)
     context.job_queue.run_repeating(job_sync_balance,interval=900,first=10)    # ✅ v11.10s — sync CLOB 15min
-    # ✅ v11.10w — auto-calibration désactivée (seuils gérés manuellement)
-    # context.job_queue.run_repeating(job_auto_calibrate,interval=7200,first=300)  # ✅ v10.37 seuils auto
+    context.job_queue.run_repeating(job_auto_calibrate,interval=7200,first=300)  # ✅ v11.10w réactivé  # ✅ v10.37 seuils auto
     context.job_queue.run_repeating(job_pattern_memory,interval=3600,first=600)  # ✅ v10.37 mémoire patterns
-    # ✅ v11.10w — Haiku désactivé
-    # context.job_queue.run_repeating(job_haiku_analysis,interval=7200,first=900)
+    context.job_queue.run_repeating(job_haiku_analysis,interval=7200,first=900)  # ✅ v11.10w réactivé
     st.fg=await fetch_fear_greed(); st.btc24=await fetch_btc_24h(); sess=session_ctx()
     clob_bal = await fetch_clob_balance()
     if clob_bal is not None and clob_bal > 0:
