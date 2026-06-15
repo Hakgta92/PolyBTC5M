@@ -61,7 +61,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "11.10w"
+BOT_VERSION = "11.10z"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -1019,6 +1019,77 @@ def compute_ind(candles):
         "ema_bull":e9>e21,"ema_bull_strong":e9>e21 and e21>e50,"supports":sup,"resistances":res,
         "adx":adx_v,"pdi":pdi_v,"mdi":mdi_v}
 
+def compute_rsi(prices, period=7):
+    """RSI rapide sur période courte pour 5min trading."""
+    if len(prices) < period + 1: return 50.0
+    gains = losses = 0.0
+    for i in range(1, period + 1):
+        d = prices[-i] - prices[-i-1]
+        if d > 0: gains += d
+        else: losses -= d
+    if losses == 0: return 100.0
+    rs = (gains/period) / (losses/period)
+    return 100 - (100 / (1 + rs))
+
+def compute_ema(prices, period):
+    """EMA sur liste de prix."""
+    if len(prices) < period: return prices[-1] if prices else 0
+    k = 2 / (period + 1)
+    ema = prices[0]
+    for p in prices[1:]: ema = p * k + ema * (1 - k)
+    return ema
+
+def compute_ta_score(price_history, asset="BTC"):
+    """
+    ✅ v11.10z — Score TA 5 indicateurs calibrés pour marchés binaires 5min.
+    Source: Archetapp/PolymarketBot + BTCC RSI 7 research.
+    Retourne: (score, direction, details)
+    score > 0 = UP, score < 0 = DOWN
+    """
+    if len(price_history) < 8: return 0, None, {}
+    prices = [x["price"] for x in sorted(price_history, key=lambda x: x["ts"])]
+    now = price_history[-1]["ts"] if price_history else 0
+    score = 0; details = {}
+
+    # 1) RSI(7) — <35=oversold=UP signal | >65=overbought=DOWN signal
+    rsi = compute_rsi(prices, 7)
+    details["rsi"] = round(rsi, 1)
+    if rsi < 35: score += 2    # forte oversold = rebond UP probable
+    elif rsi < 45: score += 1  # légère oversold
+    elif rsi > 65: score -= 2  # forte overbought = retournement DOWN
+    elif rsi > 55: score -= 1  # légère overbought
+
+    # 2) EMA9 vs EMA21 — crossover = signal tendance
+    if len(prices) >= 21:
+        ema9 = compute_ema(prices[-21:], 9)
+        ema21 = compute_ema(prices[-21:], 21)
+        details["ema9"] = round(ema9, 2)
+        details["ema21"] = round(ema21, 2)
+        gap_pct = (ema9 - ema21) / ema21 * 100
+        if gap_pct > 0.02: score += 1    # EMA9 > EMA21 = haussier
+        elif gap_pct < -0.02: score -= 1 # EMA9 < EMA21 = baissier
+
+    # 3) Momentum 3min — ROC des 3 dernières minutes
+    pts_3min = [x for x in price_history if now - x["ts"] <= 180]
+    if len(pts_3min) >= 2:
+        roc = (pts_3min[-1]["price"] - pts_3min[0]["price"]) / pts_3min[0]["price"] * 100
+        details["mom3m"] = round(roc, 4)
+        if roc > 0.03: score += 1   # momentum positif fort
+        elif roc > 0.01: score += 0 # momentum léger
+        elif roc < -0.03: score -= 1
+
+    # 4) Volatilité — si prix très volatil, signal moins fiable
+    if len(prices) >= 10:
+        recent = prices[-10:]
+        avg = sum(recent)/len(recent)
+        std = (sum((p-avg)**2 for p in recent)/len(recent))**0.5
+        vol_pct = std/avg*100
+        details["vol"] = round(vol_pct, 4)
+        if vol_pct > 0.1: score = int(score * 0.7)  # réduire confiance si trop volatil
+
+    direction = "UP" if score > 0 else ("DOWN" if score < 0 else None)
+    return score, direction, details
+
 def compute_advanced_signals(candles_5m,candles_1m,candles_4h=None):
     div=detect_divergence(candles_5m)
     div_4h=detect_rsi_divergence_4h(candles_4h) if candles_4h else None
@@ -1509,10 +1580,18 @@ class State:
         self.entry_token_price=0.0; self.shares_bought=0.0
         self.token_price_peak=0.0; self.trailing_active=False
         # ✅ v11.9m — Orderbook imbalance (Strategy 2)
-        self.ob_imbalance=0.0        # -1.0 (full DOWN) → +1.0 (full UP)
-        self.ob_ts=0.0               # timestamp dernier update OB
-        self.ob_asset_id=""          # token UP actuellement tracké
-        self.clob_ws_task=None       # tâche WS CLOB
+        self.ob_imbalance=0.0; self.ob_ts=0.0; self.ob_asset_id=""; self.clob_ws_task=None
+        # ✅ v11.10y — Multi-asset: ETH + SOL
+        # ETH
+        self.eth_price=0.0; self.eth_ts=0; self.eth_ws_task=None
+        self.eth_oracle_price=0.0; self.eth_oracle_ts=0.0
+        self.eth_oracle_slot_open=0.0; self.eth_oracle_slot_ts=0
+        self.eth_last_trade_slot=0
+        # SOL
+        self.sol_price=0.0; self.sol_ts=0; self.sol_ws_task=None
+        self.sol_oracle_price=0.0; self.sol_oracle_ts=0.0
+        self.sol_oracle_slot_open=0.0; self.sol_oracle_slot_ts=0
+        self.sol_last_trade_slot=0
         self.bet_expiry=0
         self.last_ob=None; self.last_liq=None; self.last_eth_klines=[]
         self.last_news={"sentiment":"neutral","score":0,"news":[]}
@@ -1525,6 +1604,7 @@ class State:
         self.oracle_price=0.0; self.oracle_ts=0
         self.oracle_slot_open=0.0; self.oracle_slot_ts=0
         self.oracle_task=None; self.oracle_connected=False
+        self.eth_oracle_task=None; self.sol_oracle_task=None  # ✅ v11.10y
         self.oracle_lag_signal=None  # {"bias","desc","div_pct"}
         # ✅ v10.23 — Calibration sigma
         self.calib_factor=1.0  # Multiplie VOL_SAFETY (1.0 = pas de correction)
@@ -2021,26 +2101,78 @@ async def ws_clob_loop(asset_id_up: str):
                 await ws.send_json(sub)
                 async for msg in ws:
                     if msg.type == aiohttp.WSMsgType.TEXT:
-                        d = json.loads(msg.data)
-                        event_type = d.get("event_type") or d.get("type", "")
-                        # Formats: book, price_change, last_trade_price
-                        if event_type in ("book", "price_change"):
-                            bids = d.get("bids") or d.get("bid_size") or []
-                            asks = d.get("asks") or d.get("ask_size") or []
-                            # Calculer le volume total bids vs asks
-                            if isinstance(bids, list) and isinstance(asks, list):
-                                bid_vol = sum(float(b.get("size", b[1] if isinstance(b, list) else 0)) for b in bids)
-                                ask_vol = sum(float(a.get("size", a[1] if isinstance(a, list) else 0)) for a in asks)
+                        try:
+                            raw = json.loads(msg.data)
+                            # Polymarket envoie soit une liste soit un dict
+                            msgs = raw if isinstance(raw, list) else [raw]
+                            for m in msgs:
+                                if not isinstance(m, dict): continue
+                                etype = m.get("event_type") or m.get("type", "")
+                                if etype not in ("book", "price_change", "tick_size_change"):
+                                    continue
+                                bids = m.get("bids") or []
+                                asks = m.get("asks") or []
+                                if not isinstance(bids, list) or not isinstance(asks, list):
+                                    continue
+                                bid_vol = ask_vol = 0.0
+                                for b in bids:
+                                    try:
+                                        if isinstance(b, dict): bid_vol += float(b.get("size", 0))
+                                        elif isinstance(b, (list, tuple)) and len(b) >= 2: bid_vol += float(b[1])
+                                    except: pass
+                                for a in asks:
+                                    try:
+                                        if isinstance(a, dict): ask_vol += float(a.get("size", 0))
+                                        elif isinstance(a, (list, tuple)) and len(a) >= 2: ask_vol += float(a[1])
+                                    except: pass
                                 total = bid_vol + ask_vol
                                 if total > 0:
-                                    # imbalance > 0 = plus d'acheteurs UP → signal UP
-                                    st.ob_imbalance = (bid_vol - ask_vol) / total
+                                    st.ob_imbalance = round((bid_vol - ask_vol) / total, 3)
                                     st.ob_ts = time.time()
+                        except Exception as pe:
+                            log.debug(f"WS CLOB OB parse: {pe}")
                     elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                         break
     except Exception as e:
         log.warning(f"WS CLOB OB: {e}")
     st.ob_imbalance = 0.0
+
+
+async def ws_eth_loop():
+    """✅ v11.10y — Prix ETH temps réel (Binance aggTrade)"""
+    url = "wss://stream.binance.com:9443/ws/ethusdt@aggTrade"
+    while True:
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.ws_connect(url, heartbeat=20) as ws:
+                    log.info("✅ WS ETH Binance connecté")
+                    async for msg in ws:
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            d = json.loads(msg.data)
+                            if "p" in d:
+                                st.eth_price = float(d["p"])
+                                st.eth_ts = time.time()
+                        elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR): break
+        except Exception as e: log.warning(f"WS ETH: {e}")
+        await asyncio.sleep(5)
+
+async def ws_sol_loop():
+    """✅ v11.10y — Prix SOL temps réel (Binance aggTrade)"""
+    url = "wss://stream.binance.com:9443/ws/solusdt@aggTrade"
+    while True:
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.ws_connect(url, heartbeat=20) as ws:
+                    log.info("✅ WS SOL Binance connecté")
+                    async for msg in ws:
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            d = json.loads(msg.data)
+                            if "p" in d:
+                                st.sol_price = float(d["p"])
+                                st.sol_ts = time.time()
+                        elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR): break
+        except Exception as e: log.warning(f"WS SOL: {e}")
+        await asyncio.sleep(5)
 
 
 async def ws_oracle_loop():
@@ -2081,6 +2213,63 @@ async def ws_oracle_loop():
         st.oracle_connected=False
         await asyncio.sleep(5)
 
+async def ws_oracle_eth_loop():
+    """✅ v11.10y — Feed Chainlink ETH/USD de Polymarket (même source que résolution)"""
+    url = "wss://ws-live-data.polymarket.com"
+    sub = {"action":"subscribe","subscriptions":[
+        {"topic":"crypto_prices_chainlink","type":"*","filters":'{"symbol":"eth/usd"}'}]}
+    while True:
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.ws_connect(url, heartbeat=20) as ws:
+                    await ws.send_json(sub)
+                    log.info("✅ WS Oracle ETH/USD connecté")
+                    async for msg in ws:
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            try: d = json.loads(msg.data)
+                            except: continue
+                            payload = d.get("payload", {})
+                            val = payload.get("value")
+                            if val and float(val) > 0:
+                                p = float(val); now = time.time()
+                                st.eth_oracle_price = p; st.eth_oracle_ts = now
+                                slot_start = int(now // 300) * 300
+                                if st.eth_oracle_slot_ts != slot_start:
+                                    st.eth_oracle_slot_ts = slot_start
+                                    st.eth_oracle_slot_open = p
+                        elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR): break
+        except Exception as e: log.warning(f"WS Oracle ETH: {e}")
+        await asyncio.sleep(5)
+
+async def ws_oracle_sol_loop():
+    """✅ v11.10y — Feed Chainlink SOL/USD de Polymarket"""
+    url = "wss://ws-live-data.polymarket.com"
+    sub = {"action":"subscribe","subscriptions":[
+        {"topic":"crypto_prices_chainlink","type":"*","filters":'{"symbol":"sol/usd"}'}]}
+    while True:
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.ws_connect(url, heartbeat=20) as ws:
+                    await ws.send_json(sub)
+                    log.info("✅ WS Oracle SOL/USD connecté")
+                    async for msg in ws:
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            try: d = json.loads(msg.data)
+                            except: continue
+                            payload = d.get("payload", {})
+                            val = payload.get("value")
+                            if val and float(val) > 0:
+                                p = float(val); now = time.time()
+                                st.sol_oracle_price = p; st.sol_oracle_ts = now
+                                slot_start = int(now // 300) * 300
+                                if st.sol_oracle_slot_ts != slot_start:
+                                    st.sol_oracle_slot_ts = slot_start
+                                    st.sol_oracle_slot_open = p
+                        elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR): break
+        except Exception as e: log.warning(f"WS Oracle SOL: {e}")
+        await asyncio.sleep(5)
+
+
 async def job_ws_watchdog_all(context):
     """✅ v10.23 — Garde TOUS les WS en vie (Binance + Coinbase + Kraken + Oracle)"""
     if st.ws_task is None or st.ws_task.done():
@@ -2089,10 +2278,18 @@ async def job_ws_watchdog_all(context):
         st.cb_task = asyncio.create_task(ws_coinbase_loop())
     if not hasattr(st,"bs_task") or st.bs_task is None or st.bs_task.done():
         st.bs_task = asyncio.create_task(ws_bitstamp_loop())  # ✅ v11.9k
+    if not hasattr(st,"eth_ws_task") or st.eth_ws_task is None or st.eth_ws_task.done():
+        st.eth_ws_task = asyncio.create_task(ws_eth_loop())   # ✅ v11.10y
+    if not hasattr(st,"sol_ws_task") or st.sol_ws_task is None or st.sol_ws_task.done():
+        st.sol_ws_task = asyncio.create_task(ws_sol_loop())   # ✅ v11.10y
     if st.kr_task is None or st.kr_task.done():
         st.kr_task = asyncio.create_task(ws_kraken_loop())
     if st.oracle_task is None or st.oracle_task.done():
         st.oracle_task = asyncio.create_task(ws_oracle_loop())
+    if not hasattr(st,"eth_oracle_task") or not st.eth_oracle_task or st.eth_oracle_task.done():
+        st.eth_oracle_task = asyncio.create_task(ws_oracle_eth_loop())
+    if not hasattr(st,"sol_oracle_task") or not st.sol_oracle_task or st.sol_oracle_task.done():
+        st.sol_oracle_task = asyncio.create_task(ws_oracle_sol_loop())
 
 def consensus_price():
     """✅ v10.23 — Prix médian des exchanges frais (<3s). Filtre un exchange qui lag/diverge."""
@@ -2816,16 +3013,20 @@ async def job_oracle_lag(context):
         log_skip(f"Oracle: Δ{oracle_delta:+.3f}% gap{spot_oracle_gap:+.3f}% (signals faibles)", None)
         return
 
-    # ── Cohérence des 4 signals (v11.9m — orderbook imbalance ajouté) ──
+    # ── Cohérence des 5 signals (v11.10z — TA score ajouté) ──
     ob_vote = 0
     if time.time() - st.ob_ts < 10:
         if st.ob_imbalance > 0.15: ob_vote = 1
         elif st.ob_imbalance < -0.15: ob_vote = -1
+    # ✅ v11.10z — Score TA 5 indicateurs (RSI7, EMA9/21, Momentum, Volatilité)
+    ta_score, ta_dir, ta_details = compute_ta_score(st.price_history, "BTC")
+    ta_vote = 1 if ta_dir=="UP" else (-1 if ta_dir=="DOWN" else 0)
     dir_votes = sum([
         1 if direction=="UP" and oracle_delta>0 else (-1 if direction=="DOWN" and oracle_delta<0 else 0),
         1 if direction=="UP" and spot_oracle_gap>0 else (-1 if direction=="DOWN" and spot_oracle_gap<0 else 0),
         1 if direction=="UP" and ret_3s>0 else (-1 if direction=="DOWN" and ret_3s<0 else 0),
-        ob_vote,  # ✅ v11.9m — orderbook imbalance (4ème signal)
+        ob_vote,   # orderbook imbalance
+        ta_vote,   # ✅ v11.10z TA score (RSI+EMA+Mom)
     ])
 
     # ✅ v11.10b Haiku: votes ≤ -2/4 = consensus DOWN fort = WIN garanti (8/8)
@@ -3000,7 +3201,7 @@ async def job_oracle_lag(context):
     await send(context.bot,
         f"⚡ *ORACLE LAG* [{mode}]\n━━━━━━━━━━━━━━━\n"
         f"*{direction}* | `{amount:.2f}$` | P:`{p_oracle*100:.0f}%` | ⏰T-`{int(slot_remaining)}s`\n"
-        f"Δslot:`{oracle_delta:+.3f}%` | Gap:`{spot_oracle_gap:+.3f}%` OB:`{st.ob_imbalance:+.2f}` | Votes:`{dir_votes}/4`\n"
+        f"Δslot:`{oracle_delta:+.3f}%` | Gap:`{spot_oracle_gap:+.3f}%` OB:`{st.ob_imbalance:+.2f}` TA:`{ta_score}` | Votes:`{dir_votes}/5`\n"
         f"Ret 1s:`{ret_1s:+.3f}%` 3s:`{ret_3s:+.3f}%` 10s:`{ret_10s:+.3f}%`\n"
         f"Token:`{entry_tp:.3f}$` | EV:`{ev*100:+.1f}%` | Frais:`{fee*100:.2f}¢`\n"
         f"Oracle:`${st.oracle_price:,.2f}` → Spot:`${spot_now:,.2f}`\n\n"
@@ -3061,6 +3262,93 @@ async def push_state_to_github():
                 if r.status in (200,201): log.info("✅ State → GitHub")
                 else: log.warning(f"GitHub push {r.status}: {await r.text()}")
     except Exception as e: log.warning(f"push_state_to_github: {e}")
+
+
+async def job_oracle_lag_asset(context, asset: str):
+    """✅ v11.10y — Oracle lag pour ETH et SOL (même logique que BTC)"""
+    if not st.running or st.killed: return
+    now = time.time()
+    cur_slot = int(now // 300) * 300
+    slot_remaining = cur_slot + 300 - now
+    if slot_remaining > 35 or slot_remaining < 6: return
+
+    # Prix et oracle selon l'asset
+    if asset == "ETH":
+        spot = st.eth_price; spot_ts = st.eth_ts
+        oracle = st.eth_oracle_price; oracle_ts = st.eth_oracle_ts
+        slot_open = st.eth_oracle_slot_open; slot_ts = st.eth_oracle_slot_ts
+        last_trade_slot = st.eth_last_trade_slot
+        slug_prefix = "eth-updown-5m"
+        symbol = "ETH"
+    elif asset == "SOL":
+        spot = st.sol_price; spot_ts = st.sol_ts
+        oracle = st.sol_oracle_price; oracle_ts = st.sol_oracle_ts
+        slot_open = st.sol_oracle_slot_open; slot_ts = st.sol_oracle_slot_ts
+        last_trade_slot = st.sol_last_trade_slot
+        slug_prefix = "sol-updown-5m"
+        symbol = "SOL"
+    else: return
+
+    if spot <= 0 or oracle <= 0 or slot_open <= 0:
+        return  # oracle pas encore connecté
+    if now - spot_ts > 5 or now - oracle_ts > 15: return
+    if last_trade_slot == cur_slot: return
+
+    # Calcul signal (même logique BTC)
+    oracle_delta = (oracle - slot_open) / slot_open * 100 if slot_open > 0 else 0
+    spot_oracle_gap = (spot - oracle) / oracle * 100 if oracle > 0 else 0
+
+    # Direction
+    gap_dir = None
+    if abs(spot_oracle_gap) >= ORACLE_ENTRY_DELTA * 1.5:
+        gap_dir = "UP" if spot_oracle_gap > 0 else "DOWN"
+    delta_dir = None
+    if abs(oracle_delta) >= ORACLE_ENTRY_DELTA:
+        delta_dir = "UP" if oracle_delta > 0 else "DOWN"
+
+    direction = gap_dir or delta_dir
+    if not direction: return
+
+    # Filtre delta négatif
+    if direction == "UP" and oracle_delta < -0.005: return
+    if direction == "DOWN" and oracle_delta > 0.005: return
+
+    # Filtre ret3s brutal (si disponible)
+    # Pas de ret3s multi-asset pour l'instant, skip ce filtre
+
+    # Récupérer le marché
+    market = await poly.get_market_by_slug(f"{slug_prefix}-{cur_slot}")
+    if not market: return
+    token_used = market["token_up"] if direction == "UP" else market["token_down"]
+    token_price = await poly.get_token_price(token_used)
+    if not token_price or token_price <= 0: return
+    if token_price > ORACLE_TOKEN_MAX or token_price < ORACLE_TOKEN_MIN: return
+
+    fee = taker_fee_per_share(token_price)
+    p_oracle = min(0.93, 0.80 + abs(oracle_delta) * 2.0)
+    ev = p_oracle - token_price - fee
+    if ev < ORACLE_EDGE_MIN: return
+
+    # Placer le trade
+    amount = kelly_bet(st.bankroll, p_oracle, token_price)
+    if amount < MIN_BET_USD: return
+
+    log.info(f"⚡ ORACLE LAG {symbol} {direction} | delta={oracle_delta:+.3f}% gap={spot_oracle_gap:+.3f}% tok={token_price:.3f}$ EV={ev*100:.1f}%")
+    result = await poly.place_order(token_used, amount, direction)
+    if result:
+        if asset == "ETH": st.eth_last_trade_slot = cur_slot
+        elif asset == "SOL": st.sol_last_trade_slot = cur_slot
+        await send(context.bot,
+            f"⚡ ORACLE LAG {symbol} 💰 RÉEL\n━━━━━━━━━━━━━━━\n"
+            f"{direction} | {amount:.2f}$ | ⏰T-{int(slot_remaining)}s\n"
+            f"Δslot:{oracle_delta:+.3f}% | Gap:{spot_oracle_gap:+.3f}% | tok:{token_price:.3f}$\n"
+            f"EV:{ev*100:+.1f}% | {symbol}/USD:{spot:,.2f}$")
+
+async def job_oracle_lag_eth(context):
+    await job_oracle_lag_asset(context, "ETH")
+
+async def job_oracle_lag_sol(context):
+    await job_oracle_lag_asset(context, "SOL")
 
 
 async def job_auto_calibrate(context):
@@ -3370,7 +3658,9 @@ async def cmd_run(update,context):
     context.job_queue.run_repeating(job_check_expiry,interval=30,first=15)
     context.job_queue.run_repeating(job_ws_watchdog_all,interval=30,first=1)  # ✅ v10.23 tous les WS
     context.job_queue.run_repeating(job_staged_entry,interval=5,first=14)     # ✅ v10.23 2e tranche
-    context.job_queue.run_repeating(job_oracle_lag,interval=2,first=16)       # ✅ v10.30 oracle lag (T-35s→T-6s)
+    context.job_queue.run_repeating(job_oracle_lag,interval=2,first=16)        # ✅ BTC
+    context.job_queue.run_repeating(job_oracle_lag_eth,interval=2,first=18)    # ✅ v11.10y ETH
+    context.job_queue.run_repeating(job_oracle_lag_sol,interval=2,first=20)    # ✅ v11.10y SOL
     context.job_queue.run_repeating(job_sync_balance,interval=900,first=10)    # ✅ v11.10s — sync CLOB 15min
     context.job_queue.run_repeating(job_auto_calibrate,interval=7200,first=300)  # ✅ v11.10w réactivé  # ✅ v10.37 seuils auto
     context.job_queue.run_repeating(job_pattern_memory,interval=3600,first=600)  # ✅ v10.37 mémoire patterns
@@ -3521,7 +3811,7 @@ async def cmd_status(update,context):
     msg = (
         f"📊 *STATUS v{BOT_VERSION}*\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{'🟢 EN COURS' if st.running else '🔴 ARRÊTÉ'} | {'✅ CLOB' if poly.ready else '❌ CLOB'} | WS:{'✅' if st.ws_connected else '❌'}\n\n"
-        f"₿`${st.price:,.2f}` | F&G:`{fg_val}` | `{sess['session']}`\n"
+        f"₿`${st.price:,.2f}` Ξ`${st.eth_price:,.0f}` ◎`${st.sol_price:,.0f}` | F&G:`{fg_val}` | `{sess['session']}`\n"
         f"Seuils: score≥`{min_score}` mom≥`{min_mom}`\n"
         f"📊 `{ob_txt}` | 💸 `{liq_txt}`\n"
         f"🎯 {score_info}{fair_info}\n\n"
@@ -4077,6 +4367,9 @@ async def cmd_oracle(update,context):
     else: srcs.append("Kraken❌")
     if hasattr(st,'bs_price') and st.bs_price > 0 and now - st.bs_ts < EXCH_STALE_S: srcs.append("Bitstamp✅")
     else: srcs.append("Bitstamp❌")
+    # ETH+SOL prix
+    eth_px = f"ETH:${st.eth_price:,.2f}" if st.eth_price > 0 and now - st.eth_ts < 5 else "ETH:❌"
+    sol_px = f"SOL:${st.sol_price:,.2f}" if st.sol_price > 0 and now - st.sol_ts < 5 else "SOL:❌"
     # Signal dominant (même logique que job_oracle_lag)
     gap_dir = ("UP" if spot_gap>0 else "DOWN") if abs(spot_gap) >= 0.01 else None
     delta_dir = ("UP" if oracle_delta>0 else "DOWN") if abs(oracle_delta) >= ORACLE_ENTRY_DELTA else None
