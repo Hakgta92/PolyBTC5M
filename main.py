@@ -61,7 +61,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "12.2"
+BOT_VERSION = "12.3"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -1593,7 +1593,7 @@ class State:
         self.window_delta_pct=0.0
         self.window_delta=0.0
         # ✅ v10.21 — WebSocket Binance temps réel
-        self.ws_prices=deque()
+        self.ws_prices=deque(); self.ws_volumes=deque()  # ✅ v12.3
         self.ws_price=0.0
         self.ws_connected=False
         self.ws_task=None
@@ -1609,6 +1609,9 @@ class State:
         self.token_price_peak=0.0; self.trailing_active=False
         # ✅ v11.9m — Orderbook imbalance (Strategy 2)
         self.ob_imbalance=0.0; self.ob_ts=0.0; self.ob_asset_id=""; self.clob_ws_task=None
+        # ✅ v12.3 — OB ETH/SOL
+        self.eth_ob_imbalance=0.0; self.eth_ob_ts=0.0; self.eth_ob_asset_id=""; self.eth_clob_ws_task=None
+        self.sol_ob_imbalance=0.0; self.sol_ob_ts=0.0; self.sol_ob_asset_id=""; self.sol_clob_ws_task=None
         # ✅ v12.2 — Multi-asset: ETH + SOL
         # ETH
         self.eth_price=0.0; self.eth_ts=0; self.eth_ws_task=None
@@ -1635,6 +1638,7 @@ class State:
         self.oracle_slot_open=0.0; self.oracle_slot_ts=0
         self.oracle_task=None; self.oracle_connected=False
         self.eth_oracle_task=None; self.sol_oracle_task=None  # ✅ v11.10y
+        self.oracle_chainlink_ts=0.0  # ✅ v12.3 — timestamp Chainlink réel
         self.oracle_lag_signal=None  # {"bias","desc","div_pct"}
         # ✅ v10.23 — Calibration sigma
         self.calib_factor=1.0  # Multiplie VOL_SAFETY (1.0 = pas de correction)
@@ -2027,12 +2031,18 @@ async def ws_binance_loop():
                         if msg.type == aiohttp.WSMsgType.TEXT:
                             d = json.loads(msg.data)
                             p = float(d.get("p", 0))
+                            q = float(d.get("q", 0))  # ✅ v12.3 — volume du trade
                             if p > 0:
                                 now = time.time()
                                 st.ws_price = p
                                 st.ws_prices.append((now, p))
                                 while st.ws_prices and now - st.ws_prices[0][0] > 120:
                                     st.ws_prices.popleft()
+                                # ✅ v12.3 — Volume spike: tracker les volumes
+                                if q > 0:
+                                    st.ws_volumes.append((now, q))
+                                    while st.ws_volumes and now - st.ws_volumes[0][0] > 60:
+                                        st.ws_volumes.popleft()
                                 slot_start = int(now // 300) * 300
                                 if st.slot_open_ts != slot_start:
                                     st.slot_open_ts = slot_start
@@ -2174,6 +2184,58 @@ async def ws_clob_loop(asset_id_up: str):
     st.ob_imbalance = 0.0
 
 
+async def ws_clob_loop_asset(asset_id_up: str, asset: str):
+    """✅ v12.3 — OB imbalance ETH/SOL via CLOB WS (même logique que BTC)"""
+    if not asset_id_up: return
+    url = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+    sub = {"assets_ids": [asset_id_up], "type": "market"}
+    log.info(f"✅ WS CLOB OB {asset} démarré pour {asset_id_up[:12]}...")
+    if asset == "ETH":
+        st.eth_ob_asset_id = asset_id_up; st.eth_ob_imbalance = 0.0
+    else:
+        st.sol_ob_asset_id = asset_id_up; st.sol_ob_imbalance = 0.0
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.ws_connect(url, heartbeat=10, timeout=aiohttp.ClientTimeout(total=300)) as ws:
+                await ws.send_json(sub)
+                async for msg in ws:
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        try:
+                            raw = json.loads(msg.data)
+                            msgs = raw if isinstance(raw, list) else [raw]
+                            for m in msgs:
+                                if not isinstance(m, dict): continue
+                                etype = m.get("event_type") or m.get("type", "")
+                                if etype not in ("book", "price_change", "tick_size_change"): continue
+                                bids = m.get("bids") or []
+                                asks = m.get("asks") or []
+                                bid_vol = ask_vol = 0.0
+                                for b in bids:
+                                    try:
+                                        if isinstance(b, dict): bid_vol += float(b.get("size", 0))
+                                        elif isinstance(b, (list,tuple)) and len(b)>=2: bid_vol += float(b[1])
+                                    except: pass
+                                for a in asks:
+                                    try:
+                                        if isinstance(a, dict): ask_vol += float(a.get("size", 0))
+                                        elif isinstance(a, (list,tuple)) and len(a)>=2: ask_vol += float(a[1])
+                                    except: pass
+                                total = bid_vol + ask_vol
+                                if total > 0:
+                                    imb = round((bid_vol - ask_vol) / total, 3)
+                                    if asset == "ETH":
+                                        st.eth_ob_imbalance = imb; st.eth_ob_ts = time.time()
+                                    else:
+                                        st.sol_ob_imbalance = imb; st.sol_ob_ts = time.time()
+                        except Exception as pe:
+                            log.debug(f"WS CLOB OB {asset} parse: {pe}")
+                    elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR): break
+    except Exception as e:
+        log.warning(f"WS CLOB OB {asset}: {e}")
+    if asset == "ETH": st.eth_ob_imbalance = 0.0
+    else: st.sol_ob_imbalance = 0.0
+
+
 async def ws_eth_loop():
     """✅ v11.10y — Prix ETH temps réel (Binance aggTrade)"""
     url = "wss://stream.binance.com:9443/ws/ethusdt@aggTrade"
@@ -2245,6 +2307,9 @@ async def ws_oracle_loop():
                             if val and float(val) > 0:
                                 p = float(val); now = time.time()
                                 st.oracle_price = p; st.oracle_ts = now
+                                # ✅ v12.3 — Chainlink timestamp pour détecter lag frais
+                                cl_ts_ms = payload.get("timestamp", 0)
+                                st.oracle_chainlink_ts = cl_ts_ms / 1000 if cl_ts_ms > 0 else now
                                 slot_start = int(now // 300) * 300
                                 if st.oracle_slot_ts != slot_start:
                                     st.oracle_slot_ts = slot_start
@@ -3197,6 +3262,27 @@ async def job_oracle_lag(context):
     # Bonus votes alignés
     if dir_votes >= 3: p_oracle = min(0.95, p_oracle + 0.03)
     if dir_votes >= 4: p_oracle = min(0.96, p_oracle + 0.02)  # ✅ v11.10 OB vote
+
+    # ── ✅ v12.3 Feature 3: Chainlink lag frais (< 2s depuis update oracle) ──
+    chainlink_age = now - st.oracle_chainlink_ts if st.oracle_chainlink_ts > 0 else 999
+    if chainlink_age < 2.0:
+        p_oracle = min(0.97, p_oracle + 0.03)  # lag maximal = meilleur edge
+        log.debug(f"⚡ Chainlink frais ({chainlink_age:.1f}s) → p_oracle bonus +3%")
+
+    # ── ✅ v12.3 Feature 4: Volume spike BTC ──
+    vol_vote = 0
+    vols = list(st.ws_volumes)
+    if len(vols) >= 5:
+        vol_5s = sum(q for t,q in vols if now - t <= 5)
+        vol_30s_avg = sum(q for t,q in vols if now - t <= 30) / 6  # moyenne sur 30s / 6 = par 5s
+        if vol_30s_avg > 0:
+            vol_ratio = vol_5s / vol_30s_avg
+            if vol_ratio > 2.0:   # volume 2x la moyenne → spike
+                vol_vote = 1 if direction == "UP" else -1
+                p_oracle = min(0.97, p_oracle + 0.02)
+                log.debug(f"📊 Volume spike x{vol_ratio:.1f} → signal confirmé")
+            elif vol_ratio < 0.3:  # volume très faible → signal moins fiable
+                p_oracle = max(0.75, p_oracle - 0.02)
     # ✅ v11.10 — Time-weighting: plus proche de T-6s → direction plus lockée
     # Source: medium.com/@benjamin.bigdev — "probability converges faster than market prices"
     time_weight_bonus = max(0.0, (35 - slot_remaining) / 35 * 0.04)  # +4% à T-6s, 0% à T-35s
@@ -3392,12 +3478,35 @@ async def job_oracle_lag_asset(context, asset: str):
     ta_score, ta_dir, _ = compute_ta_score(price_hist, asset)
     ta_vote = 1 if ta_dir=="UP" else (-1 if ta_dir=="DOWN" else 0)
 
-    # ── Votes /5 ──
+    # ── ✅ v12.3 Feature 5: BTC cascade vote ──
+    btc_cascade_vote = 0
+    btc_pts = list(st.ws_prices)
+    if len(btc_pts) >= 2:
+        btc_10s = [p for t,p in btc_pts if now - t <= 10]
+        if len(btc_10s) >= 2 and btc_10s[0] > 0:
+            btc_move_10s = (btc_10s[-1] - btc_10s[0]) / btc_10s[0] * 100
+            if abs(btc_move_10s) >= 0.030:
+                raw_vote = 1 if btc_move_10s > 0 else -1
+                btc_cascade_vote = raw_vote if (
+                    (direction=="UP" and raw_vote==1) or (direction=="DOWN" and raw_vote==-1)
+                ) else -raw_vote
+
+    # ── ✅ v12.3 Feature 1: OB imbalance réel ETH/SOL ──
+    ob_imb = st.eth_ob_imbalance if asset=="ETH" else st.sol_ob_imbalance
+    ob_ts_asset = st.eth_ob_ts if asset=="ETH" else st.sol_ob_ts
+    ob_vote_asset = 0
+    if time.time() - ob_ts_asset < 10:
+        if ob_imb > 0.15: ob_vote_asset = 1
+        elif ob_imb < -0.15: ob_vote_asset = -1
+
+    # ── Votes /5 : OB réel + BTC cascade (les deux disponibles) ──
+    # Si OB disponible → utiliser OB. Sinon → utiliser BTC cascade
+    fourth_vote = ob_vote_asset if ob_ts_asset > 0 and time.time()-ob_ts_asset < 10 else btc_cascade_vote
     dir_votes = sum([
         1 if direction=="UP" and oracle_delta>0 else (-1 if direction=="DOWN" and oracle_delta<0 else 0),
         1 if direction=="UP" and spot_oracle_gap>0 else (-1 if direction=="DOWN" and spot_oracle_gap<0 else 0),
         1 if direction=="UP" and ret_15s>0 else (-1 if direction=="DOWN" and ret_15s<0 else 0),
-        0,  # OB (pas de CLOB WS ETH/SOL)
+        fourth_vote,  # ✅ v12.3 — OB réel ETH/SOL ou BTC cascade
         ta_vote,
     ])
 
@@ -3410,6 +3519,19 @@ async def job_oracle_lag_asset(context, asset: str):
     token_used = market["token_up"] if direction == "UP" else market["token_down"]
     token_price = await poly.get_token_price(token_used)
     if not token_price or token_price <= 0: return
+
+    # ✅ v12.3 — Lancer WS CLOB OB pour ETH/SOL (même que BTC)
+    asset_up = market.get("token_up", "")
+    if asset == "ETH":
+        if asset_up and st.eth_ob_asset_id != asset_up:
+            if st.eth_clob_ws_task and not st.eth_clob_ws_task.done():
+                st.eth_clob_ws_task.cancel()
+            st.eth_clob_ws_task = asyncio.create_task(ws_clob_loop_asset(asset_up, "ETH"))
+    elif asset == "SOL":
+        if asset_up and st.sol_ob_asset_id != asset_up:
+            if st.sol_clob_ws_task and not st.sol_clob_ws_task.done():
+                st.sol_clob_ws_task.cancel()
+            st.sol_clob_ws_task = asyncio.create_task(ws_clob_loop_asset(asset_up, "SOL"))
 
     if token_price > ORACLE_TOKEN_MAX:
         log_skip(f"{symbol}: token {token_price:.2f}$>{ORACLE_TOKEN_MAX}$ (→ skip: déjà pricé)", direction,
@@ -3453,7 +3575,7 @@ async def job_oracle_lag_asset(context, asset: str):
     await send(context.bot,
         f"⚡ *ORACLE LAG {emoji} {symbol}* [{mode}]\n━━━━━━━━━━━━━━━\n"
         f"*{direction}* | `{amount:.2f}$` | P:`{p_oracle*100:.0f}%` | ⏰T-`{int(slot_remaining)}s`\n"
-        f"Δslot:`{oracle_delta:+.3f}%` | Gap:`{spot_oracle_gap:+.3f}%` TA:`{ta_score}` | Votes:`{dir_votes}/5`\n"
+        f"Δslot:`{oracle_delta:+.3f}%` | Gap:`{spot_oracle_gap:+.3f}%` OB:`{ob_imb:+.2f}` TA:`{ta_score}` | Votes:`{dir_votes}/5`\n"
         f"Ret 3s:`{ret_3s:+.3f}%` 15s:`{ret_15s:+.3f}%`\n"
         f"Token:`{entry_tp:.3f}$` | EV:`{ev*100:+.1f}%` | Frais:`{fee*100:.2f}¢`\n"
         f"Oracle:`${oracle:,.2f}` → Spot:`${spot:,.2f}`\n\n"
