@@ -3217,8 +3217,8 @@ async def job_oracle_lag(context):
     sess = session_ctx()
     conf_score = st.last_conf_score if st.last_conf_score else {"score": 0, "signals": []}
     reasoning = (
-        f"⚡ORACLE LAG {direction} | "
-        f"gap={spot_oracle_gap:+.3f}% delta={oracle_delta:+.3f}% OB={st.ob_imbalance:+.2f} votes={dir_votes}/4 | "
+        f"⚡ORACLE LAG BTC {direction} | "
+        f"gap={spot_oracle_gap:+.3f}% delta={oracle_delta:+.3f}% OB={st.ob_imbalance:+.2f} votes={dir_votes}/5 | "
         f"tok={token_price:.3f}$ exp={expected_token_price(abs(oracle_delta),slot_remaining):.2f}$ EV={ev*100:+.1f}% T-{int(slot_remaining)}s")
 
     ok = await place_bet(
@@ -3239,7 +3239,7 @@ async def job_oracle_lag(context):
     mode = "💰 RÉEL" if not st.paper_mode else "📄 paper"
     entry_tp = st.entry_token_price if not st.paper_mode else token_price
     await send(context.bot,
-        f"⚡ *ORACLE LAG* [{mode}]\n━━━━━━━━━━━━━━━\n"
+        f"⚡ *ORACLE LAG ₿ BTC* [{mode}]\n━━━━━━━━━━━━━━━\n"
         f"*{direction}* | `{amount:.2f}$` | P:`{p_oracle*100:.0f}%` | ⏰T-`{int(slot_remaining)}s`\n"
         f"Δslot:`{oracle_delta:+.3f}%` | Gap:`{spot_oracle_gap:+.3f}%` OB:`{st.ob_imbalance:+.2f}` TA:`{ta_score}` | Votes:`{dir_votes}/5`\n"
         f"Ret 3s:`{ret_3s:+.3f}%` 15s:`{ret_15s:+.3f}%` | Momentum 15s confirme\n"
@@ -3393,11 +3393,15 @@ async def job_oracle_lag_asset(context, asset: str):
         st.trades.append({"ts":time.time(),"dir":direction,"amount":amount,
                           "token":token_price,"asset":asset,"result":None,"pnl":0})
         st.skipped = max(0, st.skipped)
+        emoji = "Ξ" if asset == "ETH" else "◎"
+        mode = "💰 RÉEL" if not st.paper_mode else "📄 paper"
         await send(context.bot,
-            f"⚡ ORACLE LAG {symbol} 💰 RÉEL\n━━━━━━━━━━━━━━━\n"
-            f"{direction} | {amount:.2f}$ | ⏰T-{int(slot_remaining)}s\n"
-            f"Δslot:{oracle_delta:+.3f}% | Gap:{spot_oracle_gap:+.3f}% | tok:{token_price:.3f}$\n"
-            f"EV:{ev*100:+.1f}% | {symbol}/USD:{spot:,.2f}$")
+            f"⚡ *ORACLE LAG {emoji} {symbol}* [{mode}]\n━━━━━━━━━━━━━━━\n"
+            f"*{direction}* | `{amount:.2f}$` | P:`{p_oracle*100:.0f}%` | ⏰T-`{int(slot_remaining)}s`\n"
+            f"Δslot:`{oracle_delta:+.3f}%` | Gap:`{spot_oracle_gap:+.3f}%`\n"
+            f"Token:`{token_price:.3f}$` | EV:`{ev*100:+.1f}%`\n"
+            f"Oracle:`${oracle:,.2f}` → Spot:`${spot:,.2f}`\n\n"
+            f"💭 _⚡ORACLE LAG {symbol} {direction} | gap={spot_oracle_gap:+.3f}% delta={oracle_delta:+.3f}% | tok={token_price:.3f}$ EV={ev*100:+.1f}% T-{int(slot_remaining)}s_")
 
 async def job_oracle_lag_eth(context):
     await job_oracle_lag_asset(context, "ETH")
