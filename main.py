@@ -1,4 +1,3 @@
-
 """
 POLYMARKET BTC BOT v10.29 — FRAIS CORRIGÉS + FEE_FILTER SUPPRIMÉ
 NOUVEAUTÉS v10.29 — CORRECTIONS MAJEURES:
@@ -3296,6 +3295,7 @@ async def job_oracle_lag_asset(context, asset: str):
     if spot <= 0 or oracle <= 0 or slot_open <= 0:
         return  # oracle pas encore connecté
     if now - spot_ts > 5 or now - oracle_ts > 15: return
+    # ✅ v12 — Log dans pass_reasons pour /passes ETH/SOL
     if last_trade_slot == cur_slot: return
 
     # Calcul signal (même logique BTC)
@@ -3313,11 +3313,17 @@ async def job_oracle_lag_asset(context, asset: str):
         delta_dir = "UP" if oracle_delta > 0 else "DOWN"
 
     direction = gap_dir or delta_dir
-    if not direction: return
+    if not direction:
+        st.pass_reasons.append({"ts":time.time(),"dir":None,"reason":f"{symbol}: Δ{oracle_delta:+.3f}% gap{spot_oracle_gap:+.3f}% (signals faibles)","result":None})
+        return
 
     # Filtre delta négatif
-    if direction == "UP" and oracle_delta < -0.005: return
-    if direction == "DOWN" and oracle_delta > 0.005: return
+    if direction == "UP" and oracle_delta < -0.005:
+        st.pass_reasons.append({"ts":time.time(),"dir":direction,"reason":f"{symbol}: delta {oracle_delta:+.3f}%<0 (LOSS)","result":None})
+        return
+    if direction == "DOWN" and oracle_delta > 0.005:
+        st.pass_reasons.append({"ts":time.time(),"dir":direction,"reason":f"{symbol}: delta {oracle_delta:+.3f}%>0 (contre DOWN)","result":None})
+        return
 
     # Filtre ret3s brutal (si disponible)
     # Pas de ret3s multi-asset pour l'instant, skip ce filtre
@@ -3344,6 +3350,10 @@ async def job_oracle_lag_asset(context, asset: str):
     if result:
         if asset == "ETH": st.eth_last_trade_slot = cur_slot
         elif asset == "SOL": st.sol_last_trade_slot = cur_slot
+        # ✅ v12 — Logguer le trade ETH/SOL dans l'historique avec tag asset
+        st.trades.append({"ts":time.time(),"dir":direction,"amount":amount,
+                          "token":token_price,"asset":asset,"result":None,"pnl":0})
+        st.skipped = max(0, st.skipped)
         await send(context.bot,
             f"⚡ ORACLE LAG {symbol} 💰 RÉEL\n━━━━━━━━━━━━━━━\n"
             f"{direction} | {amount:.2f}$ | ⏰T-{int(slot_remaining)}s\n"
@@ -4394,14 +4404,30 @@ async def cmd_oracle(update,context):
         rec = f"📡 Pas de lag exploitable (gap:`{spot_gap:+.3f}%` delta:`{oracle_delta:+.3f}%`)"
     # Tie bias
     tie_note = "\n💡 _Quasi-plat → tie bias UP (smart contract: end≥start=UP gagne)_" if abs(oracle_delta)<0.01 and abs(spot_gap)<0.01 else ""
+    # ETH oracle info
+    eth_oracle = st.eth_oracle_price; eth_slot_open = st.eth_oracle_slot_open
+    eth_delta = (eth_oracle - eth_slot_open)/eth_slot_open*100 if eth_slot_open>0 else 0
+    eth_gap = (st.eth_price - eth_oracle)/eth_oracle*100 if eth_oracle>0 and st.eth_price>0 else 0
+    eth_ok = st.eth_oracle_price > 0 and now - st.eth_oracle_ts < 15
+    # SOL oracle info
+    sol_oracle = st.sol_oracle_price; sol_slot_open = st.sol_oracle_slot_open
+    sol_delta = (sol_oracle - sol_slot_open)/sol_slot_open*100 if sol_slot_open>0 else 0
+    sol_gap = (st.sol_price - sol_oracle)/sol_oracle*100 if sol_oracle>0 and st.sol_price>0 else 0
+    sol_ok = st.sol_oracle_price > 0 and now - st.sol_oracle_ts < 15
+
     try:
         await update.message.reply_text(
-            f"🔗 *ORACLE CHAINLINK*\n━━━━━━━━━━━━━━\n"
-            f"Connecté:{'✅' if st.oracle_connected else '❌'} | Tick:`{tick_age}s`\n"
-            f"Oracle BTC:`${oracle:,.2f}`\n"
-            f"Slot open:`${slot_open:,.2f}` (Δ oracle:`{oracle_delta:+.3f}%`)\n"
-            f"Spot consensus:`${spot:,.2f}` (Δ spot↔oracle:`{spot_gap:+.3f}%`){tie_note}\n\n"
-            f"{rec}\n\n"
+            f"🔗 *ORACLE v12.0 — BTC/ETH/SOL*\n━━━━━━━━━━━━━━\n"
+            f"*₿ BTC* | Oracle:`${oracle:,.2f}` | Tick:`{tick_age}s` {'✅' if st.oracle_connected else '❌'}\n"
+            f"  Δslot:`{oracle_delta:+.3f}%` | Gap spot↔oracle:`{spot_gap:+.3f}%`\n"
+            f"  Spot:`${spot:,.2f}`{tie_note}\n"
+            f"  → {rec}\n\n"
+            f"*Ξ ETH* | Oracle:`${eth_oracle:,.2f}` {'✅' if eth_ok else '❌'}\n"
+            f"  Δslot:`{eth_delta:+.3f}%` | Gap:`{eth_gap:+.3f}%` | {eth_px}\n"
+            f"  → {'⚡ Signal ETH ' + ('UP' if eth_delta>0 else 'DOWN') + f' T-{int(slot_remaining)}s' if eth_ok and abs(eth_delta)>=0.02 else '📡 Pas de signal ETH'}\n\n"
+            f"*◎ SOL* | Oracle:`${sol_oracle:,.2f}` {'✅' if sol_ok else '❌'}\n"
+            f"  Δslot:`{sol_delta:+.3f}%` | Gap:`{sol_gap:+.3f}%` | {sol_px}\n"
+            f"  → {'⚡ Signal SOL ' + ('UP' if sol_delta>0 else 'DOWN') + f' T-{int(slot_remaining)}s' if sol_ok and abs(sol_delta)>=0.02 else '📡 Pas de signal SOL'}\n\n"
             f"WS: {' | '.join(srcs)}",
             parse_mode="Markdown")
     except Exception as e:
