@@ -3344,65 +3344,79 @@ Format: "• [OBSERVATION]: [SUGGESTION CONCRÈTE]" """
         log.warning(f"Haiku analysis: {e}")
 
 
-async def cmd_learn(update, context):
-    """✅ v10.37 — Affiche ce que le bot a appris: calibrations + patterns + insights Haiku"""
+async def cmd_learn(update,context):
     if not auth(update): return
-    lines = ["🧠 *AUTO-APPRENTISSAGE v10.37*\n━━━━━━━━━━━━━━"]
-
-    # Seuils actuels
-    lines.append(f"📐 *Seuils actuels (auto-calibrés):*")
-    lines.append(f"  ret3s: `{ORACLE_GAP_CONFIRM_RET:.3f}%` | delta_contra: `{ORACLE_DELTA_CONTRA_MAX:.3f}%`")
-    lines.append(f"  gap_fort: `{ORACLE_GAP_MIN_STRONG:.3f}%` | gap_min: `{ORACLE_ENTRY_DELTA:.3f}%`")
-
-    # Patterns résolus
-    resolved = [p for p in st.oracle_patterns if p.get("result") in ("WIN","LOSS")]
-    if resolved:
-        wins = sum(1 for p in resolved if p["result"]=="WIN")
-        by_filter = {}
-        for p in resolved:
+    now=time.time()
+    lines=["🧠 *AUTO-APPRENTISSAGE*\n━━━━━━━━━━━━━━"]
+    merged_patterns=st.oracle_patterns; merged_trades=st.trades
+    lines.append(f"📊 {len(merged_patterns)} patterns | {len(merged_trades)} trades en mémoire")
+    lines.append(f"📐 *Seuils actuels:*")
+    lines.append(f"  delta_contra:`{ORACLE_DELTA_CONTRA_MAX:.3f}%` | gap_min:`{ORACLE_ENTRY_DELTA:.3f}%`")
+    lines.append(f"  token:`{ORACLE_TOKEN_MIN:.2f}$`-`{ORACLE_TOKEN_MAX:.2f}$` | EV_min:`{ORACLE_EDGE_MIN*100:.0f}%`")
+    # Trades réels
+    trades=merged_trades
+    if trades:
+        real=[t for t in trades if not t.get("paper")]
+        wins_r=sum(1 for t in real if t.get("result")=="WIN")
+        losses_r=len(real)-wins_r; pnl_r=sum(t.get("pnl",0) for t in real)
+        wr_r=wins_r/len(real)*100 if real else 0
+        avg_win=sum(t["pnl"] for t in real if t.get("result")=="WIN")/max(wins_r,1)
+        avg_loss=sum(t["pnl"] for t in real if t.get("result")!="WIN")/max(losses_r,1)
+        rr=abs(avg_win/avg_loss) if avg_loss!=0 else 0
+        ts_24h=now-86400; recent=[t for t in real if t.get("ts",0)>ts_24h]
+        wins_24h=sum(1 for t in recent if t.get("result")=="WIN")
+        wr_24h=wins_24h/len(recent)*100 if recent else 0
+        pnl_24h=sum(t.get("pnl",0) for t in recent)
+        lines.append(f"\n💰 *Trades réels:* {len(real)} | WR:`{wr_r:.0f}%` | PnL:`{pnl_r:+.2f}$`")
+        lines.append(f"  Gain moy:`+{avg_win:.2f}$` | Perte moy:`{avg_loss:.2f}$` | R:R:`{rr:.2f}`")
+        lines.append(f"  📅 24h: {len(recent)} trades | WR:`{wr_24h:.0f}%` | PnL:`{pnl_24h:+.2f}$`")
+        # Par asset
+        for asset_tag,emoji in [("BTC","₿"),("ETH","Ξ"),("SOL","◎")]:
+            at=[t for t in real if t.get("asset",asset_tag if asset_tag=="BTC" else None)==asset_tag]
+            if at:
+                w_at=sum(1 for t in at if t.get("result")=="WIN")
+                pnl_at=sum(t.get("pnl",0) for t in at)
+                lines.append(f"  {emoji} {asset_tag}: {len(at)} trades WR:`{w_at/len(at)*100:.0f}%` PnL:`{pnl_at:+.2f}$`")
+    # Patterns skips
+    resolved=[p for p in merged_patterns if p.get("result") in ("WIN","LOSS")]
+    resolved_cur=[p for p in resolved if p.get("v")==BOT_VERSION]
+    sample=resolved_cur if len(resolved_cur)>=5 else resolved
+    label=f"v{BOT_VERSION}" if len(resolved_cur)>=5 else f"all ({len(resolved_cur)} en v{BOT_VERSION})"
+    if sample:
+        wins=sum(1 for p in sample if p["result"]=="WIN")
+        by_filter={}
+        for p in sample:
             f=p.get("filter","?")
             if f not in by_filter: by_filter[f]={"w":0,"l":0}
             if p["result"]=="WIN": by_filter[f]["w"]+=1
             else: by_filter[f]["l"]+=1
-        lines.append(f"\n📊 *Patterns résolus: {len(resolved)}* (WR: {wins/len(resolved)*100:.0f}%)")
-        for f,v in by_filter.items():
-            tot=v["w"]+v["l"]
-            wr=v["w"]/tot*100 if tot else 0
-            lines.append(f"  `{f}`: {wr:.0f}% ({v['w']}W/{v['l']}L)")
+        lines.append(f"\n📊 *Patterns skips: {len(sample)}* (WR:{wins/len(sample)*100:.0f}%) — {label}")
+        for f,v in sorted(by_filter.items(),key=lambda x:x[1]["w"]+x[1]["l"],reverse=True)[:6]:
+            tot=v["w"]+v["l"]; wr=v["w"]/tot*100 if tot else 0
+            emoji="✅" if wr<40 else ("⚠️" if wr>65 else "➖")
+            lines.append(f"  {emoji}`{f}`: {wr:.0f}% ({v['w']}W/{v['l']}L)")
+        recent_p=[p for p in sample if p.get("ts",0)>now-86400]
+        if recent_p:
+            wins_p24=sum(1 for p in recent_p if p["result"]=="WIN")
+            lines.append(f"  📅 24h: {len(recent_p)} patterns | WR:{wins_p24/len(recent_p)*100:.0f}%")
     else:
-        lines.append("\n📊 Pas encore assez de patterns résolus (<15)")
-
-    # Dernière calibration
+        lines.append(f"\n📊 Pas encore assez de patterns (<5 pour cette version)")
+    # Calibration
     if st.calibration_log:
-        last=st.calibration_log[-1]
-        ts=datetime.fromtimestamp(last["ts"]).strftime("%d/%m %H:%M")
-        lines.append(f"\n🔧 *Dernière calibration:* `{ts}`")
-        for a in last["adjustments"]: lines.append(f"  • {a}")
-
-    # Insights Haiku
+        last=st.calibration_log[-1]; ts=datetime.fromtimestamp(last["ts"]).strftime("%d/%m %H:%M")
+        lines.append(f"\n🔧 *Calibration:* `{ts}`")
+        for a in last["adjustments"][:3]: lines.append(f"  • {a}")
+    # Haiku
     if st.haiku_insights:
         last_h=[x for x in st.haiku_insights if x["type"]=="haiku"]
         if last_h:
-            lines.append(f"\n🤖 *Dernier insight Haiku:*")
-            lines.append(last_h[-1]["insight"][:300])
-
-    try:
-        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-    except Exception:
+            lines.append(f"\n🤖 *Haiku ({datetime.fromtimestamp(last_h[-1].get('ts',now)).strftime('%d/%m %H:%M')}):*")
+            lines.append(last_h[-1]["insight"][:400])
+    try: await update.message.reply_text("\n".join(lines),parse_mode="Markdown")
+    except:
         clean=[l.replace("*","").replace("`","").replace("_","") for l in lines]
         await update.message.reply_text("\n".join(clean))
 
-
-def auth(u): return ALLOWED_UID==0 or u.effective_user.id==ALLOWED_UID
-
-def kb():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 Status",callback_data="status"),InlineKeyboardButton("🧠 AI Last",callback_data="ai")],
-        [InlineKeyboardButton("📈 Trades",callback_data="trades"),InlineKeyboardButton("📉 Stats",callback_data="stats")],
-        [InlineKeyboardButton("😱 F&G",callback_data="fear"),InlineKeyboardButton("🎯 Score",callback_data="score")],
-        [InlineKeyboardButton("▶️ Start",callback_data="run"),InlineKeyboardButton("⏹ Stop",callback_data="stop")],
-        [InlineKeyboardButton("🟢 Actif" if st.running else "🔴 Arrêté",callback_data="status"),
-         InlineKeyboardButton("💰 Réel" if not st.paper_mode else "📄 Paper",callback_data="paper")]])
 
 async def cmd_start(update,context):
     if not auth(update): return
@@ -3462,7 +3476,8 @@ async def cmd_run(update,context):
     await update.message.reply_text(
         f"🚀 *Bot v{BOT_VERSION} démarré !*\nMode:*{'📄 PAPER' if st.paper_mode else '💰 RÉEL'}*\n"
         f"Session:`{sess['session']}` | Seuils: score≥`{min_score}` mom≥`{min_mom}`\n"
-        f"⚡ ORACLE LAG actif: T-35s→T-6s | gap≥1bps / delta≥{int(ORACLE_ENTRY_DELTA*10000)}bps\n"
+        f"⚡ BTC T-25→T-5s | ETH T-25→T-5s | SOL T-20→T-5s\n"
+        f"  gap≥2.5/3bps | delta≥{int(ORACLE_ENTRY_DELTA*10000)}bps | Token≤{ORACLE_TOKEN_MAX}$ | EV≥{int(ORACLE_EDGE_MIN*100)}%\n"
         f"BR:`{st.bankroll:.2f}$` | ROI:`{roi()}`\n"
         f"📊 `{ob_txt}` | 💸 `{liq_txt}`\n"
         f"Récap auto: 22h Paris 🕙",
@@ -3554,11 +3569,19 @@ async def cmd_setbalance(update,context):
 
 async def cmd_backup(update,context):
     if not auth(update): return
+    await update.message.reply_text("💾 Backup en cours...")
     ok=st.backup()
+    gh_ok=False
     if ok:
-        await update.message.reply_text(f"💾 *Backup*\nBR:`{st.bankroll:.2f}$` | ROI:`{roi()}` | Trades:`{len(st.trades)}`",parse_mode="Markdown")
-    else:
-        await update.message.reply_text("❌ Backup échoué.")
+        try: await push_state_to_github(); gh_ok=True
+        except Exception as e: log.warning(f"backup github: {e}")
+    status="✅ Local + GitHub State" if gh_ok else ("✅ Local" if ok else "❌ Échoué")
+    await update.message.reply_text(
+        f"💾 *BACKUP*\n{status}\n"
+        f"BR:`{st.bankroll:.2f}$` | ROI:`{roi()}`\n"
+        f"Trades:`{len(st.trades)}` | Patterns:`{len(st.oracle_patterns)}` | Passes:`{len(st.pass_reasons)}`",
+        parse_mode="Markdown")
+
 
 async def cmd_status(update,context):
     if not auth(update): return
@@ -3590,7 +3613,7 @@ async def cmd_status(update,context):
     await update.message.reply_text(
         f"📊 *STATUS v{BOT_VERSION}* [{'📄' if st.paper_mode else '💰'}]\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{'🟢 EN COURS' if st.running else '🔴 ARRÊTÉ'} | {'✅ CLOB' if poly.ready else '❌ CLOB'} | WS:{'✅' if st.ws_connected else '❌'}\n\n"
-        f"₿`${st.price:,.2f}` | F&G:`{st.fg['value']}` | `{sess['session']}`\n"
+        f"₿`${st.price:,.2f}` Ξ`${st.eth_price:,.0f}` ◎`${st.sol_price:,.0f}` | F&G:`{st.fg['value']}` | `{sess['session']}`\n"
         f"Seuils: score≥`{min_score}` mom≥`{min_mom}`\n"
         f"📊 `{ob_txt}` | 💸 `{liq_txt}`\n"
         f"🎯 {score_info}{fair_info}\n\n"
@@ -3628,21 +3651,31 @@ async def cmd_balance(update,context):
 
 async def cmd_market(update,context):
     if not auth(update): return
-    await update.message.reply_text("⏳ Recherche marché...")
-    market=await poly.find_btc_5min_market()
-    if not market: await update.message.reply_text("❌ Aucun marché BTC 5min trouvé."); return
-    tu=await poly.get_token_price(market["token_up"]); td=await poly.get_token_price(market["token_down"])
-    pu=round(1/tu,2) if tu>0 else 0; pd=round(1/td,2) if td>0 else 0
-    ku=kelly_bet(st.bankroll,0.6,pu); kd=kelly_bet(st.bankroll,0.6,pd)
-    fee_u=taker_fee_per_share(tu)*100; fee_d=taker_fee_per_share(td)*100
-    liq=st.last_liq; ob=st.last_ob
-    await update.message.reply_text(
-        f"🎯 *MARCHÉ ACTIF*\n━━━━━━━━━━━━━━━━━━━━━━━━\n_{market['question']}_\n\n"
-        f"🟢 UP:`{tu:.3f}$`→x`{pu}` Kelly≈`{ku:.2f}$` frais:`{fee_u:.2f}¢`\n"
-        f"🔴 DOWN:`{td:.3f}$`→x`{pd}` Kelly≈`{kd:.2f}$` frais:`{fee_d:.2f}¢`\n"
-        f"Fin:`{market.get('end_date','?')}`\n\n"
-        f"📊 `{ob['desc'] if ob else 'N/A'}` | 💸 `{liq['desc'] if liq else 'N/A'}`",
-        parse_mode="Markdown")
+    await update.message.reply_text("⏳ Recherche marchés BTC/ETH/SOL...")
+    now_ts=int(time.time()); cur_slot=int(now_ts//300)*300; slot_rem=cur_slot+300-now_ts
+    lines=[f"🎯 *MARCHÉS ACTIFS — BTC/ETH/SOL*\n━━━━━━━━━━━━━━\n⏰ T-`{int(slot_rem)}s` avant résolution\n"]
+    for label,prefix,oracle_px,slot_open in [
+        ("₿ BTC","btc-updown-5m",st.oracle_price,st.oracle_slot_open),
+        ("Ξ ETH","eth-updown-5m",st.eth_oracle_price,st.eth_oracle_slot_open),
+        ("◎ SOL","sol-updown-5m",st.sol_oracle_price,st.sol_oracle_slot_open),
+    ]:
+        try:
+            market=await poly.get_market_by_slug(f"{prefix}-{cur_slot}")
+            if not market: lines.append(f"{label}: ❌ marché non trouvé"); continue
+            tu=await poly.get_token_price(market["token_up"])
+            td=await poly.get_token_price(market["token_down"])
+            delta=(oracle_px-slot_open)/slot_open*100 if slot_open>0 else 0
+            ev_u=(0.85-tu-taker_fee_per_share(tu))*100 if tu>0 else 0
+            ev_d=(0.85-td-taker_fee_per_share(td))*100 if td>0 else 0
+            ok_u="✅" if tu<=ORACLE_TOKEN_MAX and ev_u>=ORACLE_EDGE_MIN*100 else "❌"
+            ok_d="✅" if td<=ORACLE_TOKEN_MAX and ev_d>=ORACLE_EDGE_MIN*100 else "❌"
+            lines.append(f"*{label}* Oracle:`${oracle_px:,.2f}` Δ:`{delta:+.3f}%`\n"
+                        f"  🟢 UP:`{tu:.3f}$` EV:`{ev_u:.0f}%` {ok_u} | 🔴 DOWN:`{td:.3f}$` EV:`{ev_d:.0f}%` {ok_d}")
+        except: lines.append(f"{label}: ⚠️ erreur")
+    lines.append(f"\n🎯 Token≤`{ORACLE_TOKEN_MAX}$` | EV≥`{int(ORACLE_EDGE_MIN*100)}%`")
+    try: await update.message.reply_text("\n".join(lines),parse_mode="Markdown")
+    except: await update.message.reply_text("\n".join(lines).replace("*","").replace("`",""))
+
 
 async def cmd_score(update,context):
     if not auth(update): return
@@ -3884,12 +3917,18 @@ async def cmd_passes(update,context):
     if not auth(update): return
     passes=st.pass_reasons[-12:][::-1]
     if not passes: await update.message.reply_text("✅ Aucun PASS."); return
-    lines=["🚫 *DERNIERS PASS*"]
+    lines=["🚫 *DERNIERS PASS — BTC/ETH/SOL*"]
     for p in passes:
         res=p.get("resolved")
         emoji="✅" if res=="WIN" else "❌" if res=="LOSS" else "⏳" if p.get("dir") else "—"
         d=f"`{p.get('dir')}` " if p.get("dir") else ""
-        lines.append(f"`{datetime.fromtimestamp(p['ts']).strftime('%H:%M')}` {emoji} {d}{p['reason']}")
+        reason=p.get("reason","?")
+        reason=(reason.replace("Oracle lag: token","token").replace("Oracle lag: ","")
+            .replace("Oracle: ","").replace("(trop incertain)","→ skip: trop incertain")
+            .replace("(déjà pricé)","→ skip: marché a déjà pricé")
+            .replace("(chute brutale)","→ skip: chute brutale en 3s")
+            .replace("(chute brutale BTC)","→ skip: chute brutale en 3s"))
+        lines.append(f"`{datetime.fromtimestamp(p['ts']).strftime('%H:%M')}` {emoji} {d}{reason}")
     resolved=[p for p in st.pass_reasons if p.get("resolved")]
     if resolved:
         w=sum(1 for p in resolved if p["resolved"]=="WIN")
@@ -3897,7 +3936,7 @@ async def cmd_passes(update,context):
         lines.append(f"\n📊 *WR théorique des skips:* `{twr:.0f}%` ({w}/{len(resolved)})")
         if len(resolved)>=AUTOTUNE_MIN_SKIPS and twr>=58:
             lines.append(f"_⚠️ {len(resolved)} skips résolus, WR {twr:.0f}% >58% — filtres trop stricts._")
-            lines.append("_💡 `/turbo` pour tester des seuils -2 sur 15min, ou on baisse en dur._")
+            lines.append("_💡 Tape `/learn` pour analyser._")
         elif twr>=58: lines.append("_⚠️ >58% mais peu de données — continue._")
         elif twr<=52: lines.append("_✅ ~50% — les filtres ne coûtent rien, le marché était plat_")
         else: lines.append("_➖ Zone grise — encore besoin de données_")
@@ -4116,59 +4155,63 @@ async def cmd_backtest(update,context):
     await update.message.reply_text(res, parse_mode="Markdown")
 
 async def cmd_oracle(update,context):
-    """✅ v10.33 — Oracle complet: gap spot↔oracle + signal réel + recommandation trade"""
     if not auth(update): return
     now = time.time()
-    oracle = st.oracle_price; slot_open = st.oracle_slot_open
-    spot = consensus_price()
-    oracle_delta = (oracle - slot_open) / slot_open * 100 if slot_open > 0 else 0
-    spot_gap = (spot - oracle) / oracle * 100 if oracle > 0 else 0
-    tick_age = int(now - st.oracle_ts) if st.oracle_ts > 0 else 999
-    slot_remaining = 300 - (now % 300)
-    in_window = ORACLE_WINDOW_END <= slot_remaining <= ORACLE_WINDOW_START
-    # Sources actives
-    srcs = []
-    if st.ws_price > 0: srcs.append(f"Binance✅")
-    if hasattr(st,'cb_price') and st.cb_price > 0 and now - st.cb_ts < EXCH_STALE_S: srcs.append("Coinbase✅")
+    oracle=st.oracle_price; slot_open=st.oracle_slot_open
+    spot=consensus_price()
+    oracle_delta=(oracle-slot_open)/slot_open*100 if slot_open>0 else 0
+    spot_gap=(spot-oracle)/oracle*100 if oracle>0 else 0
+    tick_age=int(now-st.oracle_ts) if st.oracle_ts>0 else 999
+    slot_remaining=300-(now%300)
+    in_window=ORACLE_WINDOW_END<=slot_remaining<=ORACLE_WINDOW_START
+    srcs=[]
+    if st.ws_price>0: srcs.append("Binance✅")
+    if hasattr(st,'cb_price') and st.cb_price>0 and now-st.cb_ts<30: srcs.append("Coinbase✅")
     else: srcs.append("Coinbase❌")
-    if hasattr(st,'kr_price') and st.kr_price > 0 and now - st.kr_ts < EXCH_STALE_S: srcs.append("Kraken✅")
+    if hasattr(st,'kr_price') and st.kr_price>0 and now-st.kr_ts<30: srcs.append("Kraken✅")
     else: srcs.append("Kraken❌")
-    # Signal dominant (même logique que job_oracle_lag)
-    gap_dir = ("UP" if spot_gap>0 else "DOWN") if abs(spot_gap) >= 0.01 else None
-    delta_dir = ("UP" if oracle_delta>0 else "DOWN") if abs(oracle_delta) >= ORACLE_ENTRY_DELTA else None
-    sig_dir = gap_dir or delta_dir
-    sig_type = ("gap spot↔oracle" if gap_dir else "delta slot open") if sig_dir else None
-    sig_val = spot_gap if gap_dir else oracle_delta
-    # Recommandation
-    if sig_dir:
-        if in_window and st.oracle_connected and tick_age <= ORACLE_MIN_FRESH_S:
-            # ✅ v11.3 — Ne pas dire "TRADAIT" sans vérifier le token
-            # Le job vérifie aussi: token 0.51-0.92$, EV≥8%, Fix#1/2/3
-            # Un delta fort (+0.10%+) → token souvent déjà >0.92$ = bloqué
-            if abs(oracle_delta) > 0.10:
-                rec = f"⚡ Signal *{sig_dir}* fort (Δ`{oracle_delta:+.3f}%`) T-`{int(slot_remaining)}s`\n_⚠️ Delta élevé → token probablement déjà pricé (>0.92$)_"
-            else:
-                rec = f"⚡ Signal *{sig_dir}* (gap`{spot_gap:+.3f}%` Δ`{oracle_delta:+.3f}%`) T-`{int(slot_remaining)}s`\n_Le job vérifie token + EV + filtres avant de trader_"
-        elif in_window:
-            rec = f"⚠️ Signal *{sig_dir}* mais oracle périmé (`{tick_age}s`)"
-        else:
-            rec = f"⏳ Signal *{sig_dir}* ({sig_type} `{sig_val:+.3f}%`) — hors fenêtre (T-`{int(slot_remaining)}s`)"
+    if hasattr(st,'bs_price') and st.bs_price>0 and now-st.bs_ts<30: srcs.append("Bitstamp✅")
+    else: srcs.append("Bitstamp❌")
+    # Signal BTC
+    gap_dir=("UP" if spot_gap>0 else "DOWN") if abs(spot_gap)>=0.01 else None
+    delta_dir=("UP" if oracle_delta>0 else "DOWN") if abs(oracle_delta)>=ORACLE_ENTRY_DELTA else None
+    sig_dir=gap_dir or delta_dir
+    if sig_dir and in_window and st.oracle_connected and tick_age<=30:
+        btc_rec=f"⚡ Signal BTC *{sig_dir}* T-`{int(slot_remaining)}s`"
+    elif sig_dir:
+        btc_rec=f"⏳ Signal BTC *{sig_dir}* — hors fenêtre (T-`{int(slot_remaining)}s`)"
     else:
-        rec = f"📡 Pas de lag exploitable (gap:`{spot_gap:+.3f}%` delta:`{oracle_delta:+.3f}%`)"
-    # Tie bias
-    tie_note = "\n💡 _Quasi-plat → tie bias UP (smart contract: end≥start=UP gagne)_" if abs(oracle_delta)<0.01 and abs(spot_gap)<0.01 else ""
+        btc_rec=f"📡 Pas de signal BTC (gap:`{spot_gap:+.3f}%` delta:`{oracle_delta:+.3f}%`)"
+    # ETH oracle
+    eth_o=st.eth_oracle_price; eth_so=st.eth_oracle_slot_open
+    eth_d=(eth_o-eth_so)/eth_so*100 if eth_so>0 else 0
+    eth_g=(st.eth_price-eth_o)/eth_o*100 if eth_o>0 and st.eth_price>0 else 0
+    eth_ok=eth_o>0 and now-st.eth_oracle_ts<15
+    eth_sig="UP" if eth_d>ORACLE_ENTRY_DELTA else ("DOWN" if eth_d<-ORACLE_ENTRY_DELTA else None)
+    eth_rec=f"⚡ Signal ETH *{eth_sig}* T-`{int(slot_remaining)}s`" if eth_sig and eth_ok else "📡 Pas de signal ETH"
+    # SOL oracle
+    sol_o=st.sol_oracle_price; sol_so=st.sol_oracle_slot_open
+    sol_d=(sol_o-sol_so)/sol_so*100 if sol_so>0 else 0
+    sol_g=(st.sol_price-sol_o)/sol_o*100 if sol_o>0 and st.sol_price>0 else 0
+    sol_ok=sol_o>0 and now-st.sol_oracle_ts<15
+    sol_sig="UP" if sol_d>ORACLE_ENTRY_DELTA else ("DOWN" if sol_d<-ORACLE_ENTRY_DELTA else None)
+    sol_rec=f"⚡ Signal SOL *{sol_sig}* T-`{int(slot_remaining)}s`" if sol_sig and sol_ok else "📡 Pas de signal SOL"
     try:
         await update.message.reply_text(
-            f"🔗 *ORACLE CHAINLINK*\n━━━━━━━━━━━━━━\n"
-            f"Connecté:{'✅' if st.oracle_connected else '❌'} | Tick:`{tick_age}s`\n"
-            f"Oracle BTC:`${oracle:,.2f}`\n"
-            f"Slot open:`${slot_open:,.2f}` (Δ oracle:`{oracle_delta:+.3f}%`)\n"
-            f"Spot consensus:`${spot:,.2f}` (Δ spot↔oracle:`{spot_gap:+.3f}%`){tie_note}\n\n"
-            f"{rec}\n\n"
+            f"🔗 *ORACLE CHAINLINK — BTC/ETH/SOL*\n━━━━━━━━━━━━━━\n"
+            f"₿ BTC | Oracle:`${oracle:,.2f}` | Tick:`{tick_age}s` {'✅' if st.oracle_connected else '❌'}\n"
+            f"  Δslot:`{oracle_delta:+.3f}%` | Gap spot↔oracle:`{spot_gap:+.3f}%`\n"
+            f"  Spot:`${spot:,.2f}`\n  → {btc_rec}\n\n"
+            f"Ξ ETH | Oracle:`${eth_o:,.2f}` {'✅' if eth_ok else '❌'}\n"
+            f"  Δslot:`{eth_d:+.3f}%` | Gap:`{eth_g:+.3f}%` | ETH:`${st.eth_price:,.2f}`\n"
+            f"  → {eth_rec}\n\n"
+            f"◎ SOL | Oracle:`${sol_o:,.2f}` {'✅' if sol_ok else '❌'}\n"
+            f"  Δslot:`{sol_d:+.3f}%` | Gap:`{sol_g:+.3f}%` | SOL:`${st.sol_price:,.2f}`\n"
+            f"  → {sol_rec}\n\n"
             f"WS: {' | '.join(srcs)}",
             parse_mode="Markdown")
     except Exception as e:
-        await update.message.reply_text(f"❌ Erreur oracle: {str(e)[:100]}")
+        await update.message.reply_text(f"Erreur oracle: {e}")
 
 
 async def cmd_calib(update,context):
