@@ -3171,37 +3171,46 @@ async def job_pattern_memory(context):
 
 
 async def job_haiku_analysis(context):
-    """
-    ✅ v10.37 — Point 3: Claude Haiku analyse les stats toutes les 2h.
-    Envoie les 20 derniers patterns + résultats → Haiku identifie des patterns
-    que le code n'a pas vus. Coût: ~0.005$ par analyse. Résultat dans /learn.
-    """
+    """v12.4 — Haiku analyse les patterns BTC/ETH/SOL toutes les 2h."""
     if not ANTHROPIC_KEY: return
     now = time.time()
-    if now - st.last_haiku_ts < 7200: return  # max 1 analyse / 2h
+    if now - st.last_haiku_ts < 7200: return
     resolved = [p for p in st.oracle_patterns if p.get("result") in ("WIN","LOSS")]
     if len(resolved) < 15: return
 
-    sample = resolved[-30:]
+    versioned = [p for p in resolved if p.get("v") == BOT_VERSION]
+    sample = versioned[-30:] if len(versioned) >= 10 else resolved[-30:]
+    version_note = f"v{BOT_VERSION}: {len(versioned)} patterns" if versioned else "mix versions"
+
+    # Stats par asset
+    btc_p = [p for p in sample if p.get("asset","BTC")=="BTC"]
+    eth_p = [p for p in sample if p.get("asset")=="ETH"]
+    sol_p = [p for p in sample if p.get("asset")=="SOL"]
+    asset_note = f"BTC:{len(btc_p)} ETH:{len(eth_p)} SOL:{len(sol_p)}"
+
     summary = []
     for p in sample:
-        summary.append(f"gap={p.get('gap',0):+.3f}% delta={p.get('delta',0):+.3f}% "
-                       f"ret3s={p.get('ret3s',0):+.3f}% votes={p.get('votes',0)}/3 "
+        asset = p.get("asset","BTC")
+        summary.append(f"[{asset}] gap={p.get('gap',0):+.3f}% delta={p.get('delta',0):+.3f}% "
+                       f"ret3s={p.get('ret3s',0):+.3f}% votes={p.get('votes',0)}/5 "
                        f"filter={p.get('filter','?')} → {p['result']}")
 
-    prompt = f"""Tu analyses les skips d'un bot de trading Polymarket BTC 5min.
-Ces trades ont été BLOQUÉS par les filtres mais voici le résultat théorique.
-Trouve des patterns qui pourraient améliorer les seuils de filtrage.
-Réponds en 3 bullet points MAX, très concis, en français.
+    prompt = f"""Tu analyses les skips d'un bot v{BOT_VERSION} Polymarket MULTI-ASSET 5min ({version_note}).
+Le bot trade BTC, ETH et SOL simultanément avec oracle lag Chainlink.
+Répartition: {asset_note} patterns
+
+Paramètres:
+- BTC: gap≥0.025% | T-25s→T-5s
+- ETH: gap≥0.030% | T-25s→T-5s
+- SOL: gap≥0.030% | T-20s→T-5s
+- Commun: delta≥{ORACLE_ENTRY_DELTA:.3f}% | token {ORACLE_TOKEN_MIN:.2f}$-{ORACLE_TOKEN_MAX:.2f}$ | EV≥{ORACLE_EDGE_MIN*100:.0f}%
 
 Données ({len(sample)} skips résolus):
 {chr(10).join(summary)}
 
-Paramètres actuels: ret3s_seuil={ORACLE_GAP_CONFIRM_RET:.3f}% delta_contra={ORACLE_DELTA_CONTRA_MAX:.3f}% gap_fort={ORACLE_GAP_MIN_STRONG:.3f}%
-Seuils actuels: gap_min={ORACLE_ENTRY_DELTA:.3f}% token_max={ORACLE_TOKEN_MAX:.2f}$
-
-Identifie uniquement les patterns statistiquement significatifs (≥5 trades similaires).
-Format: "• [OBSERVATION]: [SUGGESTION CONCRÈTE]" """
+Identifie uniquement patterns ≥5 trades similaires. Si spécifique à un asset, précise-le.
+Réponds en 3 bullet points MAX, très concis, en français.
+Format: "• [ASSET ou COMMUN] [OBSERVATION]: [SUGGESTION CONCRÈTE]" """
 
     try:
         async with aiohttp.ClientSession() as s:
@@ -3217,10 +3226,10 @@ Format: "• [OBSERVATION]: [SUGGESTION CONCRÈTE]" """
                     st.haiku_insights.append({"type":"haiku","ts":int(now),"insight":insight})
                     if len(st.haiku_insights)>20: st.haiku_insights=st.haiku_insights[-20:]
                     st.last_haiku_ts=now
-                    log.info(f"Haiku insight: {insight[:100]}")
+                    log.info(f"Haiku: {insight[:80]}")
                     await send(context.bot, f"🤖 *Haiku Analysis*\n{insight}")
     except Exception as e:
-        log.warning(f"Haiku analysis: {e}")
+        log.warning(f"Haiku: {e}")
 
 
 async def cmd_learn(update,context):
