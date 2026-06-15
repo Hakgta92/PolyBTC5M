@@ -3227,7 +3227,8 @@ async def cmd_learn(update, context):
         wr_24h = wins_24h/len(recent)*100 if recent else 0
         pnl_24h = sum(t.get("pnl",0) for t in recent)
         lines.append(f"\n💰 *Trades réels:* {len(real)} | WR:`{wr_r:.0f}%` | PnL:`{pnl_r:+.2f}$`")
-        lines.append(f"  Gain moy:`+{avg_win:.2f}$` | Perte moy:`{avg_loss:.2f}$` | R:R:`{abs(avg_win/avg_loss):.2f}`")
+        rr = abs(avg_win/avg_loss) if avg_loss != 0 else 0
+        lines.append(f"  Gain moy:`+{avg_win:.2f}$` | Perte moy:`{avg_loss:.2f}$` | R:R:`{rr:.2f}`")
         lines.append(f"  📅 24h: {len(recent)} trades | WR:`{wr_24h:.0f}%` | PnL:`{pnl_24h:+.2f}$`")
         # Tendance semaine vs hier
         ts_48h = now - 172800
