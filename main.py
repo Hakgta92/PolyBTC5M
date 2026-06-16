@@ -2939,8 +2939,14 @@ async def job_oracle_lag(context):
 
     # Filtre ret3s brutal
     if ret_3s < -0.055:
-        log_skip(f"BTC: ret3s {ret_3s:+.3f}%<-0.055% (chute brutale)", direction,
-                 features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":0,"filter":"ret3s_brutal","asset":"BTC"}); return
+        # ✅ v12.5 — ret3s signal: chute brutale + gap faible = correction sous-pricée par oracle
+        if spot_oracle_gap >= 0.005 and direction == "DOWN":
+            log.debug(f"BTC: ret3s signal DOWN {ret_3s:+.3f}% + gap {spot_oracle_gap:+.3f}% → override")
+            # Forcer la direction DOWN et continuer le trade
+            direction = "DOWN"
+        else:
+            log_skip(f"BTC: ret3s {ret_3s:+.3f}%<-0.055% (chute brutale)", direction,
+                     features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":0,"filter":"ret3s_brutal","asset":"BTC"}); return
 
     if not direction:
         log_skip(f"BTC: Δ{oracle_delta:+.3f}% gap{spot_oracle_gap:+.3f}% (→ skip: delta et gap trop faibles)", None,
@@ -3392,7 +3398,8 @@ Format: "• [ASSET] [OBSERVATION]: [SUGGESTION avec chiffres]" """
             async with s.post(CLAUDE_API,
                 headers={"Content-Type":"application/json","x-api-key":ANTHROPIC_KEY,
                          "anthropic-version":"2023-06-01"},
-                json={"model":"claude-sonnet-4-6","max_tokens":500,
+                json={"model":"claude-sonnet-4-6","max_tokens":800,
+                      "system": "Tu es un expert en trading algorithmique quantitatif. Tu analyses des données de bot de trading sur marchés prédictifs Polymarket. Tes recommandations doivent être précises, chiffrées et actionnables. Tu connais les concepts: oracle lag, orderbook imbalance, kelly sizing, win rate, EV, R:R ratio.",
                       "messages":[{"role":"user","content":prompt}]},
                 timeout=aiohttp.ClientTimeout(total=30)) as r:
                 if r.status==200:
