@@ -61,7 +61,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "12.7"
+BOT_VERSION = "12.8"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -1325,10 +1325,11 @@ async def fetch_price():
         except: pass
     return st.price
 
-async def fetch_klines(interval,limit=60):
+async def fetch_klines(interval,limit=60,symbol="btcusdt"):
+    sym=symbol.upper()
     try:
         async with aiohttp.ClientSession() as s:
-            async with s.get(f"https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval={interval}&limit={limit}",
+            async with s.get(f"https://api.binance.com/api/v3/klines?symbol={sym}&interval={interval}&limit={limit}",
                              timeout=aiohttp.ClientTimeout(total=10)) as r:
                 if r.status==200:
                     data=await r.json()
@@ -1555,6 +1556,13 @@ class State:
         self.sol_oracle_slot_open=0.0; self.sol_oracle_slot_ts=0
         self.sol_last_trade_slot=0
         self.sol_ob_imbalance=0.0; self.sol_ob_ts=0.0; self.sol_ob_asset_id=""; self.sol_clob_ws_task=None
+        # ✅ v12.8 — XRP
+        self.xrp_price=0.0; self.xrp_ts=0; self.xrp_ws_task=None
+        self.xrp_ws_prices=deque()
+        self.xrp_oracle_price=0.0; self.xrp_oracle_ts=0.0
+        self.xrp_oracle_slot_open=0.0; self.xrp_oracle_slot_ts=0
+        self.xrp_last_trade_slot=0
+        self.xrp_ob_imbalance=0.0; self.xrp_ob_ts=0.0; self.xrp_ob_asset_id=""; self.xrp_clob_ws_task=None
         self.oracle_lag_signal=None  # {"bias","desc","div_pct"}
         # ✅ v10.23 — Calibration sigma
         self.calib_factor=1.0  # Multiplie VOL_SAFETY (1.0 = pas de correction)
@@ -1972,6 +1980,28 @@ async def ws_sol_loop():
         except Exception as e: log.warning(f"WS SOL: {e}")
         await asyncio.sleep(5)
 
+async def ws_xrp_loop():
+    """v12.8 — Prix XRP temps réel Binance."""
+    url = "wss://stream.binance.com:9443/ws/xrpusdt@aggTrade"
+    while True:
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.ws_connect(url, heartbeat=20) as ws:
+                    log.info("✅ WS XRP Binance")
+                    async for msg in ws:
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            d = json.loads(msg.data)
+                            if "p" in d:
+                                p = float(d["p"]); now = time.time()
+                                st.xrp_price=p; st.xrp_ts=now
+                                st.xrp_ws_prices.append((now,p))
+                                while st.xrp_ws_prices and now-st.xrp_ws_prices[0][0]>120:
+                                    st.xrp_ws_prices.popleft()
+                        elif msg.type in (aiohttp.WSMsgType.CLOSED,aiohttp.WSMsgType.ERROR): break
+        except Exception as e: log.warning(f"WS XRP: {e}")
+        await asyncio.sleep(5)
+
+
 async def ws_oracle_eth_loop():
     pass  # v12.4 — géré par ws_oracle_loop unifié
 
@@ -2156,6 +2186,10 @@ async def ws_oracle_loop():
                                 st.sol_oracle_price=p; st.sol_oracle_ts=now
                                 if st.sol_oracle_slot_ts!=slot_start:
                                     st.sol_oracle_slot_ts=slot_start; st.sol_oracle_slot_open=p
+                            elif symbol == "xrp/usd" and p>0.01:
+                                st.xrp_oracle_price=p; st.xrp_oracle_ts=now
+                                if st.xrp_oracle_slot_ts!=slot_start:
+                                    st.xrp_oracle_slot_ts=slot_start; st.xrp_oracle_slot_open=p
                         elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                             break
         except Exception as e:
@@ -2180,6 +2214,8 @@ async def job_ws_watchdog_all(context):
         st.eth_ws_task = asyncio.create_task(ws_eth_loop())
     if not hasattr(st,"sol_ws_task") or not st.sol_ws_task or st.sol_ws_task.done():
         st.sol_ws_task = asyncio.create_task(ws_sol_loop())
+    if not hasattr(st,"xrp_ws_task") or not st.xrp_ws_task or st.xrp_ws_task.done():
+        st.xrp_ws_task = asyncio.create_task(ws_xrp_loop())
 
 def consensus_price():
     """✅ v10.23 — Prix médian des exchanges frais (<3s). Filtre un exchange qui lag/diverge."""
@@ -3066,7 +3102,7 @@ async def job_oracle_lag_asset(context, asset:str):
     now = time.time()
     cur_slot = int(now//300)*300
     slot_remaining = cur_slot+300-now
-    win_start = 15 if asset=="SOL" else 20  # v12.7: SOL T-15s, ETH T-20s
+    win_start = 15 if asset=="SOL" else (20 if asset in ("ETH","XRP") else 25)  # v12.8: XRP T-20s
     if slot_remaining > win_start or slot_remaining < 5: return
     if asset=="ETH":
         spot=st.eth_price; spot_ts=st.eth_ts; oracle=st.eth_oracle_price
@@ -3078,6 +3114,11 @@ async def job_oracle_lag_asset(context, asset:str):
         oracle_ts=st.sol_oracle_ts; slot_open=st.sol_oracle_slot_open
         last_ts=st.sol_last_trade_slot; slug_prefix="sol-updown-5m"
         symbol="SOL"; emoji="◎"; ws_prices=st.sol_ws_prices
+    elif asset=="XRP":
+        spot=st.xrp_price; spot_ts=st.xrp_ts; oracle=st.xrp_oracle_price
+        oracle_ts=st.xrp_oracle_ts; slot_open=st.xrp_oracle_slot_open
+        last_ts=st.xrp_last_trade_slot; slug_prefix="xrp-updown-5m"
+        symbol="XRP"; emoji="✕"; ws_prices=st.xrp_ws_prices
     else: return
     if spot<=0 or oracle<=0 or slot_open<=0:
         log_skip(f"{symbol}: données manquantes spot={spot:.2f} oracle={oracle:.2f}", None); return
@@ -3095,7 +3136,7 @@ async def job_oracle_lag_asset(context, asset:str):
     ret3s_override = False
     oracle_delta=(oracle-slot_open)/slot_open*100 if slot_open>0 else 0
     spot_oracle_gap=(spot-oracle)/oracle*100 if oracle>0 else 0
-    gap_min = 0.020  # v12.7: ETH et SOL gap min 0.020%
+    gap_min = 0.025 if asset=="XRP" else 0.020  # v12.8: XRP 0.025%, ETH/SOL 0.020%
     gap_dir=("UP" if spot_oracle_gap>0 else "DOWN") if abs(spot_oracle_gap)>=gap_min else None
     delta_dir=("UP" if oracle_delta>0 else "DOWN") if abs(oracle_delta)>=ORACLE_ENTRY_DELTA else None
     primary_signal="gap" if gap_dir else "delta"
@@ -3142,18 +3183,32 @@ async def job_oracle_lag_asset(context, asset:str):
             if abs(mv)>=0.030:
                 rv=1 if mv>0 else -1
                 btc_cascade_vote=rv if (direction=="UP" and rv==1)or(direction=="DOWN" and rv==-1) else -rv
-    # ✅ v12.7 — Décorrelation BTC/ETH: BTC chute + ETH stable = signal UP ETH
-    if asset=="ETH" and len(btc_pts)>=2:
-        btc15=[p for t,p in btc_pts if now-t<=15]
-        if len(btc15)>=2 and btc15[0]>0:
-            btc_move15=(btc15[-1]-btc15[0])/btc15[0]*100
-            eth_pts=list(st.eth_ws_prices)
-            eth15=[p for t,p in eth_pts if now-t<=15]
-            if len(eth15)>=2 and eth15[0]>0:
-                eth_move15=(eth15[-1]-eth15[0])/eth15[0]*100
-                if btc_move15 < -0.020 and eth_move15 > -0.005 and direction=="UP":
-                    btc_cascade_vote = max(btc_cascade_vote, 1)
-                    log.debug(f"ETH décorrelation: BTC {btc_move15:+.3f}% ETH {eth_move15:+.3f}% → UP vote")
+    # ✅ v12.7 — Corrélation inverse BTC/ETH+SOL (SMT divergence)
+    # Sources: sharpe.ai (corr 0.9), ICT SMT technique, mean reversion pairs trading
+    # Principe: quand BTC et ETH/SOL divergent sur 15s → le laggard va rattraper
+    alt_pts = list(st.eth_ws_prices if asset=="ETH" else st.sol_ws_prices)
+    btc15 = [p for t,p in btc_pts if now-t<=15]
+    alt15 = [p for t,p in alt_pts if now-t<=15]
+    if len(btc15)>=3 and len(alt15)>=3 and btc15[0]>0 and alt15[0]>0:
+        btc_move15 = (btc15[-1]-btc15[0])/btc15[0]*100
+        alt_move15 = (alt15[-1]-alt15[0])/alt15[0]*100
+        divergence = btc_move15 - alt_move15  # BTC - ETH/SOL
+        # Cas 1: BTC monte fort, ETH/SOL reste stable → ETH/SOL va rattraper UP
+        if divergence >= 0.025 and direction=="UP":
+            btc_cascade_vote = max(btc_cascade_vote, 1)
+            log.debug(f"{asset} SMT: BTC {btc_move15:+.3f}% {asset} {alt_move15:+.3f}% div={divergence:+.3f}% → UP")
+        # Cas 2: BTC chute fort, ETH/SOL reste stable → ETH/SOL va suivre DOWN
+        elif divergence <= -0.025 and direction=="DOWN":
+            btc_cascade_vote = min(btc_cascade_vote, -1)
+            log.debug(f"{asset} SMT: BTC {btc_move15:+.3f}% {asset} {alt_move15:+.3f}% div={divergence:+.3f}% → DOWN")
+        # Cas 3: ETH/SOL monte mais BTC reste stable → ETH/SOL va mean-revert DOWN
+        elif divergence <= -0.025 and direction=="UP":
+            btc_cascade_vote = min(btc_cascade_vote, -1)
+            log.debug(f"{asset} SMT contra: {asset} surperform BTC → mean revert DOWN")
+        # Cas 4: ETH/SOL chute mais BTC stable → ETH/SOL va rebondir UP
+        elif divergence >= 0.025 and direction=="DOWN":
+            btc_cascade_vote = max(btc_cascade_vote, 1)
+            log.debug(f"{asset} SMT contra: {asset} underperform BTC → rebond UP")
     dir_votes=sum([
         1 if direction=="UP" and oracle_delta>0 else (-1 if direction=="DOWN" and oracle_delta<0 else 0),
         1 if direction=="UP" and spot_oracle_gap>0 else (-1 if direction=="DOWN" and spot_oracle_gap<0 else 0),
@@ -3204,6 +3259,7 @@ async def job_oracle_lag_asset(context, asset:str):
     if not ok: return
     if asset=="ETH": st.eth_last_trade_slot=cur_slot
     elif asset=="SOL": st.sol_last_trade_slot=cur_slot
+    elif asset=="XRP": st.xrp_last_trade_slot=cur_slot
     mode="💰 RÉEL" if not st.paper_mode else "📄 paper"
     entry_tp=st.entry_token_price if not st.paper_mode else token_price
     await send(context.bot,
@@ -3220,6 +3276,11 @@ async def job_oracle_lag_eth(context):
 
 async def job_oracle_lag_sol(context):
     await job_oracle_lag_asset(context,"SOL")
+
+
+async def job_oracle_lag_xrp(context):
+    """v12.8 — Oracle lag XRP (même logique ETH/SOL)."""
+    await job_oracle_lag_asset(context, "XRP")
 
 
 async def job_auto_calibrate(context):
@@ -3415,9 +3476,10 @@ Il achète le token UP ou DOWN avant que le marché reprices l'oracle.
 
 PARAMÈTRES ACTUELS:
 - BTC: gap≥0.025% | T-25s→T-5s
-- ETH: gap≥0.025% | T-25s→T-5s  
-- SOL: gap≥0.030% | T-20s→T-5s
-- Commun: delta≥0.020% | token 0.51$-0.75$ | EV≥15%
+- ETH: gap≥0.020% | T-20s→T-5s
+- SOL: gap≥0.020% | T-15s→T-5s
+- XRP: gap≥0.025% | T-20s→T-5s
+- Commun: delta≥0.020% | token 0.51$-0.80$ | EV≥15% | votes≥2
 - Filtres actifs: ret3s_brutal(<-0.055%) | delta_neg | gap_neg | tokenmax | tokenmin | ev
 {trade_summary}
 
@@ -3484,7 +3546,7 @@ async def cmd_learn(update,context):
     lines.append(f"📐 *Seuils actuels:*")
     lines.append(f"  delta≥`{ORACLE_ENTRY_DELTA:.3f}%` | gap BTC≥`0.025%` | gap ETH/SOL≥`0.030%`")
     lines.append(f"  token:`{ORACLE_TOKEN_MIN:.2f}$`-`{ORACLE_TOKEN_MAX:.2f}$` | EV≥`{ORACLE_EDGE_MIN*100:.0f}%` | votes≥2")
-    lines.append(f"  BTC: T-25s→T-5s | ETH: T-25s→T-5s | SOL: T-20s→T-5s")
+    lines.append(f"  BTC: T-25s→T-5s | ETH: T-20s→T-5s | SOL: T-15s→T-5s | XRP: T-20s→T-5s")
 
     # ── Trades réels ──
     real=[t for t in merged_trades if not t.get("paper")]
@@ -3508,7 +3570,7 @@ async def cmd_learn(update,context):
             pnl_7j=sum(t.get("pnl",0) for t in week)
             lines.append(f"  📈 7j: {len(week)} trades | WR:`{wins_7j/len(week)*100:.0f}%` | PnL:`{pnl_7j:+.2f}$`")
         # Par asset
-        for asset_tag,emoji in [("BTC","₿"),("ETH","Ξ"),("SOL","◎")]:
+        for asset_tag,emoji in [("BTC","₿"),("ETH","Ξ"),("SOL","◎"),("XRP","✕")]:
             at=[t for t in real if t.get("asset","BTC")==asset_tag]
             if at:
                 w_at=sum(1 for t in at if t.get("result")=="WIN")
@@ -3550,7 +3612,7 @@ async def cmd_learn(update,context):
             e="✅" if wr<35 else ("⚠️" if wr>60 else "➖")
             lines.append(f"  {e}`{f}`: {wr:.0f}% ({v['w']}W/{v['l']}L)")
         # Par asset
-        for asset_tag,emoji in [("BTC","₿"),("ETH","Ξ"),("SOL","◎")]:
+        for asset_tag,emoji in [("BTC","₿"),("ETH","Ξ"),("SOL","◎"),("XRP","✕")]:
             ap=[p for p in sample if p.get("asset","BTC")==asset_tag]
             if ap:
                 w_ap=sum(1 for p in ap if p["result"]=="WIN")
@@ -3630,6 +3692,7 @@ async def cmd_run(update,context):
     context.job_queue.run_repeating(job_oracle_lag,interval=2,first=16)
     context.job_queue.run_repeating(job_oracle_lag_eth,interval=2,first=18)
     context.job_queue.run_repeating(job_oracle_lag_sol,interval=2,first=20)
+    context.job_queue.run_repeating(job_oracle_lag_xrp,interval=2,first=22)
     context.job_queue.run_repeating(job_auto_calibrate,interval=7200,first=300)  # ✅ v10.37 seuils auto
     context.job_queue.run_repeating(job_pattern_memory,interval=3600,first=600)  # ✅ v10.37 mémoire patterns
     context.job_queue.run_repeating(job_haiku_analysis,interval=7200,first=900)  # ✅ v10.37 Haiku insights
@@ -3650,8 +3713,8 @@ async def cmd_run(update,context):
     await update.message.reply_text(
         f"🚀 *Bot v{BOT_VERSION} démarré !*\nMode:*{'📄 PAPER' if st.paper_mode else '💰 RÉEL'}*\n"
         f"Session:`{sess['session']}` | Seuils: score≥`{min_score}` mom≥`{min_mom}`\n"
-        f"⚡ BTC T-25→T-5s | ETH T-25→T-5s | SOL T-20→T-5s\n"
-        f"  gap≥2.5/3bps | delta≥{int(ORACLE_ENTRY_DELTA*10000)}bps | Token≤{ORACLE_TOKEN_MAX}$ | EV≥{int(ORACLE_EDGE_MIN*100)}%\n"
+        f"⚡ BTC T-25→T-5s | ETH T-20→T-5s | SOL T-15→T-5s | XRP T-20→T-5s\n"
+        f"  gap BTC/XRP≥2.5bps | ETH/SOL≥2.0bps | delta≥{int(ORACLE_ENTRY_DELTA*10000)}bps | Token≤{ORACLE_TOKEN_MAX}$ | EV≥{int(ORACLE_EDGE_MIN*100)}%\n"
         f"BR:`{st.bankroll:.2f}$` | ROI:`{roi()}`\n"
         f"📊 `{ob_txt}` | 💸 `{liq_txt}`\n"
         f"Récap auto: 22h Paris 🕙",
@@ -3827,11 +3890,12 @@ async def cmd_market(update,context):
     if not auth(update): return
     await update.message.reply_text("⏳ Recherche marchés BTC/ETH/SOL...")
     now_ts=int(time.time()); cur_slot=int(now_ts//300)*300; slot_rem=cur_slot+300-now_ts
-    lines=[f"🎯 *MARCHÉS ACTIFS — BTC/ETH/SOL*\n━━━━━━━━━━━━━━\n⏰ T-`{int(slot_rem)}s` avant résolution\n"]
+    lines=[f"🎯 *MARCHÉS ACTIFS — BTC/ETH/SOL/XRP*\n━━━━━━━━━━━━━━\n⏰ T-`{int(slot_rem)}s` avant résolution\n"]
     for label,prefix,oracle_px,slot_open in [
         ("₿ BTC","btc-updown-5m",st.oracle_price,st.oracle_slot_open),
         ("Ξ ETH","eth-updown-5m",st.eth_oracle_price,st.eth_oracle_slot_open),
         ("◎ SOL","sol-updown-5m",st.sol_oracle_price,st.sol_oracle_slot_open),
+        ("✕ XRP","xrp-updown-5m",st.xrp_oracle_price,st.xrp_oracle_slot_open),
     ]:
         try:
             market=await poly.get_market_by_slug(f"{prefix}-{cur_slot}")
@@ -4286,60 +4350,93 @@ async def cmd_turbo(update,context):
         f"Utilise `/score` pour voir les signaux en temps réel",
         parse_mode="Markdown")
 
-async def run_backtest(days=2):
-    """
-    ✅ v10.23 — Backtest local sur les klines historiques Binance (gratuit).
-    Rejoue la logique fair-value sur chaque slot 5min passé et estime le WR.
-    Approximation: prix token modélisé depuis le delta (modèle piecewise observé).
-    """
-    klines = await fetch_klines("1m", min(1000, days*1440))
-    if len(klines) < 20: return "❌ Pas assez de données historiques."
-    def token_price_from_delta(delta_pct):
-        # ✅ v10.28 — Piecewise calé sur le nouveau range 0.55-0.75$
-        # Le token monte vers 1 à mesure que le delta confirme la direction
+async def run_backtest(days=2, asset="BTC"):
+    """v12.8 — Backtest oracle lag sur BTC/ETH/SOL/XRP via klines Binance."""
+    symbol_map = {"BTC":"btcusdt","ETH":"ethusdt","SOL":"solusdt","XRP":"xrpusdt"}
+    symbol = symbol_map.get(asset.upper(), "btcusdt")
+    klines = await fetch_klines("1m", min(1000, days*1440), symbol=symbol)
+    if len(klines) < 20: return f"❌ Pas assez de données {asset}."
+
+    # Modèle token piecewise calé sur observations réelles
+    gap_min = {"BTC":0.025,"ETH":0.020,"SOL":0.020,"XRP":0.025}.get(asset.upper(),0.025)
+    def token_from_delta(delta_pct):
         a=abs(delta_pct)
-        if a<0.005: return 0.50   # Indécis
-        if a<0.01:  return 0.55   # Légère direction
-        if a<0.02:  return 0.62   # Direction établie
-        if a<0.04:  return 0.68   # Direction claire → zone cible
-        if a<0.08:  return 0.73   # Direction forte → limite haute de notre zone
-        return 0.78               # Très fort → souvent déjà pricé
-    wins=losses=skipped=0; pnl=0.0
-    # Parcourt par fenêtres de 5 bougies 1min = 1 slot
+        if a<0.005: return 0.50
+        if a<0.01:  return 0.54
+        if a<0.02:  return 0.60
+        if a<0.04:  return 0.68
+        if a<0.07:  return 0.75
+        if a<0.12:  return 0.82
+        return 0.92
+
+    wins=losses=skipped=0; pnl=0.0; skip_reasons={}
+    mise = 3.50
+
     for i in range(5, len(klines)-1, 5):
         slot=klines[i-5:i]; nxt=klines[i] if i<len(klines) else None
         if not nxt: break
-        open_px=slot[0]["open"]; mid_px=slot[-1]["close"]
+        open_px=float(slot[0]["open"]); mid_px=float(slot[-1]["close"])
+        final_px=float(nxt["close"])
         if open_px<=0: continue
+
         delta=(mid_px-open_px)/open_px*100
-        if abs(delta)<0.01: skipped+=1; continue
+        # Filtre gap min
+        if abs(delta) < gap_min:
+            skip_reasons["gap_faible"]=skip_reasons.get("gap_faible",0)+1
+            skipped+=1; continue
+
         direction="UP" if delta>0 else "DOWN"
-        tok=token_price_from_delta(delta)
-        if tok<SNIPE_TOKEN_MIN or tok>SNIPE_TOKEN_MAX+0.05: skipped+=1; continue
+        tok=token_from_delta(delta)
+
+        # Filtres token
+        if tok > ORACLE_TOKEN_MAX:
+            skip_reasons["tokenmax"]=skip_reasons.get("tokenmax",0)+1
+            skipped+=1; continue
+        if tok < ORACLE_TOKEN_MIN:
+            skip_reasons["tokenmin"]=skip_reasons.get("tokenmin",0)+1
+            skipped+=1; continue
+
+        # EV
         fee=taker_fee_per_share(tok)
-        # proba "vraie" grossière: signe du delta tient à la résolution ?
-        final_px=nxt["close"]
-        won=(final_px>open_px)==(direction=="UP")
-        # EV filtre approximé
-        p_est=min(0.95, 0.5+abs(delta)*4)  # heuristique
-        if (p_est - tok - fee) < FAIR_EDGE_MIN: skipped+=1; continue
-        if won: wins+=1; pnl+=(1-tok-fee)
-        else: losses+=1; pnl-=tok
+        p_est=min(0.93, 0.80+abs(delta)*3.0)
+        ev=p_est-tok-fee
+        if ev < ORACLE_EDGE_MIN:
+            skip_reasons["ev"]=skip_reasons.get("ev",0)+1
+            skipped+=1; continue
+
+        # Résultat réel
+        won=(final_px>=open_px)==(direction=="UP")
+        payout=1/tok
+        if won: wins+=1; pnl+=mise*(payout-1)*0.93
+        else:   losses+=1; pnl-=mise
+
     total=wins+losses
-    wr_bt=wins/total*100 if total else 0
-    return (f"🧪 *BACKTEST {days}j* (approx)\n━━━━━━━━━━━━━━\n"
-            f"Trades simulés:`{total}` | Skips:`{skipped}`\n"
-            f"WR:`{wr_bt:.1f}%` | PnL/share:`{fmt(pnl)}`\n"
-            f"_Approximation piecewise — indicatif, pas une garantie_")
+    wr=wins/total*100 if total else 0
+    be=tok*100 if total else 0
+
+    # Top raisons de skip
+    top_skips="\n".join(f"  {k}: {v}" for k,v in sorted(skip_reasons.items(),key=lambda x:-x[1])[:4])
+    emoji = "✅" if wr>=65 else ("⚠️" if wr>=55 else "❌")
+
+    return (f"🧪 *BACKTEST {asset} {days}j*\n━━━━━━━━━━━━━━\n"
+            f"Slots analysés:`{total+skipped}` | Tradés:`{total}` | Skips:`{skipped}`\n"
+            f"{emoji} WR:`{wr:.1f}%` | PnL simulé:`{pnl:+.2f}$`\n"
+            f"Gain moy:`+{mise*(1/0.65-1)*0.93:.2f}$` | Perte moy:`-{mise:.2f}$`\n"
+            f"\n*Raisons skips:*\n{top_skips}\n"
+            f"\n_gap min {gap_min}% | Token {ORACLE_TOKEN_MIN:.2f}$-{ORACLE_TOKEN_MAX:.2f}$ | EV≥{ORACLE_EDGE_MIN*100:.0f}%_\n"
+            f"_Résolution: données Binance 1min — indicatif_")
 
 async def cmd_backtest(update,context):
     if not auth(update): return
-    days=2
+    days=2; asset="BTC"
     if context.args:
-        try: days=max(1,min(7,int(context.args[0])))
-        except: pass
-    await update.message.reply_text(f"⏳ Backtest {days}j en cours...")
-    res=await run_backtest(days)
+        for arg in context.args:
+            if arg.upper() in ("BTC","ETH","SOL","XRP"): asset=arg.upper()
+            else:
+                try: days=max(1,min(7,int(arg)))
+                except: pass
+    await update.message.reply_text(f"⏳ Backtest {asset} {days}j en cours...")
+    res=await run_backtest(days, asset)
     await update.message.reply_text(res, parse_mode="Markdown")
 
 async def cmd_oracle(update,context):
@@ -4384,9 +4481,16 @@ async def cmd_oracle(update,context):
     sol_ok=sol_o>0 and now-st.sol_oracle_ts<15
     sol_sig="UP" if sol_d>ORACLE_ENTRY_DELTA else ("DOWN" if sol_d<-ORACLE_ENTRY_DELTA else None)
     sol_rec=f"⚡ Signal SOL *{sol_sig}* T-`{int(slot_remaining)}s`" if sol_sig and sol_ok else "📡 Pas de signal SOL"
+    # XRP oracle
+    xrp_o=st.xrp_oracle_price; xrp_so=st.xrp_oracle_slot_open
+    xrp_d=(xrp_o-xrp_so)/xrp_so*100 if xrp_so>0 else 0
+    xrp_g=(st.xrp_price-xrp_o)/xrp_o*100 if xrp_o>0 and st.xrp_price>0 else 0
+    xrp_ok=xrp_o>0 and now-st.xrp_oracle_ts<15
+    xrp_sig="UP" if xrp_d>ORACLE_ENTRY_DELTA else ("DOWN" if xrp_d<-ORACLE_ENTRY_DELTA else None)
+    xrp_rec=f"⚡ Signal XRP *{xrp_sig}* T-`{int(slot_remaining)}s`" if xrp_sig and xrp_ok else "📡 Pas de signal XRP"
     try:
         await update.message.reply_text(
-            f"🔗 *ORACLE CHAINLINK — BTC/ETH/SOL*\n━━━━━━━━━━━━━━\n"
+            f"🔗 *ORACLE CHAINLINK — BTC/ETH/SOL/XRP*\n━━━━━━━━━━━━━━\n"
             f"₿ BTC | Oracle:`${oracle:,.2f}` | Tick:`{tick_age}s` {'✅' if st.oracle_connected else '❌'}\n"
             f"  Δslot:`{oracle_delta:+.3f}%` | Gap spot↔oracle:`{spot_gap:+.3f}%`\n"
             f"  Spot:`${spot:,.2f}`\n  → {btc_rec}\n\n"
