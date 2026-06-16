@@ -61,7 +61,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "12.4"
+BOT_VERSION = "12.5"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -1646,11 +1646,19 @@ def log_skip(reason, direction=None, features=None):
              "resolved": None}
     st.pass_reasons.append(entry)
     if features and direction:
+        # ✅ v12.5 — Détecter l'asset depuis reason ou features
+        asset_tag = features.get("asset", "BTC")
+        if not features.get("asset"):
+            if reason.startswith("ETH:") or "[ETH]" in reason[:6]: asset_tag = "ETH"
+            elif reason.startswith("SOL:") or "[SOL]" in reason[:6]: asset_tag = "SOL"
+            elif reason.startswith("Ξ") or "ETH:" in reason[:8]: asset_tag = "ETH"
+            elif reason.startswith("◎") or "SOL:" in reason[:8]: asset_tag = "SOL"
         st.oracle_patterns.append({**features, "direction": direction,
                                     "result": None, "ts": now, "slot_end": entry["slot_end"],
-                                    "open_px": entry["open_px"]})
-        if len(st.oracle_patterns) > 300:
-            st.oracle_patterns = st.oracle_patterns[-300:]
+                                    "open_px": entry["open_px"], "asset": asset_tag,
+                                    "v": BOT_VERSION})
+        if len(st.oracle_patterns) > 2000:
+            st.oracle_patterns = st.oracle_patterns[-2000:]
 
 def live_window_delta():
     """✅ v10.22 — Delta du slot en TEMPS RÉEL (WS prioritaire, fallback dernier tick)"""
@@ -3066,13 +3074,19 @@ async def job_oracle_lag_asset(context, asset:str):
     ret_3s=ret_a(3); ret_15s=ret_a(15)
     oracle_delta=(oracle-slot_open)/slot_open*100 if slot_open>0 else 0
     spot_oracle_gap=(spot-oracle)/oracle*100 if oracle>0 else 0
-    gap_dir=("UP" if spot_oracle_gap>0 else "DOWN") if abs(spot_oracle_gap)>=0.030 else None
+    gap_min = 0.025 if asset=="ETH" else 0.030  # v12.5: ETH plus stable
+    gap_dir=("UP" if spot_oracle_gap>0 else "DOWN") if abs(spot_oracle_gap)>=gap_min else None
     delta_dir=("UP" if oracle_delta>0 else "DOWN") if abs(oracle_delta)>=ORACLE_ENTRY_DELTA else None
     primary_signal="gap" if gap_dir else "delta"
     direction=gap_dir or delta_dir
     if ret_3s<-0.055:
         log_skip(f"{symbol}: ret3s {ret_3s:+.3f}% (chute brutale)",direction,
                  features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":0,"filter":"ret3s_brutal"})
+        return
+    # ✅ v12.5 — SOL filtre ATR: spike UP brutal = mean reversion imprévisible
+    if asset=="SOL" and ret_3s>0.04 and ret_15s>0.08:
+        log_skip(f"SOL: spike volatilité ret3s={ret_3s:+.3f}% ret15s={ret_15s:+.3f}% (→ skip: trop volatile)", direction,
+                 features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":0,"filter":"atr_spike"})
         return
     if not direction:
         log_skip(f"{symbol}: signaux trop faibles",None,
