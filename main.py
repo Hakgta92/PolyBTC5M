@@ -4151,40 +4151,55 @@ async def cmd_autotune(update,context):
         parse_mode="Markdown")
 
 async def cmd_passes(update,context):
-    """✅ v10.22 — Affiche les skips AVEC leur résultat théorique + WR des refus"""
+    """v12.8 — Affiche les skips avec pagination. /passes 2 = page 2"""
     if not auth(update): return
-    passes=sorted(st.pass_reasons[-50:], key=lambda x: x.get("ts",0))[-12:][::-1]
-    if not passes: await update.message.reply_text("✅ Aucun PASS."); return
-    lines=["🚫 *DERNIERS PASS — BTC/ETH/SOL*"]
-    for p in passes:
-        res=p.get("resolved")
-        emoji="✅" if res=="WIN" else "❌" if res=="LOSS" else "⏳" if p.get("dir") else "—"
-        d=f"`{p.get('dir')}` " if p.get("dir") else ""
-        reason=p.get("reason","?")
-        reason=(reason.replace("Oracle lag: token","token").replace("Oracle lag: ","")
-            .replace("Oracle: ","").replace("(trop incertain)","→ skip: trop incertain")
-            .replace("(déjà pricé)","→ skip: marché a déjà pricé")
-            .replace("(chute brutale)","→ skip: chute brutale en 3s")
-            .replace("(chute brutale BTC)","→ skip: chute brutale en 3s"))
-        lines.append(f"`{datetime.fromtimestamp(p['ts']).strftime('%H:%M')}` {emoji} {d}{reason}")
-    resolved=[p for p in st.pass_reasons if p.get("resolved")]
-    if resolved:
-        w=sum(1 for p in resolved if p["resolved"]=="WIN")
-        twr=w/len(resolved)*100
-        lines.append(f"\n📊 *WR théorique des skips:* `{twr:.0f}%` ({w}/{len(resolved)})")
-        if len(resolved)>=AUTOTUNE_MIN_SKIPS and twr>=58:
-            lines.append(f"_⚠️ {len(resolved)} skips résolus, WR {twr:.0f}% >58% — filtres trop stricts._")
-            lines.append("_💡 Tape `/learn` pour analyser._")
-        elif twr>=58: lines.append("_⚠️ >58% mais peu de données — continue._")
-        elif twr<=52: lines.append("_✅ ~50% — les filtres ne coûtent rien, le marché était plat_")
-        else: lines.append("_➖ Zone grise — encore besoin de données_")
-    try:
-        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-    except Exception as e:
-        log.warning(f"cmd_passes markdown: {e}")
-        plain = "\n".join(lines).replace("*","").replace("`","").replace("_","")
-        try: await update.message.reply_text(plain)
+    PAGE_SIZE = 12
+    page = 1
+    if context.args:
+        try: page = max(1, int(context.args[0]))
         except: pass
+
+    all_passes = sorted(st.pass_reasons, key=lambda x: x.get("ts",0), reverse=True)
+    total = len(all_passes)
+    total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+    page = min(page, total_pages)
+    start = (page-1)*PAGE_SIZE
+    passes = all_passes[start:start+PAGE_SIZE]
+
+    if not passes:
+        await update.message.reply_text("✅ Aucun PASS."); return
+
+    from datetime import datetime
+    lines=[f"🚫 *DERNIERS PASS — BTC/ETH/SOL/XRP* (page {page}/{total_pages})\n━━━━━━━━━━━━━━"]
+    for p in passes:
+        ts=p.get("ts",0); reason=p.get("reason","?"); result=p.get("result"); direction=p.get("dir")
+        t=datetime.fromtimestamp(ts).strftime("%H:%M") if ts else "??"
+        reason_clean=reason.replace("**","").replace("__","")
+        if result=="WIN": emoji="✅"
+        elif result=="LOSS": emoji="❌"
+        else: emoji="⏳"
+        dir_str=f" {direction}" if direction else " —"
+        lines.append(f"{t}{dir_str} {emoji} {reason_clean[:80]}")
+
+    # Stats WR
+    resolved=[p for p in all_passes if p.get("result") in ("WIN","LOSS")]
+    if resolved:
+        wins=sum(1 for p in resolved if p["result"]=="WIN")
+        wr=wins/len(resolved)*100
+        if wr>58: status=f"⚠️ {len(resolved)} skips résolus, WR {wr:.0f}% >58% — filtres trop stricts."
+        elif wr<40: status=f"✅ ~50% — les filtres ne coûtent rien, le marché était plat"
+        else: status=f"➖ Zone grise — encore besoin de données"
+        lines.append(f"\n📊 WR théorique des skips: {wr:.0f}% ({wins}/{len(resolved)})")
+        lines.append(status)
+
+    if total_pages > 1:
+        lines.append(f"\n📄 Page {page}/{total_pages} | `/passes {page+1}` pour la suivante" if page < total_pages else f"\n📄 Page {page}/{total_pages} | `/passes 1` pour le début")
+
+    try: await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    except:
+        clean=[l.replace("*","").replace("`","") for l in lines]
+        await update.message.reply_text("\n".join(clean))
+
 
 async def cmd_fear(update,context):
     if not auth(update): return
