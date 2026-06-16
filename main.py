@@ -2939,11 +2939,11 @@ async def job_oracle_lag(context):
 
     # Filtre ret3s brutal
     if ret_3s < -0.055:
-        # ✅ v12.5 — ret3s signal: chute brutale + gap faible = correction sous-pricée par oracle
-        if spot_oracle_gap >= 0.005 and direction == "DOWN":
-            log.debug(f"BTC: ret3s signal DOWN {ret_3s:+.3f}% + gap {spot_oracle_gap:+.3f}% → override")
-            # Forcer la direction DOWN et continuer le trade
-            direction = "DOWN"
+        # ✅ v12.6 — ret3s signal: BTC chute fort + gap positif = oracle pas rattrapé → trade DOWN
+        # Le gap est positif car le spot chute MAIS l'oracle n'a pas encore suivi
+        if spot_oracle_gap >= 0.005:
+            direction = "DOWN"  # Forcer DOWN — l'oracle va rattraper la chute
+            log.info(f"BTC: ret3s signal DOWN activé {ret_3s:+.3f}% gap={spot_oracle_gap:+.3f}%")
         else:
             log_skip(f"BTC: ret3s {ret_3s:+.3f}%<-0.055% (chute brutale)", direction,
                      features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":0,"filter":"ret3s_brutal","asset":"BTC"}); return
