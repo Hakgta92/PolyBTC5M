@@ -1651,6 +1651,12 @@ def log_skip(reason, direction=None, features=None):
     entry = {"ts": now, "reason": reason, "dir": direction,
              "slot_end": (now // 300) * 300 + 300,
              "open_px": st.slot_open_price if st.slot_open_price > 0 else st.price,
+             "asset_open": {
+                 "BTC": st.slot_open_price if st.slot_open_price>0 else st.price,
+                 "ETH": st.eth_oracle_slot_open if st.eth_oracle_slot_open>0 else st.eth_price,
+                 "SOL": st.sol_oracle_slot_open if st.sol_oracle_slot_open>0 else st.sol_price,
+                 "XRP": st.xrp_oracle_slot_open if st.xrp_oracle_slot_open>0 else st.xrp_price,
+             },
              "resolved": None}
     st.pass_reasons.append(entry)
     if features and direction:
@@ -2344,9 +2350,18 @@ async def job_price(context):
         # ✅ v10.22 — Résolution THÉORIQUE des skips
         for pr in st.pass_reasons[-40:]:
             if (pr.get("resolved") is None and pr.get("slot_end",0)>0
-                and now>pr["slot_end"]+10 and pr.get("dir") in ("UP","DOWN")
-                and pr.get("open_px",0)>0):
-                won=(p>pr["open_px"])==(pr["dir"]=="UP")
+                and now>pr["slot_end"]+10 and pr.get("dir") in ("UP","DOWN")):
+                # Utiliser le bon prix selon l'asset
+                asset_tag="BTC"
+                reason=pr.get("reason","")
+                if reason.startswith("ETH:"): asset_tag="ETH"
+                elif reason.startswith("SOL:"): asset_tag="SOL"
+                elif reason.startswith("XRP:"): asset_tag="XRP"
+                asset_opens=pr.get("asset_open",{})
+                ref_px=asset_opens.get(asset_tag,0) or pr.get("open_px",0)
+                cur_px={"BTC":p,"ETH":st.eth_price,"SOL":st.sol_price,"XRP":st.xrp_price}.get(asset_tag,p)
+                if ref_px<=0 or cur_px<=0: continue
+                won=(cur_px>ref_px)==(pr["dir"]=="UP")
                 pr["resolved"]="WIN" if won else "LOSS"
         # ✅ v10.37 — Résolution des patterns oracle pour auto-calibration
         for pat in st.oracle_patterns[-100:]:
@@ -3283,6 +3298,51 @@ async def job_oracle_lag_xrp(context):
     await job_oracle_lag_asset(context, "XRP")
 
 
+async def job_resolve_passes(context):
+    """v12.8 — Résout les passes théoriques toutes les 30s pour BTC/ETH/SOL/XRP."""
+    now = time.time()
+    prices = {
+        "BTC": consensus_price() if consensus_price() > 0 else st.ws_price,
+        "ETH": st.eth_price,
+        "SOL": st.sol_price,
+        "XRP": st.xrp_price,
+    }
+    for pr in st.pass_reasons:
+        if pr.get("resolved") is not None: continue
+        if pr.get("slot_end",0) <= 0: continue
+        if now < pr["slot_end"] + 5: continue  # attendre 5s après fin du slot
+        if pr.get("dir") not in ("UP","DOWN"): continue
+
+        # Détecter l'asset
+        reason = pr.get("reason","")
+        asset = "BTC"
+        if reason.startswith("ETH:") or "[ETH]" in reason[:8]: asset = "ETH"
+        elif reason.startswith("SOL:") or "[SOL]" in reason[:8]: asset = "SOL"
+        elif reason.startswith("XRP:") or "[XRP]" in reason[:8]: asset = "XRP"
+
+        # Prix de référence et prix actuel
+        asset_opens = pr.get("asset_open", {})
+        ref_px = asset_opens.get(asset, 0) or pr.get("open_px", 0)
+        cur_px = prices.get(asset, 0)
+
+        if ref_px <= 0 or cur_px <= 0: continue
+        won = (cur_px > ref_px) == (pr["dir"] == "UP")
+        pr["resolved"] = "WIN" if won else "LOSS"
+
+    # Même chose pour oracle_patterns
+    for pat in st.oracle_patterns:
+        if pat.get("result") is not None: continue
+        if pat.get("slot_end",0) <= 0: continue
+        if now < pat["slot_end"] + 5: continue
+        if pat.get("direction") not in ("UP","DOWN"): continue
+        asset = pat.get("asset","BTC")
+        ref_px = pat.get("open_px",0)
+        cur_px = prices.get(asset, 0)
+        if ref_px <= 0 or cur_px <= 0: continue
+        won = (cur_px > ref_px) == (pat["direction"] == "UP")
+        pat["result"] = "WIN" if won else "LOSS"
+
+
 async def job_auto_calibrate(context):
     """
     ✅ v10.37 — Point 1: Auto-calibration des seuils toutes les 2h.
@@ -3693,6 +3753,7 @@ async def cmd_run(update,context):
     context.job_queue.run_repeating(job_oracle_lag_eth,interval=2,first=18)
     context.job_queue.run_repeating(job_oracle_lag_sol,interval=2,first=20)
     context.job_queue.run_repeating(job_oracle_lag_xrp,interval=2,first=22)
+    context.job_queue.run_repeating(job_resolve_passes,interval=30,first=35)
     context.job_queue.run_repeating(job_auto_calibrate,interval=7200,first=300)  # ✅ v10.37 seuils auto
     context.job_queue.run_repeating(job_pattern_memory,interval=3600,first=600)  # ✅ v10.37 mémoire patterns
     context.job_queue.run_repeating(job_haiku_analysis,interval=7200,first=900)  # ✅ v10.37 Haiku insights
