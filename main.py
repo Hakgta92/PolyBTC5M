@@ -139,7 +139,7 @@ KILL_SWITCH_LOSSES  = 5      # Pertes consécutives → arrêt total (au-delà d
 # L'orderbook Polymarket met 30-55s à suivre → fenêtre d'arb
 # Strategy: si oracle a bougé X% depuis slot open ET token gagnant encore pas cher → BUY
 ORACLE_ENTRY_DELTA  = 0.02  # v12.4  # ✅ v10.31 — baissé 0.05→0.03% (-0.049% bloqué mais ✅ dans passes)
-ORACLE_TOKEN_MAX    = 0.75  # v12.5 — élargi pour plus de trades  # ✅ v10.32 — breakeven exact @92%WR = token 0.92$ (EV>0 jusqu'à 0.92$)
+ORACLE_TOKEN_MAX    = 0.80  # v12.6 — élargi pour accumuler des données  # ✅ v10.32 — breakeven exact @92%WR = token 0.92$ (EV>0 jusqu'à 0.92$)
 ORACLE_TOKEN_MIN    = 0.51  # Token min (trop proche de 0.50$ = incertitude trop haute)
 ORACLE_EDGE_MIN     = 0.15  # v12.4  # EV minimum après frais (8%)
 ORACLE_WINDOW_START = 25    # v12.4    # Fenêtre normale: T-35s→T-6s (source: dev.to/fatherson)
@@ -3378,6 +3378,17 @@ Trades réels ({len(real_trades)} total | WR:{wr:.0f}% | PnL:{pnl:+.2f}$):
             f"ret3s={p.get('ret3s',0):+.3f}% votes={p.get('votes',0)}/5 "
             f"filter={p.get('filter','?')}{tok}{ev} → {p['result']}")
 
+    # ✅ v12.6 — Inclure les analyses précédentes dans le prompt
+    previous_insights = ""
+    if st.haiku_insights:
+        last_insights = st.haiku_insights[-3:]  # 3 dernières analyses
+        insights_text = []
+        for ins in last_insights:
+            import datetime as _dt
+            ts = _dt.datetime.fromtimestamp(ins.get("ts",0)).strftime("%d/%m %H:%M")
+            insights_text.append(f"[{ts}] {ins.get('insight','')[:300]}")
+        previous_insights = "\n\nTES ANALYSES PRÉCÉDENTES (pour cohérence et suivi):\n" + "\n---\n".join(insights_text)
+
     prompt = f"""Tu es un expert en trading algorithmique sur Polymarket (marchés prédiction crypto 5min).
 Analyse les skips d'un bot oracle lag v{BOT_VERSION} — {version_note}.
 Session actuelle: {session} | {btc_move}
@@ -3397,8 +3408,11 @@ STATS FILTRES ({filter_stats}):
 DONNÉES ({len(sample)} skips résolus — {asset_note}):
 {chr(10).join(summary)}
 
+{previous_insights}
+
 INSTRUCTIONS:
 - Identifie uniquement patterns ≥5 trades similaires (statistiquement significatifs)
+- Si une analyse précédente identifiait déjà un pattern, confirme ou infirme avec les nouvelles données
 - Si pattern spécifique à un asset, précise [BTC]/[ETH]/[SOL]
 - Si pattern commun aux 3, précise [COMMUN]
 - Évalue si un filtre est trop strict ou pas assez
