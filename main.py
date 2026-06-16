@@ -4183,9 +4183,9 @@ async def _show_passes(update, context, page=1):
         dir_str=f" {direction}" if direction else " —"
         lines.append(f"{t}{dir_str} {emoji} {r_clean}")
 
-    resolved=[p for p in all_passes if p.get("result") in ("WIN","LOSS")]
+    resolved=[p for p in all_passes if (p.get("result") or p.get("resolved")) in ("WIN","LOSS")]
     if resolved:
-        wins=sum(1 for p in resolved if p["result"]=="WIN")
+        wins=sum(1 for p in resolved if (p.get("result") or p.get("resolved"))=="WIN")
         wr=wins/len(resolved)*100
         lines.append(f"\n📊 WR: {wr:.0f}% ({wins}/{len(resolved)})")
         if wr>58: lines.append("⚠️ Filtres peut-être trop stricts")
