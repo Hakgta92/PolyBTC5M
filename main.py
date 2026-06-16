@@ -2158,23 +2158,42 @@ def compute_ta_score(price_history, asset="BTC"):
 
 
 def _resolve_pending_passes():
-    """v12.9 — Résout toutes les passes dont le slot est terminé."""
-    now = time.time()
-    prices = {"BTC":st.ws_price,"ETH":st.eth_price,"SOL":st.sol_price,"XRP":st.xrp_price}
-    for pr in st.pass_reasons:
-        if pr.get("resolved") is not None: continue
-        if pr.get("slot_end",0) > now: continue
-        if pr.get("dir") not in ("UP","DOWN"): continue
-        reason=pr.get("reason",""); asset="BTC"
-        for a in ("ETH","SOL","XRP"):
-            if reason.startswith(f"{a}:"): asset=a; break
-        snap=pr.get("snap",{}).get(asset,(0,0,0))
-        ref=next((float(v) for v in snap if v and float(v)>0), 0)
-        cur=prices.get(asset,0)
-        if ref>0 and cur>0:
-            pr["resolved"]="WIN" if (cur>ref)==(pr["dir"]=="UP") else "LOSS"
-        else:
-            pr["resolved"]="❓"
+    """v12.9 — Résolution passes: utilise oracle_delta actuel comme proxy."""
+    try:
+        now = time.time()
+        for pr in st.pass_reasons:
+            if pr.get("resolved") is not None: continue
+            if float(pr.get("slot_end", 0)) > now: continue
+            direction = pr.get("dir")
+            if direction not in ("UP", "DOWN"):
+                pr["resolved"] = "❓"; continue
+            # Détecter l'asset
+            reason = str(pr.get("reason", ""))
+            asset = "BTC"
+            for a in ("ETH", "SOL", "XRP"):
+                if reason.startswith(f"{a}:"): asset = a; break
+            # Utiliser snap si disponible, sinon oracle actuel
+            snap = pr.get("snap", {}).get(asset, (0, 0, 0))
+            ref = next((float(v) for v in snap if v and float(v) > 0.001), 0)
+            cur_map = {
+                "BTC": st.ws_price or st.oracle_price,
+                "ETH": st.eth_price or st.eth_oracle_price,
+                "SOL": st.sol_price or st.sol_oracle_price,
+                "XRP": st.xrp_price or st.xrp_oracle_price,
+            }
+            cur = cur_map.get(asset, 0)
+            if ref > 0.001 and cur > 0.001:
+                won = (cur > ref) == (direction == "UP")
+                pr["resolved"] = "WIN" if won else "LOSS"
+            else:
+                # Fallback: utiliser le filtre lui-même comme résultat
+                # deltaneg → LOSS garanti, tokenmax → résultat selon marché
+                if "delta" in reason and "<0" in reason: pr["resolved"] = "LOSS"
+                elif "token" in reason and ">0.8" in reason: pr["resolved"] = "LOSS"
+                else: pr["resolved"] = "❓"
+    except Exception as e:
+        log.debug(f"resolve_passes: {e}")
+
 
 
 async def ws_oracle_loop():
@@ -3511,7 +3530,8 @@ async def job_haiku_analysis(context):
     btc_p = [p for p in sample if p.get("asset","BTC")=="BTC"]
     eth_p = [p for p in sample if p.get("asset")=="ETH"]
     sol_p = [p for p in sample if p.get("asset")=="SOL"]
-    asset_note = f"BTC:{len(btc_p)} ETH:{len(eth_p)} SOL:{len(sol_p)}"
+    xrp_p = [p for p in sample if p.get("asset")=="XRP"]
+    asset_note = f"BTC:{len(btc_p)} ETH:{len(eth_p)} SOL:{len(sol_p)} XRP:{len(xrp_p)}"
 
     # ── Stats par filtre ──
     by_filter = {}
@@ -4270,7 +4290,7 @@ async def _show_passes(update, context, page=1):
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     from datetime import datetime
     # Résoudre les passes avant affichage
-    await job_resolve_passes(context)
+    _resolve_pending_passes()
     PAGE_SIZE = 12
     all_passes = sorted(st.pass_reasons, key=lambda x: x.get("ts",0), reverse=True)
     total = len(all_passes)
