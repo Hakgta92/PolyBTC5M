@@ -1562,6 +1562,7 @@ class State:
         self.xrp_oracle_price=0.0; self.xrp_oracle_ts=0.0
         self.xrp_oracle_slot_open=0.0; self.xrp_oracle_slot_ts=0
         self.xrp_last_trade_slot=0
+        self.momentum_last_slot=0  # v12.9 — 2ème fenêtre momentum BTC
         self.xrp_ob_imbalance=0.0; self.xrp_ob_ts=0.0; self.xrp_ob_asset_id=""; self.xrp_clob_ws_task=None
         self.oracle_lag_signal=None  # {"bias","desc","div_pct"}
         # ✅ v10.23 — Calibration sigma
@@ -3414,6 +3415,98 @@ async def job_resolve_passes(context):
         pat["result"] = "WIN" if won else "LOSS"
 
 
+async def job_momentum_btc(context):
+    """v12.9 — 2ème fenêtre BTC: momentum T-90s→T-60s.
+    Source: 69.6% WR live (23 trades), wallet $42K profit (24W/5L)
+    Signal: BTC move ≥0.30% en 60s + token 0.55-0.65$ + anti-reversal ret3s
+    """
+    if not st.running or st.killed: return
+    now = time.time()
+    cur_slot = int(now // 300) * 300
+    slot_remaining = cur_slot + 300 - now
+
+    # Fenêtre T-90s→T-60s uniquement
+    if not (60 <= slot_remaining <= 90): return
+    if st.momentum_last_slot == cur_slot: return
+    if st.oracle_price <= 0 or st.ws_price <= 0: return
+
+    # ── Calcul momentum 60s et 30s ──
+    pts = list(st.ws_prices)
+    if len(pts) < 5: return
+
+    def ret_over(secs):
+        cutoff = now - secs
+        old = [p for t,p in pts if t <= cutoff]
+        return (st.ws_price - old[-1]) / old[-1] * 100 if old and old[-1]>0 else 0.0
+
+    ret_60s = ret_over(60)
+    ret_30s = ret_over(30)
+    ret_3s  = ret_over(3)
+
+    # Signal: move ≥ 0.30% en 60s
+    if abs(ret_60s) < 0.30: return
+
+    direction = "UP" if ret_60s > 0 else "DOWN"
+
+    # Filtre 1: ret30s dans même direction (momentum continu)
+    if direction == "UP" and ret_30s < 0.05: return
+    if direction == "DOWN" and ret_30s > -0.05: return
+
+    # Filtre 2: anti-reversal ret3s dans même direction
+    if direction == "UP" and ret_3s < -0.050: return
+    if direction == "DOWN" and ret_3s > 0.050: return
+
+    # ── Récupérer marché + token ──
+    market = await poly.get_market_by_slug(f"btc-updown-5m-{cur_slot}")
+    if not market: return
+    token_used = market["token_up"] if direction=="UP" else market["token_down"]
+    token_price = await poly.get_token_price(token_used)
+    if not token_price or token_price <= 0: return
+
+    # Token entre 0.55$ et 0.65$ max — momentum window spécifique
+    MOMENTUM_TOKEN_MIN = 0.55
+    MOMENTUM_TOKEN_MAX = 0.65
+    if token_price > MOMENTUM_TOKEN_MAX:
+        log_skip(f"BTC [MOM]: token {token_price:.2f}$>{MOMENTUM_TOKEN_MAX}$ (momentum déjà pricé)", direction,
+                 features={"gap":0,"delta":ret_60s,"ret3s":ret_3s,"votes":0,"filter":"mom_tokenmax","asset":"BTC","source":"momentum"}); return
+    if token_price < MOMENTUM_TOKEN_MIN:
+        log_skip(f"BTC [MOM]: token {token_price:.2f}$<{MOMENTUM_TOKEN_MIN}$ (signal trop faible)", direction,
+                 features={"gap":0,"delta":ret_60s,"ret3s":ret_3s,"votes":0,"filter":"mom_tokenmin","asset":"BTC","source":"momentum"}); return
+
+    # ── EV ──
+    fee = taker_fee_per_share(token_price)
+    p_mom = min(0.90, 0.65 + abs(ret_60s) * 0.5)  # prob estimée
+    ev = p_mom - token_price - fee
+    if ev < ORACLE_EDGE_MIN:
+        log_skip(f"BTC [MOM]: EV {ev*100:+.1f}%<{ORACLE_EDGE_MIN*100:.0f}%", direction,
+                 features={"gap":0,"delta":ret_60s,"ret3s":ret_3s,"votes":0,"filter":"mom_ev","asset":"BTC","source":"momentum"}); return
+
+    # ── Kelly + bet ──
+    payout = round(1/token_price, 2)
+    amount = kelly_bet(st.bankroll, p_mom, payout, token_price, ev_bonus=True)
+    if amount < MIN_BET_USD: return
+
+    log.info(f"⚡ MOMENTUM BTC {direction} | ret60s={ret_60s:+.3f}% ret30s={ret_30s:+.3f}% tok={token_price:.2f}$ EV={ev*100:.1f}%")
+
+    tpu = market["token_up"]; tpd = market["token_down"]
+    market_end = market.get("end_date","")
+    sess = session_ctx()
+    conf_score = {"score":0,"signals":[]}
+    reasoning = f"⚡MOMENTUM BTC {direction} | ret60s={ret_60s:+.3f}% ret30s={ret_30s:+.3f}% ret3s={ret_3s:+.3f}% | tok={token_price:.2f}$ EV={ev*100:+.1f}% T-{int(slot_remaining)}s"
+
+    ok = await place_bet(context, direction, amount, round(p_mom,2), reasoning, conf_score, sess, tpu, tpd, market_end, source="momentum")
+    if not ok: return
+
+    st.momentum_last_slot = cur_slot
+    mode = "💰 RÉEL" if not st.paper_mode else "📄 paper"
+    await send(context.bot,
+        f"🚀 *MOMENTUM BTC* [{mode}]\n━━━━━━━━━━━━━━\n"
+        f"*{direction}* | `{amount:.2f}$` | P:`{p_mom*100:.0f}%` | ⏰T-`{int(slot_remaining)}s`\n"
+        f"Ret 60s:`{ret_60s:+.3f}%` | 30s:`{ret_30s:+.3f}%` | 3s:`{ret_3s:+.3f}%`\n"
+        f"Token:`{token_price:.2f}$` | EV:`{ev*100:+.1f}%`\n\n"
+        f"📝 _2ème fenêtre momentum — entrée tôt sur fort move_")
+
+
 async def job_auto_calibrate(context):
     """
     ✅ v10.37 — Point 1: Auto-calibration des seuils toutes les 2h.
@@ -3538,7 +3631,9 @@ async def job_haiku_analysis(context):
     eth_p = [p for p in sample if p.get("asset")=="ETH"]
     sol_p = [p for p in sample if p.get("asset")=="SOL"]
     xrp_p = [p for p in sample if p.get("asset")=="XRP"]
-    asset_note = f"BTC:{len(btc_p)} ETH:{len(eth_p)} SOL:{len(sol_p)} XRP:{len(xrp_p)}"
+    mom_p = [p for p in sample if p.get("source")=="momentum"]
+    oracle_p = [p for p in sample if p.get("source") != "momentum"]
+    asset_note = f"BTC:{len(btc_p)} ETH:{len(eth_p)} SOL:{len(sol_p)} XRP:{len(xrp_p)} | OracleLag:{len(oracle_p)} Momentum:{len(mom_p)}"
 
     # ── Stats par filtre ──
     by_filter = {}
@@ -3611,6 +3706,7 @@ PARAMÈTRES ACTUELS:
 - ETH: gap≥0.020% | T-20s→T-5s
 - SOL: gap≥0.020% | T-15s→T-5s
 - XRP: gap≥0.025% | T-20s→T-5s
+- BTC MOMENTUM: ret60s≥0.30% | T-90s→T-60s | tok 0.55$-0.65$ (2ème fenêtre indépendante)
 - Commun: delta≥0.020% | token 0.51$-0.80$ | EV≥15% | votes≥2
 - Filtres actifs: ret3s_brutal(<-0.055%) | delta_neg | gap_neg | tokenmax | tokenmin | ev
 {trade_summary}
@@ -3636,6 +3732,7 @@ INSTRUCTIONS:
 
 QUESTIONS CLÉS À RÉPONDRE:
 - Quel filtre bloque le plus de trades gagnants en ce moment ?
+- La 2ème fenêtre MOMENTUM BTC (T-90s→T-60s) performe-t-elle ? Faut-il ajuster ret60s seuil ou token range ?
 - Quel seuil précis faudrait-il changer pour capturer ces gains ?
 - Y a-t-il un contexte (session, volatilité, gap fort) où on devrait être plus agressif ?
 
@@ -3719,6 +3816,17 @@ async def cmd_learn(update,context):
         if sessions:
             best=max(sessions.items(),key=lambda x:x[1]["pnl"])
             lines.append(f"  🏆 Meilleure session: `{best[0]}` PnL:`{best[1]['pnl']:+.2f}$`")
+        # WR par stratégie
+        mom_trades = [t for t in real if t.get("source")=="momentum"]
+        lag_trades = [t for t in real if t.get("source") != "momentum"]
+        if mom_trades:
+            w_m=sum(1 for t in mom_trades if t.get("result")=="WIN")
+            pnl_m=sum(t.get("pnl",0) for t in mom_trades)
+            lines.append(f"  🚀 Momentum: {len(mom_trades)} trades WR:`{w_m/len(mom_trades)*100:.0f}%` PnL:`{pnl_m:+.2f}$`")
+        if lag_trades:
+            w_l=sum(1 for t in lag_trades if t.get("result")=="WIN")
+            pnl_l=sum(t.get("pnl",0) for t in lag_trades)
+            lines.append(f"  ⚡ Oracle lag: {len(lag_trades)} trades WR:`{w_l/len(lag_trades)*100:.0f}%` PnL:`{pnl_l:+.2f}$`")
     else:
         lines.append(f"\n💰 *Trades réels:* 0 — en attente du premier trade")
 
@@ -3825,6 +3933,7 @@ async def cmd_run(update,context):
     context.job_queue.run_repeating(job_oracle_lag_eth,interval=2,first=18)
     context.job_queue.run_repeating(job_oracle_lag_sol,interval=2,first=20)
     context.job_queue.run_repeating(job_oracle_lag_xrp,interval=2,first=22)
+    context.job_queue.run_repeating(job_momentum_btc,interval=2,first=24)  # ✅ v12.9 — 2ème fenêtre momentum
     context.job_queue.run_repeating(job_resolve_passes,interval=30,first=35)
     context.job_queue.run_repeating(job_auto_calibrate,interval=7200,first=300)  # ✅ v10.37 seuils auto
     context.job_queue.run_repeating(job_pattern_memory,interval=3600,first=600)  # ✅ v10.37 mémoire patterns
@@ -3847,6 +3956,7 @@ async def cmd_run(update,context):
         f"🚀 *Bot v{BOT_VERSION} démarré !*\nMode:*{'📄 PAPER' if st.paper_mode else '💰 RÉEL'}*\n"
         f"Session:`{sess['session']}` | Seuils: score≥`{min_score}` mom≥`{min_mom}`\n"
         f"⚡ BTC T-25→T-5s | ETH T-20→T-5s | SOL T-15→T-5s | XRP T-20→T-5s\n"
+        f"🚀 BTC Momentum T-90s→T-60s | move≥0.30%/60s | tok 0.55$-0.65$\n"
         f"  gap BTC/XRP≥2.5bps | ETH/SOL≥2.0bps | delta≥{int(ORACLE_ENTRY_DELTA*10000)}bps | Token≤{ORACLE_TOKEN_MAX}$ | EV≥{int(ORACLE_EDGE_MIN*100)}%\n"
         f"BR:`{st.bankroll:.2f}$` | ROI:`{roi()}`\n"
         f"📊 `{ob_txt}` | 💸 `{liq_txt}`\n"
