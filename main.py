@@ -4277,26 +4277,26 @@ async def cmd_autotune(update,context):
         parse_mode="Markdown")
 
 async def cmd_passes(update,context):
-    """v12.8 — Affiche les skips avec boutons pagination."""
+    """v12.9 — Passes avec pagination boutons."""
     if not auth(update): return
     page = 1
     if context.args:
         try: page = max(1, int(context.args[0]))
         except: pass
-    await _show_passes(update, context, page)
+    await _show_passes_page(update, context, page)
 
-async def _show_passes(update, context, page=1):
-    """Affiche une page de passes avec boutons navigation."""
+async def _show_passes_page(update, context, page=1):
+    """Affiche une page de passes — logique originale + pagination."""
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     from datetime import datetime
-    # Résoudre les passes avant affichage
     _resolve_pending_passes()
-    PAGE_SIZE = 12
-    all_passes = sorted(st.pass_reasons, key=lambda x: x.get("ts",0), reverse=True)
+
+    PAGE = 12
+    all_passes = list(reversed(st.pass_reasons))
     total = len(all_passes)
-    total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+    total_pages = max(1, (total + PAGE - 1) // PAGE)
     page = min(max(1, page), total_pages)
-    passes = all_passes[(page-1)*PAGE_SIZE : page*PAGE_SIZE]
+    passes = all_passes[(page-1)*PAGE : page*PAGE]
 
     if not passes:
         msg = update.callback_query.message if update.callback_query else update.message
@@ -4304,295 +4304,43 @@ async def _show_passes(update, context, page=1):
 
     lines=[f"🚫 *PASSES — BTC/ETH/SOL/XRP* ({page}/{total_pages})\n━━━━━━━━━━━━━━"]
     for p in passes:
-        ts=p.get("ts",0); reason=p.get("reason","?"); result=p.get("result"); direction=p.get("dir")
-        t=datetime.fromtimestamp(ts).strftime("%H:%M") if ts else "??"
-        r_clean=reason.replace("**","").replace("__","")[:80]
-        emoji="✅" if result=="WIN" else ("❌" if result=="LOSS" else ("❓" if result=="❓" else "⏳"))
-        dir_str=f" {direction}" if direction else " —"
-        lines.append(f"{t}{dir_str} {emoji} {r_clean}")
+        res = p.get("resolved")
+        emoji = "✅" if res=="WIN" else "❌" if res=="LOSS" else "❓" if res=="❓" else ("—" if not p.get("dir") else "⏳")
+        d = f"{p.get('dir')} " if p.get("dir") else "— "
+        reason = p.get("reason","?")
+        t = datetime.fromtimestamp(p.get("ts",0)).strftime("%H:%M") if p.get("ts") else "??"
+        lines.append(f"{t} {d}{emoji} {reason[:80]}")
 
-    resolved=[p for p in all_passes if (p.get("result") or p.get("resolved")) in ("WIN","LOSS")]
+    # Stats WR
+    resolved = [p for p in st.pass_reasons if p.get("resolved") in ("WIN","LOSS")]
     if resolved:
-        wins=sum(1 for p in resolved if (p.get("result") or p.get("resolved"))=="WIN")
-        wr=wins/len(resolved)*100
-        lines.append(f"\n📊 WR: {wr:.0f}% ({wins}/{len(resolved)})")
-        if wr>58: lines.append("⚠️ Filtres peut-être trop stricts")
-        elif wr<40: lines.append("✅ Filtres corrects")
-        else: lines.append("➖ Zone grise")
+        w = sum(1 for p in resolved if p.get("resolved")=="WIN")
+        twr = w/len(resolved)*100
+        lines.append(f"\n📊 WR théorique des skips: {twr:.0f}% ({w}/{len(resolved)})")
+        if twr >= 58: lines.append("⚠️ Filtres peut-être trop stricts")
+        elif twr <= 50: lines.append("✅ ~50% — les filtres ne coûtent rien, le marché était plat")
+        else: lines.append("➖ Zone grise — encore besoin de données")
 
-    text="\n".join(lines)
+    text = "\n".join(lines)
 
     # Boutons navigation
-    buttons=[]
-    if page > 1: buttons.append(InlineKeyboardButton("⬅️ Précédent", callback_data=f"passes:{page-1}"))
-    if page < total_pages: buttons.append(InlineKeyboardButton("Suivant ➡️", callback_data=f"passes:{page+1}"))
-    keyboard = InlineKeyboardMarkup([buttons]) if buttons else None
+    btns = []
+    if page > 1: btns.append(InlineKeyboardButton("⬅️", callback_data=f"passes:{page-1}"))
+    if page < total_pages: btns.append(InlineKeyboardButton("➡️", callback_data=f"passes:{page+1}"))
+    kbd = InlineKeyboardMarkup([btns]) if btns else None
 
     try:
         if update.callback_query:
-            await update.callback_query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+            await update.callback_query.edit_message_text(text, parse_mode="Markdown", reply_markup=kbd)
         else:
-            await update.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
+            await update.message.reply_text(text, parse_mode="Markdown", reply_markup=kbd)
     except:
-        clean=text.replace("*","").replace("`","")
+        clean = text.replace("*","").replace("`","").replace("_","")
         if update.callback_query:
-            await update.callback_query.edit_message_text(clean, reply_markup=keyboard)
+            await update.callback_query.edit_message_text(clean, reply_markup=kbd)
         else:
-            await update.message.reply_text(clean, reply_markup=keyboard)
+            await update.message.reply_text(clean, reply_markup=kbd)
 
-
-async def cmd_fear(update,context):
-    if not auth(update): return
-    v=st.fg['value']; bar="█"*(v//10)+"░"*(10-v//10)
-    e="😱" if v<20 else "😟" if v<40 else "😐" if v<60 else "😊" if v<80 else "🤑"
-    interp="Extrême Peur→biais UP" if v<20 else "Peur" if v<40 else "Neutre" if v<60 else "Greed" if v<80 else "Extrême Greed→biais DOWN"
-    await update.message.reply_text(
-        f"😱 *FEAR & GREED*\n{e} *{st.fg['label']}* — `{v}/100`\n`{bar}`\n\n_{interp}_\n₿ 24h:`{st.btc24.get('change_pct',0):+.2f}%`",
-        parse_mode="Markdown")
-
-async def cmd_paper(update,context):
-    if not auth(update): return
-    st.paper_mode=not st.paper_mode
-    if not st.paper_mode and not poly.ready: poly.init_client()
-    await update.message.reply_text(f"Mode:*{'📄 PAPER' if st.paper_mode else '💰 RÉEL ⚠️'}* | API:{'✅' if poly.ready else '❌'}",parse_mode="Markdown")
-    st.backup()
-
-async def cmd_resetskips(update,context):
-    """v12.6 — Remet à zéro les passes et patterns."""
-    if not auth(update): return
-    n_passes = len(st.pass_reasons)
-    n_patterns = len(st.oracle_patterns)
-    st.pass_reasons.clear()
-    st.oracle_patterns.clear()
-    await update.message.reply_text(
-        f"🔄 *Skips réinitialisés*\n"
-        f"  {n_passes} passes supprimées\n"
-        f"  {n_patterns} patterns supprimés\n"
-        f"WR théorique remis à zéro ✅", parse_mode="Markdown")
-
-
-async def cmd_reset(update,context):
-    if not auth(update): return
-    st.running=False
-    for j in [st.tick_job,st.price_job,st.macro_job,st.tp_job,st.backup_job,st.recap_job,st.snipe_job]:
-        if j:
-            try: j.schedule_removal()
-            except: pass
-    st.bankroll=50.0; st.bankroll_ref=50.0; st.trades=[]; st.bet=None
-    st.wins=st.losses=st.skipped=st.consec=0; st.pnl=st.streak=st.best_streak=st.worst_streak=0
-    st.cooldown_until=0; st.daily_pause_until=0; st.session_start=time.time(); st.pass_reasons=[]
-    st.last_conf_score={}; st.last_mom_score=0; st.active_order_id=None
-    st.active_token_id=None; st.shares_bought=0; st.entry_token_price=0
-    st.token_price_peak=0; st.trailing_active=False; st.bet_expiry=0
-    st.win_streak_count=0; st.conservative_until=0; st.turbo_until=0; st.last_fair={}
-    st.c1.clear(); st.c5.clear(); st.c15.clear(); st.c1h.clear(); st.c4h.clear()
-    for f in [DATA_FILE,BACKUP_FILE]:
-        if os.path.exists(f): os.remove(f)
-    await update.message.reply_text("🔄 *Reset complet.*",parse_mode="Markdown")
-
-async def cmd_cooldown(update,context):
-    if not auth(update): return
-    st.cooldown_until=0; st.consec=0; st.daily_pause_until=0
-    await update.message.reply_text("✅ Cooldown + pause reset.",parse_mode="Markdown")
-
-async def cmd_fair(update,context):
-    """✅ v10.21 — Fair value du slot actuel (modèle Brownien) + frais v10.22"""
-    if not auth(update): return
-    sigma = realized_vol()
-    t_rem = int(300 - (time.time() % 300))
-    if not st.ws_connected or sigma <= 0:
-        await update.message.reply_text("⏳ WebSocket Binance pas encore prêt — relance dans 1min.")
-        return
-    cur = st.ws_price
-    delta_live = (cur - st.slot_open_price) / st.slot_open_price * 100 if st.slot_open_price > 0 else 0.0
-    p_up = fair_prob_up(delta_live, t_rem, sigma)
-    snipe_zone = SNIPE_LAST_MIN <= t_rem < ENTRY_LAST_SECONDS
-    await update.message.reply_text(
-        f"⚖️ *FAIR VALUE* (Brownien)\n━━━━━━━━━━━━━━\n"
-        f"₿`${cur:,.2f}` | Slot open:`${st.slot_open_price:,.2f}`\n"
-        f"Δ:`{delta_live:+.3f}%` | ⏰`{t_rem}s` {'🎯SNIPE zone' if snipe_zone else ''} | σ:`{sigma:.4f}`\n\n"
-        f"🟢 P(UP):`{p_up*100:.0f}%` | 🔴 P(DOWN):`{(1-p_up)*100:.0f}%`\n\n"
-        f"💡 Normal: EV≥{FAIR_EDGE_MIN*100:.0f}pts | SNIPE: P≥{SNIPE_MIN_PROB*100:.0f}% + EV≥{SNIPE_EDGE_MIN*100:.0f}pts\n"
-        f"_(frais taker déduits automatiquement)_",
-        parse_mode="Markdown")
-
-async def cmd_sellcheck(update,context):
-    """✅ v10.20d — Affiche le PnL actuel sans vendre"""
-    if not auth(update): return
-    if not st.bet:
-        await update.message.reply_text("❌ Aucune position active."); return
-    if not st.active_token_id:
-        await update.message.reply_text("❌ Pas de token actif."); return
-    current_price = await poly.get_token_price(st.active_token_id)
-    if current_price <= 0 or st.entry_token_price <= 0:
-        await update.message.reply_text("❌ Prix non disponible."); return
-    gain_mult = current_price / st.entry_token_price
-    gross = round((current_price - st.entry_token_price) * st.shares_bought, 2)
-    emoji = "✅" if gross >= 0 else "❌"
-    remaining = int((st.bet_expiry - time.time())) if st.bet_expiry > 0 else 0
-    await update.message.reply_text(
-        f"💰 *Position actuelle*\n━━━━━━━━━━━━━━\n"
-        f"{emoji} `{st.bet['dir']}` | x`{gain_mult:.2f}` | PnL:`{fmt(gross)}$`\n"
-        f"Token: `{st.entry_token_price:.3f}$` → `{current_price:.3f}$`\n"
-        f"⏰ Expire dans: `{remaining}s`\n\n"
-        f"Tape `/sell` pour vendre maintenant.",
-        parse_mode="Markdown")
-
-async def cmd_sell(update,context):
-    """✅ v10.19d — Vente manuelle immédiate de la position active"""
-    if not auth(update): return
-    if not st.bet:
-        await update.message.reply_text("❌ Aucune position active."); return
-    if st.paper_mode:
-        await update.message.reply_text("❌ Paper mode — pas de vente réelle."); return
-    if not st.active_token_id:
-        await update.message.reply_text("❌ Pas de token actif."); return
-
-    await update.message.reply_text("⏳ Vente en cours...")
-    current_price = await poly.get_token_price(st.active_token_id)
-    gain_mult = current_price/st.entry_token_price if st.entry_token_price>0 and current_price>0 else 0
-
-    opposite_token = None
-    if st.current_market:
-        if st.bet.get("dir") == "DOWN":
-            opposite_token = st.current_market.get("token_up")
-        else:
-            opposite_token = st.current_market.get("token_down")
-    result = await poly.sell_position(st.active_token_id, st.shares_bought, opposite_token, current_price)
-    if result:
-        clob_bal = await fetch_clob_balance()
-        bet = st.bet
-        if clob_bal and clob_bal > 0:
-            gross = round(clob_bal - st.bankroll, 2)
-            st.bankroll = clob_bal
-        else:
-            gross = round((current_price - st.entry_token_price) * st.shares_bought, 2)
-            st.bankroll = max(0.0, st.bankroll + gross)
-        st.pnl += gross
-        won = gross >= 0
-        register_trade_result(won)
-        st.trades.append({"dir":bet["dir"],"amount":bet["amount"],"pnl":round(gross,4),
-            "conf":bet["conf"],"result":"WIN" if won else "LOSS",
-            "entry":bet["entry"],"exit":st.price,"reasoning":"Vente manuelle /sell",
-            "paper":False,"ts":int(time.time()),"score":bet.get("score",0),
-            "fg_value":st.fg.get("value",50),"session":bet.get("session","?"),"aligned_15h1h":True})
-        st.bet=None; st.active_token_id=None; st.active_order_id=None
-        st.shares_bought=0; st.entry_token_price=0
-        st.token_price_peak=0; st.trailing_active=False; st.bet_expiry=0
-        emoji = "✅" if won else "❌"
-        await update.message.reply_text(
-            f"{emoji} *Vente manuelle*\n"
-            f"`{bet['dir']}` | x`{gain_mult:.2f}` | PnL:`{fmt(gross)}$`\n"
-            f"BR:`{st.bankroll:.2f}$` | ROI:`{roi()}`",
-            parse_mode="Markdown")
-        st.backup()
-    else:
-        await update.message.reply_text("⚠️ Vente échouée — réessaie ou attends la résolution auto.")
-
-async def cmd_turbo(update,context):
-    """✅ v10.17 — Mode turbo: seuils réduits pendant 15min"""
-    if not auth(update): return
-    if time.time() < st.turbo_until:
-        remaining = int((st.turbo_until - time.time()) / 60)
-        await update.message.reply_text(f"⚡ Turbo déjà actif — encore `{remaining}min`",parse_mode="Markdown")
-        return
-    st.turbo_until = time.time() + 15*60
-    sess = session_ctx()
-    min_score,min_diff,min_mom = get_session_thresholds(sess["session"])
-    await update.message.reply_text(
-        f"⚡ *MODE TURBO activé 15min*\n"
-        f"Seuils: score≥`{max(7,min_score-2)}` mom≥`{max(2,min_mom-1)}`\n"
-        f"Utilise `/score` pour voir les signaux en temps réel",
-        parse_mode="Markdown")
-
-async def run_backtest(days=2, asset="BTC"):
-    """v12.8 — Backtest oracle lag sur BTC/ETH/SOL/XRP via klines Binance."""
-    symbol_map = {"BTC":"btcusdt","ETH":"ethusdt","SOL":"solusdt","XRP":"xrpusdt"}
-    symbol = symbol_map.get(asset.upper(), "btcusdt")
-    klines = await fetch_klines("1m", min(1000, days*1440), symbol=symbol)
-    if len(klines) < 20: return f"❌ Pas assez de données {asset}."
-
-    # Modèle token piecewise calé sur observations réelles
-    gap_min = {"BTC":0.025,"ETH":0.020,"SOL":0.020,"XRP":0.025}.get(asset.upper(),0.025)
-    def token_from_delta(delta_pct):
-        a=abs(delta_pct)
-        if a<0.005: return 0.50
-        if a<0.01:  return 0.54
-        if a<0.02:  return 0.60
-        if a<0.04:  return 0.68
-        if a<0.07:  return 0.75
-        if a<0.12:  return 0.82
-        return 0.92
-
-    wins=losses=skipped=0; pnl=0.0; skip_reasons={}
-    mise = 3.50
-
-    for i in range(5, len(klines)-1, 5):
-        slot=klines[i-5:i]; nxt=klines[i] if i<len(klines) else None
-        if not nxt: break
-        open_px=float(slot[0]["open"]); mid_px=float(slot[-1]["close"])
-        final_px=float(nxt["close"])
-        if open_px<=0: continue
-
-        delta=(mid_px-open_px)/open_px*100
-        # Filtre gap min
-        if abs(delta) < gap_min:
-            skip_reasons["gap_faible"]=skip_reasons.get("gap_faible",0)+1
-            skipped+=1; continue
-
-        direction="UP" if delta>0 else "DOWN"
-        tok=token_from_delta(delta)
-
-        # Filtres token
-        if tok > ORACLE_TOKEN_MAX:
-            skip_reasons["tokenmax"]=skip_reasons.get("tokenmax",0)+1
-            skipped+=1; continue
-        if tok < ORACLE_TOKEN_MIN:
-            skip_reasons["tokenmin"]=skip_reasons.get("tokenmin",0)+1
-            skipped+=1; continue
-
-        # EV
-        fee=taker_fee_per_share(tok)
-        p_est=min(0.93, 0.80+abs(delta)*3.0)
-        ev=p_est-tok-fee
-        if ev < ORACLE_EDGE_MIN:
-            skip_reasons["ev"]=skip_reasons.get("ev",0)+1
-            skipped+=1; continue
-
-        # Résultat réel
-        won=(final_px>=open_px)==(direction=="UP")
-        payout=1/tok
-        if won: wins+=1; pnl+=mise*(payout-1)*0.93
-        else:   losses+=1; pnl-=mise
-
-    total=wins+losses
-    wr=wins/total*100 if total else 0
-    be=tok*100 if total else 0
-
-    # Top raisons de skip
-    top_skips="\n".join(f"  {k}: {v}" for k,v in sorted(skip_reasons.items(),key=lambda x:-x[1])[:4])
-    emoji = "✅" if wr>=65 else ("⚠️" if wr>=55 else "❌")
-
-    return (f"🧪 *BACKTEST {asset} {days}j*\n━━━━━━━━━━━━━━\n"
-            f"Slots analysés:`{total+skipped}` | Tradés:`{total}` | Skips:`{skipped}`\n"
-            f"{emoji} WR:`{wr:.1f}%` | PnL simulé:`{pnl:+.2f}$`\n"
-            f"Gain moy:`+{mise*(1/0.65-1)*0.93:.2f}$` | Perte moy:`-{mise:.2f}$`\n"
-            f"\n*Raisons skips:*\n{top_skips}\n"
-            f"\n_gap min {gap_min}% | Token {ORACLE_TOKEN_MIN:.2f}$-{ORACLE_TOKEN_MAX:.2f}$ | EV≥{ORACLE_EDGE_MIN*100:.0f}%_\n"
-            f"_Résolution: données Binance 1min — indicatif_")
-
-async def cmd_backtest(update,context):
-    if not auth(update): return
-    days=2; asset="BTC"
-    if context.args:
-        for arg in context.args:
-            if arg.upper() in ("BTC","ETH","SOL","XRP"): asset=arg.upper()
-            else:
-                try: days=max(1,min(7,int(arg)))
-                except: pass
-    await update.message.reply_text(f"⏳ Backtest {asset} {days}j en cours...")
-    res=await run_backtest(days, asset)
-    await update.message.reply_text(res, parse_mode="Markdown")
 
 async def cmd_oracle(update,context):
     if not auth(update): return
@@ -4685,7 +4433,7 @@ async def cb(update,context):
     q=update.callback_query; await q.answer()
     if q.data.startswith("passes:"):
         page=int(q.data.split(":")[1])
-        await _show_passes(update,context,page); return
+        await _show_passes_page(update,context,page); return
     h={"status":cmd_status,"ai":cmd_ai,"trades":cmd_trades,"stats":cmd_stats,
        "fear":cmd_fear,"score":cmd_score,"run":cmd_run,"stop":cmd_stop,"paper":cmd_paper}
     if q.data in h: await h[q.data](update,context)
