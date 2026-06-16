@@ -4352,6 +4352,165 @@ async def _show_passes_page(update, context, page=1):
             await update.message.reply_text(clean, reply_markup=kbd)
 
 
+async def cmd_paper(update,context):
+    if not auth(update): return
+    st.paper_mode=not st.paper_mode
+    if not st.paper_mode and not poly.ready: poly.init_client()
+    await update.message.reply_text(f"Mode:*{'📄 PAPER' if st.paper_mode else '💰 RÉEL ⚠️'}* | API:{'✅' if poly.ready else '❌'}",parse_mode="Markdown")
+    st.backup()
+
+
+async def cmd_cooldown(update,context):
+    if not auth(update): return
+    st.cooldown_until=0; st.consec=0; st.daily_pause_until=0
+    await update.message.reply_text("✅ Cooldown + pause reset.",parse_mode="Markdown")
+
+
+async def cmd_reset(update,context):
+    if not auth(update): return
+    st.running=False
+    for j in [st.tick_job,st.price_job,st.macro_job,st.tp_job,st.backup_job,st.recap_job,st.snipe_job]:
+        if j:
+            try: j.schedule_removal()
+            except: pass
+    st.bankroll=50.0; st.bankroll_ref=50.0; st.trades=[]; st.bet=None
+    st.wins=st.losses=st.skipped=st.consec=0; st.pnl=st.streak=st.best_streak=st.worst_streak=0
+    st.cooldown_until=0; st.daily_pause_until=0; st.session_start=time.time(); st.pass_reasons=[]
+    st.last_conf_score={}; st.last_mom_score=0; st.active_order_id=None
+    st.active_token_id=None; st.shares_bought=0; st.entry_token_price=0
+    st.token_price_peak=0; st.trailing_active=False; st.bet_expiry=0
+    st.win_streak_count=0; st.conservative_until=0; st.turbo_until=0; st.last_fair={}
+    st.c1.clear(); st.c5.clear(); st.c15.clear(); st.c1h.clear(); st.c4h.clear()
+    for f in [DATA_FILE,BACKUP_FILE]:
+        if os.path.exists(f): os.remove(f)
+    await update.message.reply_text("🔄 *Reset complet.*",parse_mode="Markdown")
+
+
+async def cmd_sell(update,context):
+    """✅ v10.19d — Vente manuelle immédiate de la position active"""
+    if not auth(update): return
+    if not st.bet:
+        await update.message.reply_text("❌ Aucune position active."); return
+    if st.paper_mode:
+        await update.message.reply_text("❌ Paper mode — pas de vente réelle."); return
+    if not st.active_token_id:
+        await update.message.reply_text("❌ Pas de token actif."); return
+
+    await update.message.reply_text("⏳ Vente en cours...")
+    current_price = await poly.get_token_price(st.active_token_id)
+    gain_mult = current_price/st.entry_token_price if st.entry_token_price>0 and current_price>0 else 0
+
+    opposite_token = None
+    if st.current_market:
+        if st.bet.get("dir") == "DOWN":
+            opposite_token = st.current_market.get("token_up")
+        else:
+            opposite_token = st.current_market.get("token_down")
+    result = await poly.sell_position(st.active_token_id, st.shares_bought, opposite_token, current_price)
+    if result:
+        clob_bal = await fetch_clob_balance()
+        bet = st.bet
+        if clob_bal and clob_bal > 0:
+            gross = round(clob_bal - st.bankroll, 2)
+            st.bankroll = clob_bal
+        else:
+            gross = round((current_price - st.entry_token_price) * st.shares_bought, 2)
+            st.bankroll = max(0.0, st.bankroll + gross)
+        st.pnl += gross
+        won = gross >= 0
+        register_trade_result(won)
+        st.trades.append({"dir":bet["dir"],"amount":bet["amount"],"pnl":round(gross,4),
+            "conf":bet["conf"],"result":"WIN" if won else "LOSS",
+            "entry":bet["entry"],"exit":st.price,"reasoning":"Vente manuelle /sell",
+            "paper":False,"ts":int(time.time()),"score":bet.get("score",0),
+            "fg_value":st.fg.get("value",50),"session":bet.get("session","?"),"aligned_15h1h":True})
+        st.bet=None; st.active_token_id=None; st.active_order_id=None
+        st.shares_bought=0; st.entry_token_price=0
+        st.token_price_peak=0; st.trailing_active=False; st.bet_expiry=0
+        emoji = "✅" if won else "❌"
+        await update.message.reply_text(
+            f"{emoji} *Vente manuelle*\n"
+            f"`{bet['dir']}` | x`{gain_mult:.2f}` | PnL:`{fmt(gross)}$`\n"
+            f"BR:`{st.bankroll:.2f}$` | ROI:`{roi()}`",
+            parse_mode="Markdown")
+        st.backup()
+    else:
+        await update.message.reply_text("⚠️ Vente échouée — réessaie ou attends la résolution auto.")
+
+
+async def cmd_sellcheck(update,context):
+    """✅ v10.20d — Affiche le PnL actuel sans vendre"""
+    if not auth(update): return
+    if not st.bet:
+        await update.message.reply_text("❌ Aucune position active."); return
+    if not st.active_token_id:
+        await update.message.reply_text("❌ Pas de token actif."); return
+    current_price = await poly.get_token_price(st.active_token_id)
+    if current_price <= 0 or st.entry_token_price <= 0:
+        await update.message.reply_text("❌ Prix non disponible."); return
+    gain_mult = current_price / st.entry_token_price
+    gross = round((current_price - st.entry_token_price) * st.shares_bought, 2)
+    emoji = "✅" if gross >= 0 else "❌"
+    remaining = int((st.bet_expiry - time.time())) if st.bet_expiry > 0 else 0
+    await update.message.reply_text(
+        f"💰 *Position actuelle*\n━━━━━━━━━━━━━━\n"
+        f"{emoji} `{st.bet['dir']}` | x`{gain_mult:.2f}` | PnL:`{fmt(gross)}$`\n"
+        f"Token: `{st.entry_token_price:.3f}$` → `{current_price:.3f}$`\n"
+        f"⏰ Expire dans: `{remaining}s`\n\n"
+        f"Tape `/sell` pour vendre maintenant.",
+        parse_mode="Markdown")
+
+
+async def cmd_turbo(update,context):
+    """✅ v10.17 — Mode turbo: seuils réduits pendant 15min"""
+    if not auth(update): return
+    if time.time() < st.turbo_until:
+        remaining = int((st.turbo_until - time.time()) / 60)
+        await update.message.reply_text(f"⚡ Turbo déjà actif — encore `{remaining}min`",parse_mode="Markdown")
+        return
+    st.turbo_until = time.time() + 15*60
+    sess = session_ctx()
+    min_score,min_diff,min_mom = get_session_thresholds(sess["session"])
+    await update.message.reply_text(
+        f"⚡ *MODE TURBO activé 15min*\n"
+        f"Seuils: score≥`{max(7,min_score-2)}` mom≥`{max(2,min_mom-1)}`\n"
+        f"Utilise `/score` pour voir les signaux en temps réel",
+        parse_mode="Markdown")
+
+
+async def cmd_fair(update,context):
+    """✅ v10.21 — Fair value du slot actuel (modèle Brownien) + frais v10.22"""
+    if not auth(update): return
+    sigma = realized_vol()
+    t_rem = int(300 - (time.time() % 300))
+    if not st.ws_connected or sigma <= 0:
+        await update.message.reply_text("⏳ WebSocket Binance pas encore prêt — relance dans 1min.")
+        return
+    cur = st.ws_price
+    delta_live = (cur - st.slot_open_price) / st.slot_open_price * 100 if st.slot_open_price > 0 else 0.0
+    p_up = fair_prob_up(delta_live, t_rem, sigma)
+    snipe_zone = SNIPE_LAST_MIN <= t_rem < ENTRY_LAST_SECONDS
+    await update.message.reply_text(
+        f"⚖️ *FAIR VALUE* (Brownien)\n━━━━━━━━━━━━━━\n"
+        f"₿`${cur:,.2f}` | Slot open:`${st.slot_open_price:,.2f}`\n"
+        f"Δ:`{delta_live:+.3f}%` | ⏰`{t_rem}s` {'🎯SNIPE zone' if snipe_zone else ''} | σ:`{sigma:.4f}`\n\n"
+        f"🟢 P(UP):`{p_up*100:.0f}%` | 🔴 P(DOWN):`{(1-p_up)*100:.0f}%`\n\n"
+        f"💡 Normal: EV≥{FAIR_EDGE_MIN*100:.0f}pts | SNIPE: P≥{SNIPE_MIN_PROB*100:.0f}% + EV≥{SNIPE_EDGE_MIN*100:.0f}pts\n"
+        f"_(frais taker déduits automatiquement)_",
+        parse_mode="Markdown")
+
+
+async def cmd_backtest(update,context):
+    if not auth(update): return
+    days=2
+    if context.args:
+        try: days=max(1,min(7,int(context.args[0])))
+        except: pass
+    await update.message.reply_text(f"⏳ Backtest {days}j en cours...")
+    res=await run_backtest(days)
+    await update.message.reply_text(res, parse_mode="Markdown")
+
+
 async def cmd_oracle(update,context):
     if not auth(update): return
     now = time.time()
