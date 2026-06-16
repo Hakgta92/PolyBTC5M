@@ -61,7 +61,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "12.8"
+BOT_VERSION = "12.9"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -2961,7 +2961,11 @@ async def job_oracle_lag(context):
     now = time.time()
     cur_slot = int(now // 300) * 300
     slot_remaining = cur_slot + 300 - now
-    if slot_remaining > ORACLE_WINDOW_START or slot_remaining < ORACLE_WINDOW_END: return
+    # ✅ v12.9 — Régime trendsession: >60% deltaneg → T-15s
+    recent_30=[p for p in st.pass_reasons if now-p.get("ts",0)<=1800]
+    dn_ratio=sum(1 for p in recent_30 if "delta" in p.get("reason","").lower() and "<0" in p.get("reason",""))/max(len(recent_30),1)
+    btc_win_start=15 if dn_ratio>0.60 else ORACLE_WINDOW_START
+    if slot_remaining > btc_win_start or slot_remaining < ORACLE_WINDOW_END: return
 
     if not st.oracle_connected or st.oracle_price <= 0 or st.oracle_slot_open <= 0:
         log_skip(f"BTC: WS non dispo (T-{int(slot_remaining)}s)", None); return
@@ -3333,20 +3337,18 @@ async def job_resolve_passes(context):
         cur_px = cur_prices.get(asset, 0)
         if cur_px <= 0: continue
 
-        # Utiliser snap (snapshot au moment du log) pour ref_px
+        # Utiliser snap pour ref_px (slot open au moment du log)
         snap = pr.get("snap", {}).get(asset, (0, 0, 0))
-        ref_px = snap[0] if snap[0] > 0 else (snap[1] if snap[1] > 0 else pr.get("open_px", 0))
+        ref_px = snap[0] if snap[0]>0 else (snap[1] if snap[1]>0 else pr.get("open_px",0))
+        if ref_px<=0: ref_px=snap[2] if len(snap)>2 and snap[2]>0 else 0  # fallback spot
 
-        if ref_px <= 0:
-            # Fallback: oracle price actuel comme ref (approximatif)
-            ref_px = {"BTC":st.oracle_price,"ETH":st.eth_oracle_price,
-                      "SOL":st.sol_oracle_price,"XRP":st.xrp_oracle_price}.get(asset, 0)
-        if ref_px <= 0 or cur_px <= 0:
-            pr["resolved"] = "❓"  # Impossible à résoudre
-            continue
-
-        won = (cur_px > ref_px) == (direction == "UP")
-        pr["resolved"] = "WIN" if won else "LOSS"
+        if ref_px<=0 or cur_px<=0:
+            # Dernier fallback: oracle actuel (approximatif mais mieux que ⏳)
+            ref_px={"BTC":st.oracle_price,"ETH":st.eth_oracle_price,"SOL":st.sol_oracle_price,"XRP":st.xrp_oracle_price}.get(asset,0)
+        if ref_px<=0 or cur_px<=0 or abs(cur_px-ref_px)/max(ref_px,0.001)>0.10:
+            pr["resolved"]="❓"; continue  # trop incertain
+        won=(cur_px>ref_px)==(direction=="UP")
+        pr["resolved"]="WIN" if won else "LOSS"
 
     # Résoudre oracle_patterns
     for pat in st.oracle_patterns:
