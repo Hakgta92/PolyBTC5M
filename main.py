@@ -1962,6 +1962,7 @@ async def ws_eth_loop():
                                 p = float(d["p"]); now = time.time()
                                 st.eth_price=p; st.eth_ts=now
                                 st.eth_ws_prices.append((now,p))
+                                _resolve_pending_passes()
                                 while st.eth_ws_prices and now-st.eth_ws_prices[0][0]>120: st.eth_ws_prices.popleft()
                         elif msg.type in (aiohttp.WSMsgType.CLOSED,aiohttp.WSMsgType.ERROR): break
         except Exception as e: log.warning(f"WS ETH: {e}")
@@ -1982,6 +1983,7 @@ async def ws_sol_loop():
                                 p = float(d["p"]); now = time.time()
                                 st.sol_price=p; st.sol_ts=now
                                 st.sol_ws_prices.append((now,p))
+                                _resolve_pending_passes()
                                 while st.sol_ws_prices and now-st.sol_ws_prices[0][0]>120: st.sol_ws_prices.popleft()
                         elif msg.type in (aiohttp.WSMsgType.CLOSED,aiohttp.WSMsgType.ERROR): break
         except Exception as e: log.warning(f"WS SOL: {e}")
@@ -2002,6 +2004,7 @@ async def ws_xrp_loop():
                                 p = float(d["p"]); now = time.time()
                                 st.xrp_price=p; st.xrp_ts=now
                                 st.xrp_ws_prices.append((now,p))
+                                _resolve_pending_passes()
                                 while st.xrp_ws_prices and now-st.xrp_ws_prices[0][0]>120:
                                     st.xrp_ws_prices.popleft()
                         elif msg.type in (aiohttp.WSMsgType.CLOSED,aiohttp.WSMsgType.ERROR): break
@@ -2152,6 +2155,26 @@ def compute_ta_score(price_history, asset="BTC"):
         if avg>0 and std/avg*100>0.1: score=int(score*0.7)
     direction="UP" if score>0 else ("DOWN" if score<0 else None)
     return score,direction,details
+
+
+def _resolve_pending_passes():
+    """v12.9 — Résout toutes les passes dont le slot est terminé."""
+    now = time.time()
+    prices = {"BTC":st.ws_price,"ETH":st.eth_price,"SOL":st.sol_price,"XRP":st.xrp_price}
+    for pr in st.pass_reasons:
+        if pr.get("resolved") is not None: continue
+        if pr.get("slot_end",0) > now: continue
+        if pr.get("dir") not in ("UP","DOWN"): continue
+        reason=pr.get("reason",""); asset="BTC"
+        for a in ("ETH","SOL","XRP"):
+            if reason.startswith(f"{a}:"): asset=a; break
+        snap=pr.get("snap",{}).get(asset,(0,0,0))
+        ref=next((float(v) for v in snap if v and float(v)>0), 0)
+        cur=prices.get(asset,0)
+        if ref>0 and cur>0:
+            pr["resolved"]="WIN" if (cur>ref)==(pr["dir"]=="UP") else "LOSS"
+        else:
+            pr["resolved"]="❓"
 
 
 async def ws_oracle_loop():
@@ -2967,22 +2990,7 @@ async def job_oracle_lag(context):
     btc_win_start=15 if dn_ratio>0.60 else ORACLE_WINDOW_START
     if slot_remaining > btc_win_start or slot_remaining < ORACLE_WINDOW_END: return
 
-    # ✅ v12.9 — Résolution: toutes passes dont le slot est terminé
-    _prices = {"BTC":consensus_price() or st.ws_price,"ETH":st.eth_price,"SOL":st.sol_price,"XRP":st.xrp_price}
-    for _pr in st.pass_reasons:
-        if _pr.get("resolved") is not None: continue
-        if _pr.get("slot_end",0) > now: continue  # slot pas encore terminé
-        if _pr.get("dir") not in ("UP","DOWN"): continue
-        _reason=_pr.get("reason",""); _asset="BTC"
-        for _a in ("ETH","SOL","XRP"):
-            if _reason.startswith(f"{_a}:"): _asset=_a; break
-        _snap=_pr.get("snap",{}).get(_asset,(0,0,0))
-        _ref=_snap[0] if _snap[0]>0 else (_snap[1] if len(_snap)>1 and _snap[1]>0 else (float(_snap[2]) if len(_snap)>2 and _snap[2]>0 else 0))
-        _cur=_prices.get(_asset,0)
-        if _ref>0 and _cur>0:
-            _pr["resolved"]="WIN" if (_cur>_ref)==(_pr["dir"]=="UP") else "LOSS"
-        else:
-            _pr["resolved"]="❓"
+    _resolve_pending_passes()  # ✅ v12.9 — Résolution immédiate
 
     if not st.oracle_connected or st.oracle_price <= 0 or st.oracle_slot_open <= 0:
         log_skip(f"BTC: WS non dispo (T-{int(slot_remaining)}s)", None); return
