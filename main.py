@@ -4638,6 +4638,60 @@ async def cmd_resetskips(update,context):
         parse_mode="Markdown")
 
 
+async def cmd_momentum(update,context):
+    """v12.9 — Signal momentum BTC T-90s→T-60s en temps réel."""
+    if not auth(update): return
+    now = time.time()
+    cur_slot = int(now // 300) * 300
+    slot_remaining = cur_slot + 300 - now
+
+    pts = list(st.ws_prices)
+    if len(pts) < 5:
+        await update.message.reply_text("❌ Pas assez de données WS BTC."); return
+
+    def ret_over(secs):
+        cutoff = now - secs
+        old = [p for t,p in pts if t <= cutoff]
+        return (st.ws_price - old[-1]) / old[-1] * 100 if old and old[-1]>0 else 0.0
+
+    ret_60s = ret_over(60)
+    ret_30s = ret_over(30)
+    ret_10s = ret_over(10)
+    ret_3s  = ret_over(3)
+
+    # Status signal
+    in_window = 60 <= slot_remaining <= 90
+    signal = abs(ret_60s) >= 0.30
+    direction = "UP 📈" if ret_60s > 0 else "DOWN 📉"
+    mom_ok = (ret_60s > 0 and ret_30s > 0.05) or (ret_60s < 0 and ret_30s < -0.05)
+    anti_rev = (ret_60s > 0 and ret_3s > -0.050) or (ret_60s < 0 and ret_3s < 0.050)
+
+    if signal and in_window and mom_ok and anti_rev:
+        status = "🚀 *SIGNAL ACTIF* — Momentum trade en cours!"
+    elif signal and not in_window:
+        status = f"⏳ Signal fort mais hors fenêtre (T-{int(slot_remaining)}s, fenêtre T-90s→T-60s)"
+    elif not signal:
+        status = f"📡 Pas de signal (ret60s={ret_60s:+.3f}% < ±0.30%)"
+    else:
+        status = f"⚠️ Signal faible ou momentum contra"
+
+    last_mom = "jamais" if st.momentum_last_slot == 0 else f"slot {st.momentum_last_slot}"
+
+    await update.message.reply_text(
+        f"🚀 *MOMENTUM BTC — T-90s→T-60s*\n━━━━━━━━━━━━━━\n"
+        f"Fenêtre: `T-{int(slot_remaining)}s` {'✅ ACTIVE' if in_window else '❌ hors fenêtre'}\n\n"
+        f"₿ BTC:`${st.ws_price:,.2f}`\n"
+        f"  Ret 60s:`{ret_60s:+.3f}%` {'✅' if abs(ret_60s)>=0.30 else '❌'} (seuil ±0.30%)\n"
+        f"  Ret 30s:`{ret_30s:+.3f}%` {'✅' if mom_ok else '❌'} (momentum continu)\n"
+        f"  Ret 10s:`{ret_10s:+.3f}%`\n"
+        f"  Ret 3s:`{ret_3s:+.3f}%` {'✅' if anti_rev else '❌'} (anti-reversal)\n\n"
+        f"Direction: {direction if signal else '— neutre'}\n"
+        f"Token cible: 0.55$→0.65$ | EV min: {ORACLE_EDGE_MIN*100:.0f}%\n\n"
+        f"{status}\n"
+        f"Dernier trade momentum: `{last_mom}`",
+        parse_mode="Markdown")
+
+
 async def cmd_oracle(update,context):
     if not auth(update): return
     now = time.time()
@@ -4776,7 +4830,7 @@ def main():
         ("balance",cmd_balance),("paper",cmd_paper),("cooldown",cmd_cooldown),("reset",cmd_reset),("resetskips",cmd_resetskips),
         ("setbalance",cmd_setbalance),("backup",cmd_backup),("recap",cmd_recap),("dashboard",cmd_dashboard),
         ("history",cmd_history),("turbo",cmd_turbo),("sell",cmd_sell),("sellcheck",cmd_sellcheck),("fair",cmd_fair),
-        ("backtest",cmd_backtest),("oracle",cmd_oracle),("calib",cmd_calib),("learn",cmd_learn),("revive",cmd_revive),("autotune",cmd_autotune)]:
+        ("backtest",cmd_backtest),("oracle",cmd_oracle),("momentum",cmd_momentum),("calib",cmd_calib),("learn",cmd_learn),("revive",cmd_revive),("autotune",cmd_autotune)]:
         app.add_handler(CommandHandler(name,handler))
     app.add_handler(CallbackQueryHandler(cb))
     log.info(f"🧠 PolyBot v{BOT_VERSION} démarré")
