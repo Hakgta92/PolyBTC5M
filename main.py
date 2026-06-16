@@ -3111,9 +3111,13 @@ async def job_oracle_lag(context):
             st.clob_ws_task.cancel()
         st.clob_ws_task = asyncio.create_task(ws_clob_loop(asset_up))
 
+    # ✅ v12.9 Sonnet: BTC tokenmax avec sous-filtre ret3s≤+0.010% (7W pattern confirmé)
     if token_price > ORACLE_TOKEN_MAX:
-        log_skip(f"BTC: token {token_price:.2f}$>{ORACLE_TOKEN_MAX}$ (→ skip: marché a déjà pricé la direction)", direction,
-                 features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"filter":"tokenmax","token":token_price,"asset":"BTC"}); return
+        if ret_3s <= 0.010:
+            log.debug(f"BTC tokenmax override: tok={token_price:.2f}$ ret3s={ret_3s:+.3f}% ≤+0.010% → autoriser")
+        else:
+            log_skip(f"BTC: token {token_price:.2f}$>{ORACLE_TOKEN_MAX}$ (→ skip: marché a déjà pricé la direction)", direction,
+                     features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"filter":"tokenmax","token":token_price,"asset":"BTC"}); return
     if token_price < ORACLE_TOKEN_MIN:
         log_skip(f"BTC: token {token_price:.2f}$<{ORACLE_TOKEN_MIN}$ (→ skip: trop incertain)", direction,
                  features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"filter":"tokenmin","token":token_price,"asset":"BTC"}); return
@@ -3295,7 +3299,10 @@ async def job_oracle_lag_asset(context, asset:str):
         if st.sol_clob_ws_task and not st.sol_clob_ws_task.done(): st.sol_clob_ws_task.cancel()
         st.sol_clob_ws_task = asyncio.create_task(ws_clob_loop_asset(asset_up_ob,"SOL"))
     # ✅ v12.6 — SOL tokenmax 0.95$ si votes ≤ -1 (Sonnet: 2W/0L à 0.92-0.98$)
-    effective_token_max = 0.95 if (asset=="SOL" and dir_votes<=-1) else ORACLE_TOKEN_MAX
+    # ✅ v12.9 Sonnet: ETH/XRP ≥0.95$ bloqués (1W/9L ETH, 1W/6L SOL à 0.99$)
+    if asset == "SOL" and dir_votes <= -1: effective_token_max = 0.95
+    elif asset in ("ETH","XRP"): effective_token_max = 0.95
+    else: effective_token_max = ORACLE_TOKEN_MAX
     if token_price>effective_token_max:
         log_skip(f"{symbol}: token {token_price:.2f}$>{effective_token_max}$ (déjà pricé)",direction,
                  features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"filter":"tokenmax","token":token_price}); return
