@@ -3292,7 +3292,7 @@ async def job_pattern_memory(context):
 
 
 async def job_haiku_analysis(context):
-    """v12.4 — Haiku analyse les patterns BTC/ETH/SOL toutes les 2h."""
+    """v12.5 — Haiku/Sonnet analyse les patterns BTC/ETH/SOL toutes les 2h."""
     if not ANTHROPIC_KEY: return
     now = time.time()
     if now - st.last_haiku_ts < 7200: return
@@ -3300,57 +3300,114 @@ async def job_haiku_analysis(context):
     if len(resolved) < 15: return
 
     versioned = [p for p in resolved if p.get("v") == BOT_VERSION]
-    sample = versioned[-30:] if len(versioned) >= 10 else resolved[-30:]
+    sample = versioned[-40:] if len(versioned) >= 10 else resolved[-40:]
     version_note = f"v{BOT_VERSION}: {len(versioned)} patterns" if versioned else "mix versions"
 
-    # Stats par asset
+    # ── Stats par asset ──
     btc_p = [p for p in sample if p.get("asset","BTC")=="BTC"]
     eth_p = [p for p in sample if p.get("asset")=="ETH"]
     sol_p = [p for p in sample if p.get("asset")=="SOL"]
     asset_note = f"BTC:{len(btc_p)} ETH:{len(eth_p)} SOL:{len(sol_p)}"
 
+    # ── Stats par filtre ──
+    by_filter = {}
+    for p in sample:
+        f = p.get("filter","?")
+        if f not in by_filter: by_filter[f] = {"w":0,"l":0}
+        if p["result"]=="WIN": by_filter[f]["w"]+=1
+        else: by_filter[f]["l"]+=1
+    filter_stats = " | ".join(f"{f}:{v['w']}W/{v['l']}L" for f,v in sorted(by_filter.items(), key=lambda x:x[1]["w"]+x[1]["l"],reverse=True)[:5])
+
+    # ── Trades réels si disponibles ──
+    real_trades = [t for t in st.trades if not t.get("paper") and t.get("result")]
+    trade_summary = ""
+    if real_trades:
+        wins = sum(1 for t in real_trades if t.get("result")=="WIN")
+        wr = wins/len(real_trades)*100
+        pnl = sum(t.get("pnl",0) for t in real_trades)
+        btc_t = [t for t in real_trades if t.get("asset","BTC")=="BTC"]
+        eth_t = [t for t in real_trades if t.get("asset")=="ETH"]
+        sol_t = [t for t in real_trades if t.get("asset")=="SOL"]
+        trade_summary = f"""
+Trades réels ({len(real_trades)} total | WR:{wr:.0f}% | PnL:{pnl:+.2f}$):
+- BTC: {len(btc_t)} trades | WR:{sum(1 for t in btc_t if t.get('result')=='WIN')/max(1,len(btc_t))*100:.0f}%
+- ETH: {len(eth_t)} trades | WR:{sum(1 for t in eth_t if t.get('result')=='WIN')/max(1,len(eth_t))*100:.0f}%
+- SOL: {len(sol_t)} trades | WR:{sum(1 for t in sol_t if t.get('result')=='WIN')/max(1,len(sol_t))*100:.0f}%"""
+
+    # ── Session et contexte marché ──
+    import datetime
+    hour = datetime.datetime.utcnow().hour
+    session = "ASIA" if 0<=hour<8 else ("EU" if 8<=hour<14 else "US")
+    btc_spot = st.ws_price if st.ws_price > 0 else 0
+    btc_move = ""
+    if st.ws_prices:
+        pts = list(st.ws_prices)
+        if len(pts)>=2:
+            move = (pts[-1][1]-pts[0][1])/pts[0][1]*100
+            btc_move = f"BTC move 2min: {move:+.3f}%"
+
+    # ── Patterns détaillés ──
     summary = []
     for p in sample:
         asset = p.get("asset","BTC")
-        summary.append(f"[{asset}] gap={p.get('gap',0):+.3f}% delta={p.get('delta',0):+.3f}% "
-                       f"ret3s={p.get('ret3s',0):+.3f}% votes={p.get('votes',0)}/5 "
-                       f"filter={p.get('filter','?')} → {p['result']}")
+        tok = f" tok={p.get('token',0):.2f}$" if p.get("token") else ""
+        ev = f" EV={p.get('ev',0)*100:+.1f}%" if p.get("ev") else ""
+        summary.append(
+            f"[{asset}] gap={p.get('gap',0):+.3f}% delta={p.get('delta',0):+.3f}% "
+            f"ret3s={p.get('ret3s',0):+.3f}% votes={p.get('votes',0)}/5 "
+            f"filter={p.get('filter','?')}{tok}{ev} → {p['result']}")
 
-    prompt = f"""Tu analyses les skips d'un bot v{BOT_VERSION} Polymarket MULTI-ASSET 5min ({version_note}).
-Le bot trade BTC, ETH et SOL simultanément avec oracle lag Chainlink.
-Répartition: {asset_note} patterns
+    prompt = f"""Tu es un expert en trading algorithmique sur Polymarket (marchés prédiction crypto 5min).
+Analyse les skips d'un bot oracle lag v{BOT_VERSION} — {version_note}.
+Session actuelle: {session} | {btc_move}
 
-Paramètres:
+STRATÉGIE: Le bot exploite le lag entre Chainlink (oracle Polymarket) et le prix spot Binance.
+Il achète le token UP ou DOWN avant que le marché reprices l'oracle.
+
+PARAMÈTRES ACTUELS:
 - BTC: gap≥0.025% | T-25s→T-5s
-- ETH: gap≥0.030% | T-25s→T-5s
+- ETH: gap≥0.025% | T-25s→T-5s  
 - SOL: gap≥0.030% | T-20s→T-5s
-- Commun: delta≥{ORACLE_ENTRY_DELTA:.3f}% | token {ORACLE_TOKEN_MIN:.2f}$-{ORACLE_TOKEN_MAX:.2f}$ | EV≥{ORACLE_EDGE_MIN*100:.0f}%
+- Commun: delta≥0.020% | token 0.51$-0.75$ | EV≥15%
+- Filtres actifs: ret3s_brutal(<-0.055%) | delta_neg | gap_neg | tokenmax | tokenmin | ev
+{trade_summary}
 
-Données ({len(sample)} skips résolus):
+STATS FILTRES ({filter_stats}):
+DONNÉES ({len(sample)} skips résolus — {asset_note}):
 {chr(10).join(summary)}
 
-Identifie uniquement patterns ≥5 trades similaires. Si spécifique à un asset, précise-le.
-Réponds en 3 bullet points MAX, très concis, en français.
-Format: "• [ASSET ou COMMUN] [OBSERVATION]: [SUGGESTION CONCRÈTE]" """
+INSTRUCTIONS:
+- Identifie uniquement patterns ≥5 trades similaires (statistiquement significatifs)
+- Si pattern spécifique à un asset, précise [BTC]/[ETH]/[SOL]
+- Si pattern commun aux 3, précise [COMMUN]
+- Évalue si un filtre est trop strict ou pas assez
+- Propose des seuils concrets et chiffrés
+- Sois direct, concis, actionnable
+
+Réponds en EXACTEMENT 3 bullet points en français:
+Format: "• [ASSET] [OBSERVATION]: [SUGGESTION avec chiffres]" """
 
     try:
         async with aiohttp.ClientSession() as s:
-            async with s.post("https://api.anthropic.com/v1/messages",
+            async with s.post(CLAUDE_API,
                 headers={"Content-Type":"application/json","x-api-key":ANTHROPIC_KEY,
                          "anthropic-version":"2023-06-01"},
-                json={"model":"claude-haiku-4-5-20251001","max_tokens":300,
+                json={"model":"claude-sonnet-4-6","max_tokens":500,
                       "messages":[{"role":"user","content":prompt}]},
-                timeout=aiohttp.ClientTimeout(total=20)) as r:
+                timeout=aiohttp.ClientTimeout(total=30)) as r:
                 if r.status==200:
                     data=await r.json()
                     insight=data["content"][0]["text"].strip()
-                    st.haiku_insights.append({"type":"haiku","ts":int(now),"insight":insight})
+                    st.haiku_insights.append({"type":"sonnet","ts":int(now),"insight":insight})
                     if len(st.haiku_insights)>20: st.haiku_insights=st.haiku_insights[-20:]
                     st.last_haiku_ts=now
-                    log.info(f"Haiku: {insight[:80]}")
+                    log.info(f"Sonnet analysis: {insight[:80]}")
                     await send(context.bot, f"🤖 *Haiku Analysis*\n{insight}")
+                else:
+                    err = await r.text()
+                    log.warning(f"Sonnet API {r.status}: {err[:100]}")
     except Exception as e:
-        log.warning(f"Haiku: {e}")
+        log.warning(f"Haiku/Sonnet: {e}")
 
 
 async def cmd_learn(update,context):
