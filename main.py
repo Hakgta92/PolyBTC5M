@@ -4224,6 +4224,8 @@ async def _show_passes(update, context, page=1):
     """Affiche une page de passes avec boutons navigation."""
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     from datetime import datetime
+    # Résoudre les passes avant affichage
+    await job_resolve_passes(context)
     PAGE_SIZE = 12
     all_passes = sorted(st.pass_reasons, key=lambda x: x.get("ts",0), reverse=True)
     total = len(all_passes)
