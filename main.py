@@ -2928,6 +2928,7 @@ async def job_oracle_lag(context):
         old = [p for t,p in pts if t <= cutoff]
         return (spot_now - old[-1]) / old[-1] * 100 if old and old[-1] > 0 else 0.0
     ret_3s = ret_over(3); ret_15s = ret_over(15)
+    ret3s_override = False
 
     oracle_delta = (st.oracle_price - st.oracle_slot_open) / st.oracle_slot_open * 100
     spot_oracle_gap = (spot_now - st.oracle_price) / st.oracle_price * 100
@@ -2942,8 +2943,8 @@ async def job_oracle_lag(context):
         # ✅ v12.6 — ret3s signal: BTC chute fort + gap positif = oracle pas rattrapé → trade DOWN
         # Le gap est positif car le spot chute MAIS l'oracle n'a pas encore suivi
         if spot_oracle_gap >= 0.005:
-            direction = "DOWN"  # Forcer DOWN — l'oracle va rattraper la chute
-            log.info(f"BTC: ret3s signal DOWN activé {ret_3s:+.3f}% gap={spot_oracle_gap:+.3f}%")
+            direction = "DOWN"; ret3s_override = True
+            log.info(f"BTC: ret3s signal DOWN {ret_3s:+.3f}% gap={spot_oracle_gap:+.3f}% → override")
         else:
             log_skip(f"BTC: ret3s {ret_3s:+.3f}%<-0.055% (chute brutale)", direction,
                      features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":0,"filter":"ret3s_brutal","asset":"BTC"}); return
@@ -2958,7 +2959,7 @@ async def job_oracle_lag(context):
     if direction == "UP" and oracle_delta < -0.005:
         log_skip(f"BTC: delta {oracle_delta:+.3f}%<0 (→ skip: delta négatif LOSS garanti)", direction,
                  features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":0,"filter":"delta_neg","asset":"BTC"}); return
-    if direction == "DOWN" and oracle_delta > 0.005:
+    if direction == "DOWN" and oracle_delta > 0.005 and not ret3s_override:
         log_skip(f"BTC: delta {oracle_delta:+.3f}%>0 (→ skip: contre DOWN)", direction,
                  features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":0,"filter":"delta_contra","asset":"BTC"}); return
 
@@ -3091,6 +3092,7 @@ async def job_oracle_lag_asset(context, asset:str):
         cut=now-secs; old=[p for t,p in pts if t<=cut]
         return (spot-old[-1])/old[-1]*100 if old and old[-1]>0 else 0.0
     ret_3s=ret_a(3); ret_15s=ret_a(15)
+    ret3s_override = False
     oracle_delta=(oracle-slot_open)/slot_open*100 if slot_open>0 else 0
     spot_oracle_gap=(spot-oracle)/oracle*100 if oracle>0 else 0
     gap_min = 0.025 if asset=="ETH" else 0.030  # v12.5: ETH plus stable
@@ -3101,8 +3103,8 @@ async def job_oracle_lag_asset(context, asset:str):
     if ret_3s<-0.055:
         # ✅ v12.6 — ret3s signal ETH/SOL: chute brutale + gap positif = oracle pas rattrapé → DOWN
         if spot_oracle_gap >= 0.005:
-            direction = "DOWN"  # Forcer DOWN — oracle va rattraper la chute
-            log.info(f"{symbol}: ret3s signal DOWN {ret_3s:+.3f}% gap={spot_oracle_gap:+.3f}%")
+            direction = "DOWN"; ret3s_override = True
+            log.info(f"{symbol}: ret3s signal DOWN {ret_3s:+.3f}% gap={spot_oracle_gap:+.3f}% → override")
         else:
             log_skip(f"{symbol}: ret3s {ret_3s:+.3f}% (chute brutale)",direction,
                      features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":0,"filter":"ret3s_brutal"})
@@ -3122,8 +3124,8 @@ async def job_oracle_lag_asset(context, asset:str):
     if direction=="UP" and oracle_delta<-0.005:
         log_skip(f"{symbol}: delta {oracle_delta:+.3f}%<0",direction,
                  features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":0,"filter":"delta_neg"}); return
-    if direction=="DOWN" and oracle_delta>0.005:
-        log_skip(f"{symbol}: delta {oracle_delta:+.3f}%>0",direction,
+    if direction=="DOWN" and oracle_delta>0.005 and not ret3s_override:
+        log_skip(f"{symbol}: delta {oracle_delta:+.3f}%>0 (→ skip: contre DOWN)",direction,
                  features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":0,"filter":"delta_contra"}); return
     price_hist=[{"price":p,"ts":t} for t,p in pts]
     ta_score,ta_dir,_=compute_ta_score(price_hist,asset)
