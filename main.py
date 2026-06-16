@@ -4249,6 +4249,16 @@ async def cmd_stats(update,context):
         f"💡 `/recap` 24h | `/passes` WR skips | `/dashboard` HTML",
         parse_mode="Markdown")
 
+async def cmd_fear(update,context):
+    if not auth(update): return
+    v=st.fg.get("value",50); bar="█"*(v//10)+"░"*(10-v//10)
+    e="😱" if v<20 else "😟" if v<40 else "😐" if v<60 else "😊" if v<80 else "🤑"
+    interp="Extrême Peur→biais UP" if v<20 else "Peur" if v<40 else "Neutre" if v<60 else "Greed" if v<80 else "Extrême Greed→biais DOWN"
+    await update.message.reply_text(
+        f"😱 *FEAR & GREED*\n{e} *{st.fg.get('label','N/A')}* — `{v}/100`\n`{bar}`\n\n_{interp}_",
+        parse_mode="Markdown")
+
+
 async def cmd_autotune(update,context):
     """✅ v10.23 — Ajuste les seuils selon le WR théorique des skips résolus."""
     if not auth(update): return
