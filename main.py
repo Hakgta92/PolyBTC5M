@@ -3099,9 +3099,14 @@ async def job_oracle_lag_asset(context, asset:str):
     primary_signal="gap" if gap_dir else "delta"
     direction=gap_dir or delta_dir
     if ret_3s<-0.055:
-        log_skip(f"{symbol}: ret3s {ret_3s:+.3f}% (chute brutale)",direction,
-                 features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":0,"filter":"ret3s_brutal"})
-        return
+        # ✅ v12.6 — ret3s signal ETH/SOL: chute brutale + gap positif = oracle pas rattrapé → DOWN
+        if spot_oracle_gap >= 0.005:
+            direction = "DOWN"  # Forcer DOWN — oracle va rattraper la chute
+            log.info(f"{symbol}: ret3s signal DOWN {ret_3s:+.3f}% gap={spot_oracle_gap:+.3f}%")
+        else:
+            log_skip(f"{symbol}: ret3s {ret_3s:+.3f}% (chute brutale)",direction,
+                     features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":0,"filter":"ret3s_brutal"})
+            return
     # ✅ v12.5 — SOL filtre ATR: spike UP brutal = mean reversion imprévisible
     if asset=="SOL" and ret_3s>0.04 and ret_15s>0.08:
         log_skip(f"SOL: spike volatilité ret3s={ret_3s:+.3f}% ret15s={ret_15s:+.3f}% (→ skip: trop volatile)", direction,
