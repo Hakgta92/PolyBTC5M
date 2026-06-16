@@ -61,7 +61,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "12.6"
+BOT_VERSION = "12.7"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -3066,7 +3066,7 @@ async def job_oracle_lag_asset(context, asset:str):
     now = time.time()
     cur_slot = int(now//300)*300
     slot_remaining = cur_slot+300-now
-    win_start = 20 if asset=="SOL" else 25
+    win_start = 15 if asset=="SOL" else 20  # v12.7: SOL T-15s, ETH T-20s
     if slot_remaining > win_start or slot_remaining < 5: return
     if asset=="ETH":
         spot=st.eth_price; spot_ts=st.eth_ts; oracle=st.eth_oracle_price
@@ -3095,7 +3095,7 @@ async def job_oracle_lag_asset(context, asset:str):
     ret3s_override = False
     oracle_delta=(oracle-slot_open)/slot_open*100 if slot_open>0 else 0
     spot_oracle_gap=(spot-oracle)/oracle*100 if oracle>0 else 0
-    gap_min = 0.025 if asset=="ETH" else 0.030  # v12.5: ETH plus stable
+    gap_min = 0.020  # v12.7: ETH et SOL gap min 0.020%
     gap_dir=("UP" if spot_oracle_gap>0 else "DOWN") if abs(spot_oracle_gap)>=gap_min else None
     delta_dir=("UP" if oracle_delta>0 else "DOWN") if abs(oracle_delta)>=ORACLE_ENTRY_DELTA else None
     primary_signal="gap" if gap_dir else "delta"
@@ -3109,11 +3109,14 @@ async def job_oracle_lag_asset(context, asset:str):
             log_skip(f"{symbol}: ret3s {ret_3s:+.3f}% (chute brutale)",direction,
                      features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":0,"filter":"ret3s_brutal"})
             return
-    # ✅ v12.5 — SOL filtre ATR: spike UP brutal = mean reversion imprévisible
+    # ✅ v12.6 — SOL filtre ATR: ignoré si gap fort >0.05% (spike = signal valide)
     if asset=="SOL" and ret_3s>0.04 and ret_15s>0.08:
-        log_skip(f"SOL: spike volatilité ret3s={ret_3s:+.3f}% ret15s={ret_15s:+.3f}% (→ skip: trop volatile)", direction,
-                 features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":0,"filter":"atr_spike"})
-        return
+        if abs(spot_oracle_gap) >= 0.05:
+            log.debug(f"SOL: ATR spike override — gap {spot_oracle_gap:+.3f}% fort → signal valide")
+        else:
+            log_skip(f"SOL: spike volatilité ret3s={ret_3s:+.3f}% ret15s={ret_15s:+.3f}% (→ skip: trop volatile)", direction,
+                     features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":0,"filter":"atr_spike"})
+            return
     if not direction:
         log_skip(f"{symbol}: signaux trop faibles",None,
                  features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":0,"filter":"weak_signal"})
@@ -3139,6 +3142,18 @@ async def job_oracle_lag_asset(context, asset:str):
             if abs(mv)>=0.030:
                 rv=1 if mv>0 else -1
                 btc_cascade_vote=rv if (direction=="UP" and rv==1)or(direction=="DOWN" and rv==-1) else -rv
+    # ✅ v12.7 — Décorrelation BTC/ETH: BTC chute + ETH stable = signal UP ETH
+    if asset=="ETH" and len(btc_pts)>=2:
+        btc15=[p for t,p in btc_pts if now-t<=15]
+        if len(btc15)>=2 and btc15[0]>0:
+            btc_move15=(btc15[-1]-btc15[0])/btc15[0]*100
+            eth_pts=list(st.eth_ws_prices)
+            eth15=[p for t,p in eth_pts if now-t<=15]
+            if len(eth15)>=2 and eth15[0]>0:
+                eth_move15=(eth15[-1]-eth15[0])/eth15[0]*100
+                if btc_move15 < -0.020 and eth_move15 > -0.005 and direction=="UP":
+                    btc_cascade_vote = max(btc_cascade_vote, 1)
+                    log.debug(f"ETH décorrelation: BTC {btc_move15:+.3f}% ETH {eth_move15:+.3f}% → UP vote")
     dir_votes=sum([
         1 if direction=="UP" and oracle_delta>0 else (-1 if direction=="DOWN" and oracle_delta<0 else 0),
         1 if direction=="UP" and spot_oracle_gap>0 else (-1 if direction=="DOWN" and spot_oracle_gap<0 else 0),
@@ -3160,8 +3175,10 @@ async def job_oracle_lag_asset(context, asset:str):
     elif asset=="SOL" and asset_up_ob and st.sol_ob_asset_id != asset_up_ob:
         if st.sol_clob_ws_task and not st.sol_clob_ws_task.done(): st.sol_clob_ws_task.cancel()
         st.sol_clob_ws_task = asyncio.create_task(ws_clob_loop_asset(asset_up_ob,"SOL"))
-    if token_price>ORACLE_TOKEN_MAX:
-        log_skip(f"{symbol}: token {token_price:.2f}$>{ORACLE_TOKEN_MAX}$ (déjà pricé)",direction,
+    # ✅ v12.6 — SOL tokenmax 0.95$ si votes ≤ -1 (Sonnet: 2W/0L à 0.92-0.98$)
+    effective_token_max = 0.95 if (asset=="SOL" and dir_votes<=-1) else ORACLE_TOKEN_MAX
+    if token_price>effective_token_max:
+        log_skip(f"{symbol}: token {token_price:.2f}$>{effective_token_max}$ (déjà pricé)",direction,
                  features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"filter":"tokenmax","token":token_price}); return
     if token_price<ORACLE_TOKEN_MIN:
         log_skip(f"{symbol}: token {token_price:.2f}$<{ORACLE_TOKEN_MIN}$ (incertain)",direction,
