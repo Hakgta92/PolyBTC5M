@@ -139,7 +139,7 @@ KILL_SWITCH_LOSSES  = 5      # Pertes consécutives → arrêt total (au-delà d
 # L'orderbook Polymarket met 30-55s à suivre → fenêtre d'arb
 # Strategy: si oracle a bougé X% depuis slot open ET token gagnant encore pas cher → BUY
 ORACLE_ENTRY_DELTA  = 0.02  # v12.4  # ✅ v10.31 — baissé 0.05→0.03% (-0.049% bloqué mais ✅ dans passes)
-ORACLE_TOKEN_MAX    = 0.68  # v12.4  # ✅ v10.32 — breakeven exact @92%WR = token 0.92$ (EV>0 jusqu'à 0.92$)
+ORACLE_TOKEN_MAX    = 0.75  # v12.5 — élargi pour plus de trades  # ✅ v10.32 — breakeven exact @92%WR = token 0.92$ (EV>0 jusqu'à 0.92$)
 ORACLE_TOKEN_MIN    = 0.51  # Token min (trop proche de 0.50$ = incertitude trop haute)
 ORACLE_EDGE_MIN     = 0.15  # v12.4  # EV minimum après frais (8%)
 ORACLE_WINDOW_START = 25    # v12.4    # Fenêtre normale: T-35s→T-6s (source: dev.to/fatherson)
@@ -1719,12 +1719,18 @@ async def send(bot,text,parse_mode="Markdown"):
 
 # ─── JOBS ──────────────────────────────────────────────────────────────────
 async def job_backup(context):
-    """v12.4 — Backup local + GitHub State toutes les 2min."""
+    """v12.5 — Backup local + GitHub State toutes les 2min."""
     try: factor, _ = calibrate_sigma(); st.calib_factor = factor
     except: pass
-    st.backup()
-    await push_state_to_github()
-    log.info("✅ Backup auto → GitHub State")
+    try:
+        st.backup()
+        log.info(f"✅ Backup local OK — {len(st.oracle_patterns)} patterns / {len(st.trades)} trades")
+    except Exception as e:
+        log.warning(f"Backup local ERREUR: {e}")
+    try:
+        await push_state_to_github()
+    except Exception as e:
+        log.warning(f"push GitHub ERREUR: {e}")
 
 async def job_daily_recap(context):
     """✅ v10.16 — Résumé 22h + rapport hebdo dimanche + alerte bot arrêté"""
@@ -2059,7 +2065,10 @@ async def push_state_to_github():
             if sha: body["sha"] = sha
             async with s.put(url, headers=hdrs, json=body) as r:
                 if r.status in (200,201): log.info("✅ State → GitHub State")
-    except Exception as e: log.warning(f"push_state: {e}")
+    except Exception as e:
+        import traceback
+        log.warning(f"push_state ERREUR: {e}")
+        log.warning(traceback.format_exc())
 
 
 def compute_rsi(prices, period=7):
