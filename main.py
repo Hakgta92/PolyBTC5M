@@ -2967,6 +2967,28 @@ async def job_oracle_lag(context):
     btc_win_start=15 if dn_ratio>0.60 else ORACLE_WINDOW_START
     if slot_remaining > btc_win_start or slot_remaining < ORACLE_WINDOW_END: return
 
+    # ✅ v12.9 — Résolution immédiate des passes du slot précédent
+    if not hasattr(st, "_last_resolved_slot"): st._last_resolved_slot = 0
+    if cur_slot != st._last_resolved_slot and st._last_resolved_slot > 0:
+        spot_now = consensus_price() or st.ws_price
+        for pr in st.pass_reasons:
+            if pr.get("resolved") is not None: continue
+            if pr.get("slot_end", 0) != st._last_resolved_slot + 300: continue
+            if pr.get("dir") not in ("UP","DOWN"): continue
+            snap = pr.get("snap", {})
+            reason = pr.get("reason","")
+            asset = "BTC"
+            for a in ("ETH","SOL","XRP"):
+                if reason.startswith(f"{a}:"): asset=a; break
+            s = snap.get(asset,(0,0,0))
+            ref = s[0] if s[0]>0 else (s[1] if s[1]>0 else s[2] if len(s)>2 else 0)
+            cur = {"BTC":spot_now,"ETH":st.eth_price,"SOL":st.sol_price,"XRP":st.xrp_price}.get(asset,0)
+            if ref>0 and cur>0:
+                pr["resolved"]="WIN" if (cur>ref)==(pr["dir"]=="UP") else "LOSS"
+            else:
+                pr["resolved"]="❓"
+    st._last_resolved_slot = cur_slot
+
     if not st.oracle_connected or st.oracle_price <= 0 or st.oracle_slot_open <= 0:
         log_skip(f"BTC: WS non dispo (T-{int(slot_remaining)}s)", None); return
     if now - st.oracle_ts > 15:
