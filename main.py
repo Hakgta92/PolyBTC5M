@@ -4500,6 +4500,9 @@ async def cmd_oracle(update,context):
             f"◎ SOL | Oracle:`${sol_o:,.2f}` | Tick:`{int(now-st.sol_oracle_ts) if st.sol_oracle_ts>0 else 999}s` {'✅' if sol_ok else '❌'}\n"
             f"  Δslot:`{sol_d:+.3f}%` | Gap:`{sol_g:+.3f}%` | SOL:`${st.sol_price:,.2f}`\n"
             f"  → {sol_rec}\n\n"
+            f"✕ XRP | Oracle:`${xrp_o:,.4f}` | Tick:`{int(now-st.xrp_oracle_ts) if st.xrp_oracle_ts>0 else 999}s` {'✅' if xrp_ok else '❌'}\n"
+            f"  Δslot:`{xrp_d:+.3f}%` | Gap:`{xrp_g:+.3f}%` | XRP:`${st.xrp_price:,.4f}`\n"
+            f"  → {xrp_rec}\n\n"
             f"WS: {' | '.join(srcs)}",
             parse_mode="Markdown")
     except Exception as e:
