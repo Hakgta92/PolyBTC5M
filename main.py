@@ -61,7 +61,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "12.5"
+BOT_VERSION = "12.6"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -3024,6 +3024,10 @@ async def job_oracle_lag(context):
     if chainlink_age < 2.0: p_oracle = min(0.97, p_oracle + 0.03)
     ev = p_oracle - token_price - fee
 
+    # ✅ v12.6 — votes minimum 3/5
+    if dir_votes < 3:
+        log_skip(f"BTC: votes {dir_votes}/5 < 3 (→ skip: consensus faible)", direction,
+                 features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"filter":"votes_min","asset":"BTC"}); return
     if ev < ORACLE_EDGE_MIN:
         log_skip(f"BTC: EV {ev*100:+.1f}%<{ORACLE_EDGE_MIN*100:.0f}% (→ skip: edge insuffisant)", direction,
                  features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"filter":"ev","token":token_price,"ev":ev,"asset":"BTC"}); return
@@ -3159,6 +3163,10 @@ async def job_oracle_lag_asset(context, asset:str):
     p_oracle=min(0.93,0.85+abs(spot_oracle_gap)*3.0) if primary_signal=="gap" else min(0.90,0.80+abs(oracle_delta)*2.0)
     if dir_votes>=3: p_oracle=min(0.95,p_oracle+0.03)
     ev=p_oracle-token_price-fee
+    # ✅ v12.6 — votes minimum 3/5 (données: 12/12 votes=2 sont LOSS)
+    if dir_votes < 3:
+        log_skip(f"{symbol}: votes {dir_votes}/5 < 3 (→ skip: consensus faible)", direction,
+                 features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"filter":"votes_min"}); return
     if ev<ORACLE_EDGE_MIN:
         log_skip(f"{symbol}: EV {ev*100:+.1f}% insuffisant",direction,
                  features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"filter":"ev","token":token_price,"ev":ev}); return
