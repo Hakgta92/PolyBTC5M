@@ -4511,6 +4511,16 @@ async def cmd_backtest(update,context):
     await update.message.reply_text(res, parse_mode="Markdown")
 
 
+async def cmd_resetskips(update,context):
+    """v12.9 — Remet à zéro les passes et patterns."""
+    if not auth(update): return
+    n_passes=len(st.pass_reasons); n_patterns=len(st.oracle_patterns)
+    st.pass_reasons.clear(); st.oracle_patterns.clear()
+    await update.message.reply_text(
+        f"🔄 *Skips réinitialisés*\n  {n_passes} passes supprimées\n  {n_patterns} patterns supprimés\nWR théorique remis à zéro ✅",
+        parse_mode="Markdown")
+
+
 async def cmd_oracle(update,context):
     if not auth(update): return
     now = time.time()
