@@ -3057,9 +3057,13 @@ async def job_oracle_lag(context):
     if direction == "UP" and spot_oracle_gap < 0:
         log_skip(f"BTC: UP bloqué gap négatif (→ skip: gap négatif)", direction,
                  features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":0,"filter":"gap_neg","asset":"BTC"}); return
+    # ✅ v12.9 Sonnet P1: BTC deltaneg exception si gap≥+0.040% ET ret3s>-0.050% (9W/3L=75%)
     if direction == "UP" and oracle_delta < -0.005:
-        log_skip(f"BTC: delta {oracle_delta:+.3f}%<0 (→ skip: delta négatif LOSS garanti)", direction,
-                 features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":0,"filter":"delta_neg","asset":"BTC"}); return
+        if (spot_oracle_gap >= 0.040 and abs(oracle_delta) >= 0.010 and ret_3s > -0.050):
+            log.debug(f"BTC deltaneg override: gap={spot_oracle_gap:+.3f}% delta={oracle_delta:+.3f}% ret3s={ret_3s:+.3f}% → autoriser (9W/3L pattern)")
+        else:
+            log_skip(f"BTC: delta {oracle_delta:+.3f}%<0 (→ skip: delta négatif LOSS garanti)", direction,
+                     features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":0,"filter":"delta_neg","asset":"BTC"}); return
     if direction == "DOWN" and oracle_delta > 0.005 and not ret3s_override:
         log_skip(f"BTC: delta {oracle_delta:+.3f}%>0 (→ skip: contre DOWN)", direction,
                  features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":0,"filter":"delta_contra","asset":"BTC"}); return
@@ -3112,10 +3116,13 @@ async def job_oracle_lag(context):
             st.clob_ws_task.cancel()
         st.clob_ws_task = asyncio.create_task(ws_clob_loop(asset_up))
 
-    # ✅ v12.9 Sonnet: BTC tokenmax avec sous-filtre ret3s≤+0.010% (7W pattern confirmé)
+    # ✅ v12.9 Sonnet P1: BTC tokenmax ret3s≤+0.010%
+    # ✅ v12.9 Sonnet P3: BTC ultra exception si delta≥+0.114% ET gap≥+0.060% (7W/0L=100%)
     if token_price > ORACLE_TOKEN_MAX:
         if ret_3s <= 0.010:
-            log.debug(f"BTC tokenmax override: tok={token_price:.2f}$ ret3s={ret_3s:+.3f}% ≤+0.010% → autoriser")
+            log.debug(f"BTC tokenmax override ret3s: tok={token_price:.2f}$ ret3s={ret_3s:+.3f}% → autoriser")
+        elif oracle_delta >= 0.114 and spot_oracle_gap >= 0.060:
+            log.debug(f"BTC tokenmax ultra-override: delta={oracle_delta:+.3f}% gap={spot_oracle_gap:+.3f}% (7W/0L pattern) → autoriser")
         else:
             log_skip(f"BTC: token {token_price:.2f}$>{ORACLE_TOKEN_MAX}$ (→ skip: marché a déjà pricé la direction)", direction,
                      features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"filter":"tokenmax","token":token_price,"asset":"BTC"}); return
@@ -3234,8 +3241,9 @@ async def job_oracle_lag_asset(context, asset:str):
     if direction=="UP" and spot_oracle_gap<0:
         log_skip(f"{symbol}: gap négatif",direction,
                  features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":0,"filter":"gap_neg"}); return
-    if direction=="UP" and oracle_delta<-0.005:
-        log_skip(f"{symbol}: delta {oracle_delta:+.3f}%<0",direction,
+    # ✅ v12.9 Sonnet P2: ETH/SOL seuil deltaneg abaissé à -0.010% (0W/8L ETH, 0W/3L SOL)
+    if direction=="UP" and oracle_delta<-0.010:
+        log_skip(f"{symbol}: delta {oracle_delta:+.3f}%<-0.010% (delta négatif)",direction,
                  features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":0,"filter":"delta_neg"}); return
     if direction=="DOWN" and oracle_delta>0.005 and not ret3s_override:
         log_skip(f"{symbol}: delta {oracle_delta:+.3f}%>0 (→ skip: contre DOWN)",direction,
@@ -3694,6 +3702,17 @@ Trades réels ({len(real_trades)} total | WR:{wr:.0f}% | PnL:{pnl:+.2f}$):
             insights_text.append(f"[{ts}] {ins.get('insight','')[:300]}")
         previous_insights = "\n\nTES ANALYSES PRÉCÉDENTES (pour cohérence et suivi):\n" + "\n---\n".join(insights_text)
 
+    # Calcul mise/gain/perte pour le prompt
+    bankroll = st.bankroll
+    avg_bet = round(bankroll * 0.04, 2)  # Kelly ~4% BR
+    real_trades = [t for t in st.trades if not t.get("paper") and t.get("result")]
+    wins_real = [t for t in real_trades if t.get("result")=="WIN"]
+    losses_real = [t for t in real_trades if t.get("result")=="LOSS"]
+    avg_win = round(sum(t.get("pnl",0) for t in wins_real)/max(len(wins_real),1), 2)
+    avg_loss = round(abs(sum(t.get("pnl",0) for t in losses_real)/max(len(losses_real),1)), 2)
+    if avg_win == 0: avg_win = round(avg_bet * 0.45, 2)  # estimation si pas de trades
+    if avg_loss == 0: avg_loss = round(avg_bet * 0.85, 2)
+
     prompt = f"""Tu es un expert en trading algorithmique sur Polymarket (marchés prédiction crypto 5min).
 Analyse les skips d'un bot oracle lag v{BOT_VERSION} — {version_note}.
 Session actuelle: {session} | {btc_move}
@@ -3718,6 +3737,8 @@ DONNÉES ({len(sample)} skips résolus — {asset_note}):
 {previous_insights}
 
 CONTEXTE IMPORTANT:
+- Bankroll: {bankroll:.2f}$ | Mise Kelly estimée: ~{avg_bet:.2f}$ par trade
+- Gain moyen estimé par WIN: ~{avg_win:.2f}$ | Perte moyenne par LOSS: ~{avg_loss:.2f}$
 - Le bot n'a eu AUCUN trade réel depuis l'ajout ETH/SOL (marché en forte tendance)
 - Objectif prioritaire: identifier des configurations qui AURAIENT dû trader et gagner
 - Token max actuel: {ORACLE_TOKEN_MAX}$ | EV min: {int(ORACLE_EDGE_MIN*100)}% | votes min: 2/5
@@ -3736,8 +3757,15 @@ QUESTIONS CLÉS À RÉPONDRE:
 - Quel seuil précis faudrait-il changer pour capturer ces gains ?
 - Y a-t-il un contexte (session, volatilité, gap fort) où on devrait être plus agressif ?
 
+CALCUL DE PROFIT OBLIGATOIRE pour chaque suggestion:
+- Bankroll actuelle: {bankroll:.2f}$
+- Mise moyenne par trade (Kelly ~3-5% BR): ~{avg_bet:.2f}$
+- Pour chaque suggestion: calcule (W supplémentaires × gain moyen) - (L supplémentaires × perte moyenne)
+- Gain moyen sur un trade: mise × (1/token - 1) | Perte moyenne: -mise
+- Si tu proposes un changement → chiffre l'impact net en dollars ET en % de bankroll
+
 Réponds en EXACTEMENT 3 bullet points actionnables en français:
-Format: "• [ASSET] [OBSERVATION + données]: [SUGGESTION CONCRÈTE avec chiffres et impact attendu]" """
+Format: "• [ASSET] [OBSERVATION + données]: [SUGGESTION CONCRÈTE] → Impact: +Xw/-Yl = +Y.YY$ net (+Z% BR)" """
 
     try:
         async with aiohttp.ClientSession() as s:
