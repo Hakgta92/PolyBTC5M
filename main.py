@@ -89,7 +89,7 @@ POLY_GAMMA         = "https://gamma-api.polymarket.com"
 POLY_CHAIN_ID      = 137
 
 # ✅ v12.4 — Filtres oracle (alias pour compatibilité save/load)
-FILTER_RET3S          = -0.055  # ret3s min (chute brutale)
+FILTER_RET3S          = -0.070  # v12.6 — relevé -0.055→-0.070
 FILTER_DELTA_CONTRA   = 0.017   # delta contra max
 FILTER_GAP_STRONG     = 0.025   # gap fort BTC
 
@@ -2939,7 +2939,7 @@ async def job_oracle_lag(context):
     direction = gap_dir or delta_dir
 
     # Filtre ret3s brutal
-    if ret_3s < -0.055:
+    if ret_3s < -0.070:  # v12.6 — seuil relevé -0.055→-0.070 (Sonnet: 4/5 wins ≤-0.075%)
         # ✅ v12.6 — ret3s signal: BTC chute fort + gap positif = oracle pas rattrapé → trade DOWN
         # Le gap est positif car le spot chute MAIS l'oracle n'a pas encore suivi
         if spot_oracle_gap >= 0.005:
@@ -3100,7 +3100,7 @@ async def job_oracle_lag_asset(context, asset:str):
     delta_dir=("UP" if oracle_delta>0 else "DOWN") if abs(oracle_delta)>=ORACLE_ENTRY_DELTA else None
     primary_signal="gap" if gap_dir else "delta"
     direction=gap_dir or delta_dir
-    if ret_3s<-0.055:
+    if ret_3s<-0.070:  # v12.6 — seuil relevé -0.055→-0.070
         # ✅ v12.6 — ret3s signal ETH/SOL: chute brutale + gap positif = oracle pas rattrapé → DOWN
         if spot_oracle_gap >= 0.005:
             direction = "DOWN"; ret3s_override = True
@@ -3313,7 +3313,7 @@ async def job_pattern_memory(context):
 
 
 async def job_haiku_analysis(context):
-    """v12.5 — Haiku/Sonnet analyse les patterns BTC/ETH/SOL toutes les 2h."""
+    """v12.6 — Sonnet analyse les patterns BTC/ETH/SOL toutes les 2h."""
     if not ANTHROPIC_KEY: return
     now = time.time()
     if now - st.last_haiku_ts < 7200: return
@@ -3410,17 +3410,26 @@ DONNÉES ({len(sample)} skips résolus — {asset_note}):
 
 {previous_insights}
 
-INSTRUCTIONS:
-- Identifie uniquement patterns ≥5 trades similaires (statistiquement significatifs)
-- Si une analyse précédente identifiait déjà un pattern, confirme ou infirme avec les nouvelles données
-- Si pattern spécifique à un asset, précise [BTC]/[ETH]/[SOL]
-- Si pattern commun aux 3, précise [COMMUN]
-- Évalue si un filtre est trop strict ou pas assez
-- Propose des seuils concrets et chiffrés
-- Sois direct, concis, actionnable
+CONTEXTE IMPORTANT:
+- Le bot n'a eu AUCUN trade réel depuis l'ajout ETH/SOL (marché en forte tendance)
+- Objectif prioritaire: identifier des configurations qui AURAIENT dû trader et gagner
+- Token max actuel: {ORACLE_TOKEN_MAX}$ | EV min: {int(ORACLE_EDGE_MIN*100)}% | votes min: 2/5
 
-Réponds en EXACTEMENT 3 bullet points en français:
-Format: "• [ASSET] [OBSERVATION]: [SUGGESTION avec chiffres]" """
+INSTRUCTIONS:
+1. Identifie les patterns de skips qui auraient été GAGNANTS (WR élevé dans les ✅)
+2. Pour chaque pattern gagnant raté, propose UN ajustement de paramètre concret et chiffré
+3. Évalue le ratio risque/opportunité: combien de trades supplémentaires gagnerait-on vs perdrait-on
+4. Si une analyse précédente identifiait un pattern, confirme ou infirme avec les nouvelles données
+5. Distingue [BTC]/[ETH]/[SOL] ou [COMMUN] selon l'asset concerné
+6. Priorise les suggestions qui augmentent le nombre de trades rentables
+
+QUESTIONS CLÉS À RÉPONDRE:
+- Quel filtre bloque le plus de trades gagnants en ce moment ?
+- Quel seuil précis faudrait-il changer pour capturer ces gains ?
+- Y a-t-il un contexte (session, volatilité, gap fort) où on devrait être plus agressif ?
+
+Réponds en EXACTEMENT 3 bullet points actionnables en français:
+Format: "• [ASSET] [OBSERVATION + données]: [SUGGESTION CONCRÈTE avec chiffres et impact attendu]" """
 
     try:
         async with aiohttp.ClientSession() as s:
@@ -3438,82 +3447,128 @@ Format: "• [ASSET] [OBSERVATION]: [SUGGESTION avec chiffres]" """
                     if len(st.haiku_insights)>20: st.haiku_insights=st.haiku_insights[-20:]
                     st.last_haiku_ts=now
                     log.info(f"Sonnet analysis: {insight[:80]}")
-                    await send(context.bot, f"🤖 *Haiku Analysis*\n{insight}")
+                    await send(context.bot, f"🤖 *Sonnet Analysis*\n{insight}")
                 else:
                     err = await r.text()
                     log.warning(f"Sonnet API {r.status}: {err[:100]}")
     except Exception as e:
-        log.warning(f"Haiku/Sonnet: {e}")
+        log.warning(f"Sonnet analysis: {e}")
 
 
 async def cmd_learn(update,context):
     if not auth(update): return
     now=time.time()
+    from datetime import datetime
     lines=["🧠 *AUTO-APPRENTISSAGE*\n━━━━━━━━━━━━━━"]
     merged_patterns=st.oracle_patterns; merged_trades=st.trades
+
+    # ── Résumé général ──
     lines.append(f"📊 {len(merged_patterns)} patterns | {len(merged_trades)} trades en mémoire")
     lines.append(f"📐 *Seuils actuels:*")
-    lines.append(f"  delta_contra:`{ORACLE_DELTA_CONTRA_MAX:.3f}%` | gap_min:`{ORACLE_ENTRY_DELTA:.3f}%`")
-    lines.append(f"  token:`{ORACLE_TOKEN_MIN:.2f}$`-`{ORACLE_TOKEN_MAX:.2f}$` | EV_min:`{ORACLE_EDGE_MIN*100:.0f}%`")
-    # Trades réels
-    trades=merged_trades
-    if trades:
-        real=[t for t in trades if not t.get("paper")]
+    lines.append(f"  delta≥`{ORACLE_ENTRY_DELTA:.3f}%` | gap BTC≥`0.025%` | gap ETH/SOL≥`0.030%`")
+    lines.append(f"  token:`{ORACLE_TOKEN_MIN:.2f}$`-`{ORACLE_TOKEN_MAX:.2f}$` | EV≥`{ORACLE_EDGE_MIN*100:.0f}%` | votes≥2")
+    lines.append(f"  BTC: T-25s→T-5s | ETH: T-25s→T-5s | SOL: T-20s→T-5s")
+
+    # ── Trades réels ──
+    real=[t for t in merged_trades if not t.get("paper")]
+    if real:
         wins_r=sum(1 for t in real if t.get("result")=="WIN")
         losses_r=len(real)-wins_r; pnl_r=sum(t.get("pnl",0) for t in real)
-        wr_r=wins_r/len(real)*100 if real else 0
+        wr_r=wins_r/len(real)*100
         avg_win=sum(t["pnl"] for t in real if t.get("result")=="WIN")/max(wins_r,1)
         avg_loss=sum(t["pnl"] for t in real if t.get("result")!="WIN")/max(losses_r,1)
         rr=abs(avg_win/avg_loss) if avg_loss!=0 else 0
-        ts_24h=now-86400; recent=[t for t in real if t.get("ts",0)>ts_24h]
+        recent=[t for t in real if t.get("ts",0)>now-86400]
         wins_24h=sum(1 for t in recent if t.get("result")=="WIN")
-        wr_24h=wins_24h/len(recent)*100 if recent else 0
-        pnl_24h=sum(t.get("pnl",0) for t in recent)
         lines.append(f"\n💰 *Trades réels:* {len(real)} | WR:`{wr_r:.0f}%` | PnL:`{pnl_r:+.2f}$`")
         lines.append(f"  Gain moy:`+{avg_win:.2f}$` | Perte moy:`{avg_loss:.2f}$` | R:R:`{rr:.2f}`")
-        lines.append(f"  📅 24h: {len(recent)} trades | WR:`{wr_24h:.0f}%` | PnL:`{pnl_24h:+.2f}$`")
+        if recent:
+            pnl_24h=sum(t.get("pnl",0) for t in recent)
+            lines.append(f"  📅 24h: {len(recent)} trades | WR:`{wins_24h/len(recent)*100:.0f}%` | PnL:`{pnl_24h:+.2f}$`")
+        ts_7j=now-604800; week=[t for t in real if t.get("ts",0)>ts_7j]
+        if len(week)>len(recent):
+            wins_7j=sum(1 for t in week if t.get("result")=="WIN")
+            pnl_7j=sum(t.get("pnl",0) for t in week)
+            lines.append(f"  📈 7j: {len(week)} trades | WR:`{wins_7j/len(week)*100:.0f}%` | PnL:`{pnl_7j:+.2f}$`")
         # Par asset
         for asset_tag,emoji in [("BTC","₿"),("ETH","Ξ"),("SOL","◎")]:
-            at=[t for t in real if t.get("asset",asset_tag if asset_tag=="BTC" else None)==asset_tag]
+            at=[t for t in real if t.get("asset","BTC")==asset_tag]
             if at:
                 w_at=sum(1 for t in at if t.get("result")=="WIN")
                 pnl_at=sum(t.get("pnl",0) for t in at)
                 lines.append(f"  {emoji} {asset_tag}: {len(at)} trades WR:`{w_at/len(at)*100:.0f}%` PnL:`{pnl_at:+.2f}$`")
-    # Patterns skips
+        # Session la plus rentable
+        sessions={}
+        for t in real:
+            s=t.get("session","?")
+            if s not in sessions: sessions[s]={"w":0,"l":0,"pnl":0}
+            if t.get("result")=="WIN": sessions[s]["w"]+=1
+            else: sessions[s]["l"]+=1
+            sessions[s]["pnl"]+=t.get("pnl",0)
+        if sessions:
+            best=max(sessions.items(),key=lambda x:x[1]["pnl"])
+            lines.append(f"  🏆 Meilleure session: `{best[0]}` PnL:`{best[1]['pnl']:+.2f}$`")
+    else:
+        lines.append(f"\n💰 *Trades réels:* 0 — en attente du premier trade")
+
+    # ── Patterns skips ──
     resolved=[p for p in merged_patterns if p.get("result") in ("WIN","LOSS")]
     resolved_cur=[p for p in resolved if p.get("v")==BOT_VERSION]
     sample=resolved_cur if len(resolved_cur)>=5 else resolved
     label=f"v{BOT_VERSION}" if len(resolved_cur)>=5 else f"all ({len(resolved_cur)} en v{BOT_VERSION})"
     if sample:
         wins=sum(1 for p in sample if p["result"]=="WIN")
+        wr_global=wins/len(sample)*100
+        # Par filtre
         by_filter={}
         for p in sample:
             f=p.get("filter","?")
             if f not in by_filter: by_filter[f]={"w":0,"l":0}
             if p["result"]=="WIN": by_filter[f]["w"]+=1
             else: by_filter[f]["l"]+=1
-        lines.append(f"\n📊 *Patterns skips: {len(sample)}* (WR:{wins/len(sample)*100:.0f}%) — {label}")
-        for f,v in sorted(by_filter.items(),key=lambda x:x[1]["w"]+x[1]["l"],reverse=True)[:6]:
+        lines.append(f"\n📊 *Patterns skips: {len(sample)}* (WR:{wr_global:.0f}%) — {label}")
+        # Top filtres triés par volume
+        for f,v in sorted(by_filter.items(),key=lambda x:x[1]["w"]+x[1]["l"],reverse=True)[:7]:
             tot=v["w"]+v["l"]; wr=v["w"]/tot*100 if tot else 0
-            emoji="✅" if wr<40 else ("⚠️" if wr>65 else "➖")
-            lines.append(f"  {emoji}`{f}`: {wr:.0f}% ({v['w']}W/{v['l']}L)")
+            e="✅" if wr<35 else ("⚠️" if wr>60 else "➖")
+            lines.append(f"  {e}`{f}`: {wr:.0f}% ({v['w']}W/{v['l']}L)")
+        # Par asset
+        for asset_tag,emoji in [("BTC","₿"),("ETH","Ξ"),("SOL","◎")]:
+            ap=[p for p in sample if p.get("asset","BTC")==asset_tag]
+            if ap:
+                w_ap=sum(1 for p in ap if p["result"]=="WIN")
+                lines.append(f"  {emoji} {asset_tag}: {len(ap)} patterns WR:{w_ap/len(ap)*100:.0f}%")
+        # 24h
         recent_p=[p for p in sample if p.get("ts",0)>now-86400]
         if recent_p:
             wins_p24=sum(1 for p in recent_p if p["result"]=="WIN")
-            lines.append(f"  📅 24h: {len(recent_p)} patterns | WR:{wins_p24/len(recent_p)*100:.0f}%")
+            wrt=wins_p24/len(recent_p)*100
+            status="✅" if wrt<50 else ("⚠️" if wrt>58 else "➖")
+            msg=f"  📅 24h: {len(recent_p)} patterns | WR:{wrt:.0f}%"
+            if wrt>58: msg+=f"\n  {status} {len(recent_p)} skips résolus, WR {wrt:.0f}% >58% — filtres trop stricts."
+            elif wrt<40: msg+=f"\n  {status} ~50% — les filtres ne coûtent rien"
+            else: msg+=f"\n  ➖ Zone grise — encore besoin de données"
+            lines.append(msg)
     else:
         lines.append(f"\n📊 Pas encore assez de patterns (<5 pour cette version)")
-    # Calibration
+
+    # ── Calibration ──
     if st.calibration_log:
-        last=st.calibration_log[-1]; ts=datetime.fromtimestamp(last["ts"]).strftime("%d/%m %H:%M")
+        last=st.calibration_log[-1]
+        ts=datetime.fromtimestamp(last["ts"]).strftime("%d/%m %H:%M")
         lines.append(f"\n🔧 *Calibration:* `{ts}`")
-        for a in last["adjustments"][:3]: lines.append(f"  • {a}")
-    # Haiku
-    if st.haiku_insights:
-        last_h=[x for x in st.haiku_insights if x["type"]=="haiku"]
-        if last_h:
-            lines.append(f"\n🤖 *Haiku ({datetime.fromtimestamp(last_h[-1].get('ts',now)).strftime('%d/%m %H:%M')}):*")
-            lines.append(last_h[-1]["insight"][:400])
+        for a in last["adjustments"][:2]: lines.append(f"  • {a}")
+
+    # ── Sonnet dernière analyse ──
+    all_insights=[x for x in st.haiku_insights if x.get("insight")]
+    if all_insights:
+        last_s=all_insights[-1]
+        ts_s=datetime.fromtimestamp(last_s.get("ts",now)).strftime("%d/%m %H:%M")
+        lines.append(f"\n🤖 *Sonnet ({ts_s}):*")
+        lines.append(last_s["insight"][:500])
+    else:
+        lines.append(f"\n🤖 *Sonnet:* Prochaine analyse dans {int((st.last_haiku_ts+7200-now)/60)}min")
+
     try: await update.message.reply_text("\n".join(lines),parse_mode="Markdown")
     except:
         clean=[l.replace("*","").replace("`","").replace("_","") for l in lines]
@@ -4065,6 +4120,20 @@ async def cmd_paper(update,context):
     if not st.paper_mode and not poly.ready: poly.init_client()
     await update.message.reply_text(f"Mode:*{'📄 PAPER' if st.paper_mode else '💰 RÉEL ⚠️'}* | API:{'✅' if poly.ready else '❌'}",parse_mode="Markdown")
     st.backup()
+
+async def cmd_resetskips(update,context):
+    """v12.6 — Remet à zéro les passes et patterns."""
+    if not auth(update): return
+    n_passes = len(st.pass_reasons)
+    n_patterns = len(st.oracle_patterns)
+    st.pass_reasons.clear()
+    st.oracle_patterns.clear()
+    await update.message.reply_text(
+        f"🔄 *Skips réinitialisés*\n"
+        f"  {n_passes} passes supprimées\n"
+        f"  {n_patterns} patterns supprimés\n"
+        f"WR théorique remis à zéro ✅", parse_mode="Markdown")
+
 
 async def cmd_reset(update,context):
     if not auth(update): return
