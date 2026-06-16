@@ -3025,8 +3025,8 @@ async def job_oracle_lag(context):
     ev = p_oracle - token_price - fee
 
     # ✅ v12.6 — votes minimum 3/5
-    if dir_votes < 3:
-        log_skip(f"BTC: votes {dir_votes}/5 < 3 (→ skip: consensus faible)", direction,
+    if dir_votes < 2:
+        log_skip(f"BTC: votes {dir_votes}/5 < 2 (→ skip: consensus faible)", direction,
                  features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"filter":"votes_min","asset":"BTC"}); return
     if ev < ORACLE_EDGE_MIN:
         log_skip(f"BTC: EV {ev*100:+.1f}%<{ORACLE_EDGE_MIN*100:.0f}% (→ skip: edge insuffisant)", direction,
@@ -3164,8 +3164,8 @@ async def job_oracle_lag_asset(context, asset:str):
     if dir_votes>=3: p_oracle=min(0.95,p_oracle+0.03)
     ev=p_oracle-token_price-fee
     # ✅ v12.6 — votes minimum 3/5 (données: 12/12 votes=2 sont LOSS)
-    if dir_votes < 3:
-        log_skip(f"{symbol}: votes {dir_votes}/5 < 3 (→ skip: consensus faible)", direction,
+    if dir_votes < 2:
+        log_skip(f"{symbol}: votes {dir_votes}/5 < 2 (→ skip: consensus faible)", direction,
                  features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"filter":"votes_min"}); return
     if ev<ORACLE_EDGE_MIN:
         log_skip(f"{symbol}: EV {ev*100:+.1f}% insuffisant",direction,
