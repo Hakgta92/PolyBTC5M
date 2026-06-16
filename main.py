@@ -1650,13 +1650,14 @@ def log_skip(reason, direction=None, features=None):
     now = int(time.time())
     entry = {"ts": now, "reason": reason, "dir": direction,
              "slot_end": (now // 300) * 300 + 300,
-             "open_px": st.slot_open_price if st.slot_open_price > 0 else st.price,
-             "asset_open": {
-                 "BTC": st.slot_open_price if st.slot_open_price>0 else st.price,
-                 "ETH": st.eth_oracle_slot_open if st.eth_oracle_slot_open>0 else st.eth_price,
-                 "SOL": st.sol_oracle_slot_open if st.sol_oracle_slot_open>0 else st.sol_price,
-                 "XRP": st.xrp_oracle_slot_open if st.xrp_oracle_slot_open>0 else st.xrp_price,
+             # v12.8 — snapshot prix ACTUELS + oracle au moment du log
+             "snap": {
+                 "BTC": (st.oracle_slot_open, st.oracle_price, st.ws_price),
+                 "ETH": (st.eth_oracle_slot_open, st.eth_oracle_price, st.eth_price),
+                 "SOL": (st.sol_oracle_slot_open, st.sol_oracle_price, st.sol_price),
+                 "XRP": (st.xrp_oracle_slot_open, st.xrp_oracle_price, st.xrp_price),
              },
+             "open_px": st.oracle_slot_open if st.oracle_slot_open>0 else st.oracle_price,
              "resolved": None}
     st.pass_reasons.append(entry)
     if features and direction:
@@ -3299,45 +3300,62 @@ async def job_oracle_lag_xrp(context):
 
 
 async def job_resolve_passes(context):
-    """v12.8 — Résout les passes théoriques toutes les 30s pour BTC/ETH/SOL/XRP."""
+    """v12.8 — Résout les passes théoriques pour BTC/ETH/SOL/XRP."""
     now = time.time()
-    prices = {
+    cur_prices = {
         "BTC": consensus_price() if consensus_price() > 0 else st.ws_price,
-        "ETH": st.eth_price,
-        "SOL": st.sol_price,
-        "XRP": st.xrp_price,
+        "ETH": st.eth_price if st.eth_price > 0 else 0,
+        "SOL": st.sol_price if st.sol_price > 0 else 0,
+        "XRP": st.xrp_price if st.xrp_price > 0 else 0,
     }
+    # Prix de référence des slots actuels (fallback si open_px manquant)
+    slot_opens = {
+        "BTC": st.oracle_slot_open if st.oracle_slot_open > 0 else st.oracle_price,
+        "ETH": st.eth_oracle_slot_open if st.eth_oracle_slot_open > 0 else st.eth_oracle_price,
+        "SOL": st.sol_oracle_slot_open if st.sol_oracle_slot_open > 0 else st.sol_oracle_price,
+        "XRP": st.xrp_oracle_slot_open if st.xrp_oracle_slot_open > 0 else st.xrp_oracle_price,
+    }
+
     for pr in st.pass_reasons:
         if pr.get("resolved") is not None: continue
-        if pr.get("slot_end",0) <= 0: continue
-        if now < pr["slot_end"] + 5: continue  # attendre 5s après fin du slot
-        if pr.get("dir") not in ("UP","DOWN"): continue
+        slot_end = pr.get("slot_end", 0)
+        if slot_end <= 0 or now < slot_end + 5: continue
+        direction = pr.get("dir")
+        if direction not in ("UP","DOWN"): continue
 
-        # Détecter l'asset
+        # Détecter l'asset depuis la raison
         reason = pr.get("reason","")
         asset = "BTC"
-        if reason.startswith("ETH:") or "[ETH]" in reason[:8]: asset = "ETH"
-        elif reason.startswith("SOL:") or "[SOL]" in reason[:8]: asset = "SOL"
-        elif reason.startswith("XRP:") or "[XRP]" in reason[:8]: asset = "XRP"
+        for a in ("ETH","SOL","XRP"):
+            if reason.startswith(f"{a}:") or f"[{a}]" in reason[:6]:
+                asset = a; break
 
-        # Prix de référence et prix actuel
-        asset_opens = pr.get("asset_open", {})
-        ref_px = asset_opens.get(asset, 0) or pr.get("open_px", 0)
-        cur_px = prices.get(asset, 0)
+        cur_px = cur_prices.get(asset, 0)
+        if cur_px <= 0: continue
 
-        if ref_px <= 0 or cur_px <= 0: continue
-        won = (cur_px > ref_px) == (pr["dir"] == "UP")
+        # Utiliser snap (snapshot au moment du log) pour ref_px
+        snap = pr.get("snap", {}).get(asset, (0, 0, 0))
+        ref_px = snap[0] if snap[0] > 0 else (snap[1] if snap[1] > 0 else pr.get("open_px", 0))
+
+        if ref_px <= 0:
+            # Fallback: oracle price actuel comme ref (approximatif)
+            ref_px = {"BTC":st.oracle_price,"ETH":st.eth_oracle_price,
+                      "SOL":st.sol_oracle_price,"XRP":st.xrp_oracle_price}.get(asset, 0)
+        if ref_px <= 0 or cur_px <= 0:
+            pr["resolved"] = "❓"  # Impossible à résoudre
+            continue
+
+        won = (cur_px > ref_px) == (direction == "UP")
         pr["resolved"] = "WIN" if won else "LOSS"
 
-    # Même chose pour oracle_patterns
+    # Résoudre oracle_patterns
     for pat in st.oracle_patterns:
         if pat.get("result") is not None: continue
-        if pat.get("slot_end",0) <= 0: continue
-        if now < pat["slot_end"] + 5: continue
+        if pat.get("slot_end",0) <= 0 or now < pat["slot_end"] + 5: continue
         if pat.get("direction") not in ("UP","DOWN"): continue
         asset = pat.get("asset","BTC")
-        ref_px = pat.get("open_px",0)
-        cur_px = prices.get(asset, 0)
+        cur_px = cur_prices.get(asset, 0)
+        ref_px = pat.get("open_px", 0)
         if ref_px <= 0 or cur_px <= 0: continue
         won = (cur_px > ref_px) == (pat["direction"] == "UP")
         pat["result"] = "WIN" if won else "LOSS"
@@ -4242,7 +4260,7 @@ async def _show_passes(update, context, page=1):
         ts=p.get("ts",0); reason=p.get("reason","?"); result=p.get("result"); direction=p.get("dir")
         t=datetime.fromtimestamp(ts).strftime("%H:%M") if ts else "??"
         r_clean=reason.replace("**","").replace("__","")[:80]
-        emoji="✅" if result=="WIN" else ("❌" if result=="LOSS" else "⏳")
+        emoji="✅" if result=="WIN" else ("❌" if result=="LOSS" else ("❓" if result=="❓" else "⏳"))
         dir_str=f" {direction}" if direction else " —"
         lines.append(f"{t}{dir_str} {emoji} {r_clean}")
 
