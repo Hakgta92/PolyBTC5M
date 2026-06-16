@@ -4151,54 +4151,66 @@ async def cmd_autotune(update,context):
         parse_mode="Markdown")
 
 async def cmd_passes(update,context):
-    """v12.8 — Affiche les skips avec pagination. /passes 2 = page 2"""
+    """v12.8 — Affiche les skips avec boutons pagination."""
     if not auth(update): return
-    PAGE_SIZE = 12
     page = 1
     if context.args:
         try: page = max(1, int(context.args[0]))
         except: pass
+    await _show_passes(update, context, page)
 
+async def _show_passes(update, context, page=1):
+    """Affiche une page de passes avec boutons navigation."""
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    from datetime import datetime
+    PAGE_SIZE = 12
     all_passes = sorted(st.pass_reasons, key=lambda x: x.get("ts",0), reverse=True)
     total = len(all_passes)
     total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
-    page = min(page, total_pages)
-    start = (page-1)*PAGE_SIZE
-    passes = all_passes[start:start+PAGE_SIZE]
+    page = min(max(1, page), total_pages)
+    passes = all_passes[(page-1)*PAGE_SIZE : page*PAGE_SIZE]
 
     if not passes:
-        await update.message.reply_text("✅ Aucun PASS."); return
+        msg = update.callback_query.message if update.callback_query else update.message
+        await msg.reply_text("✅ Aucun PASS."); return
 
-    from datetime import datetime
-    lines=[f"🚫 *DERNIERS PASS — BTC/ETH/SOL/XRP* (page {page}/{total_pages})\n━━━━━━━━━━━━━━"]
+    lines=[f"🚫 *PASSES — BTC/ETH/SOL/XRP* ({page}/{total_pages})\n━━━━━━━━━━━━━━"]
     for p in passes:
         ts=p.get("ts",0); reason=p.get("reason","?"); result=p.get("result"); direction=p.get("dir")
         t=datetime.fromtimestamp(ts).strftime("%H:%M") if ts else "??"
-        reason_clean=reason.replace("**","").replace("__","")
-        if result=="WIN": emoji="✅"
-        elif result=="LOSS": emoji="❌"
-        else: emoji="⏳"
+        r_clean=reason.replace("**","").replace("__","")[:80]
+        emoji="✅" if result=="WIN" else ("❌" if result=="LOSS" else "⏳")
         dir_str=f" {direction}" if direction else " —"
-        lines.append(f"{t}{dir_str} {emoji} {reason_clean[:80]}")
+        lines.append(f"{t}{dir_str} {emoji} {r_clean}")
 
-    # Stats WR
     resolved=[p for p in all_passes if p.get("result") in ("WIN","LOSS")]
     if resolved:
         wins=sum(1 for p in resolved if p["result"]=="WIN")
         wr=wins/len(resolved)*100
-        if wr>58: status=f"⚠️ {len(resolved)} skips résolus, WR {wr:.0f}% >58% — filtres trop stricts."
-        elif wr<40: status=f"✅ ~50% — les filtres ne coûtent rien, le marché était plat"
-        else: status=f"➖ Zone grise — encore besoin de données"
-        lines.append(f"\n📊 WR théorique des skips: {wr:.0f}% ({wins}/{len(resolved)})")
-        lines.append(status)
+        lines.append(f"\n📊 WR: {wr:.0f}% ({wins}/{len(resolved)})")
+        if wr>58: lines.append("⚠️ Filtres peut-être trop stricts")
+        elif wr<40: lines.append("✅ Filtres corrects")
+        else: lines.append("➖ Zone grise")
 
-    if total_pages > 1:
-        lines.append(f"\n📄 Page {page}/{total_pages} | `/passes {page+1}` pour la suivante" if page < total_pages else f"\n📄 Page {page}/{total_pages} | `/passes 1` pour le début")
+    text="\n".join(lines)
 
-    try: await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    # Boutons navigation
+    buttons=[]
+    if page > 1: buttons.append(InlineKeyboardButton("⬅️ Précédent", callback_data=f"passes:{page-1}"))
+    if page < total_pages: buttons.append(InlineKeyboardButton("Suivant ➡️", callback_data=f"passes:{page+1}"))
+    keyboard = InlineKeyboardMarkup([buttons]) if buttons else None
+
+    try:
+        if update.callback_query:
+            await update.callback_query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+        else:
+            await update.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
     except:
-        clean=[l.replace("*","").replace("`","") for l in lines]
-        await update.message.reply_text("\n".join(clean))
+        clean=text.replace("*","").replace("`","")
+        if update.callback_query:
+            await update.callback_query.edit_message_text(clean, reply_markup=keyboard)
+        else:
+            await update.message.reply_text(clean, reply_markup=keyboard)
 
 
 async def cmd_fear(update,context):
@@ -4543,6 +4555,9 @@ async def cmd_revive(update,context):
 
 async def cb(update,context):
     q=update.callback_query; await q.answer()
+    if q.data.startswith("passes:"):
+        page=int(q.data.split(":")[1])
+        await _show_passes(update,context,page); return
     h={"status":cmd_status,"ai":cmd_ai,"trades":cmd_trades,"stats":cmd_stats,
        "fear":cmd_fear,"score":cmd_score,"run":cmd_run,"stop":cmd_stop,"paper":cmd_paper}
     if q.data in h: await h[q.data](update,context)
