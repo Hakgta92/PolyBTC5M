@@ -142,8 +142,8 @@ ORACLE_ENTRY_DELTA  = 0.02  # v12.4  # ✅ v10.31 — baissé 0.05→0.03% (-0.0
 ORACLE_TOKEN_MAX    = 0.80  # v12.6 — élargi pour accumuler des données  # ✅ v10.32 — breakeven exact @92%WR = token 0.92$ (EV>0 jusqu'à 0.92$)
 ORACLE_TOKEN_MIN    = 0.51  # Token min (trop proche de 0.50$ = incertitude trop haute)
 ORACLE_EDGE_MIN     = 0.15  # v12.4  # EV minimum après frais (8%)
-ORACLE_WINDOW_START = 25    # v12.4    # Fenêtre normale: T-35s→T-6s (source: dev.to/fatherson)
-ORACLE_WINDOW_END   = 5     # v12.4     # T-6s = dernier moment sûr (latence ordre ~2-3s)
+ORACLE_WINDOW_START = 45    # v12.9 — élargi T-25→T-45 (demande user 17/06)    # Fenêtre normale: T-45s→T-10s
+ORACLE_WINDOW_END   = 10    # v12.9 — élargi T-5→T-10     # T-10s = nouveau dernier moment sûr
 # ✅ v10.32 — Mode T-10s (source: github.com/Archetapp — T-10s "direction quasi lockée")
 ORACLE_ULTRA_WINDOW = 12    # Passe ultra-précise si T-12s→T-6s ET EV exceptionnelle
 ORACLE_ULTRA_EV_MIN = 0.05  # EV min pour passe ultra (moins strict car WR > 95% à T-10s)
@@ -3187,8 +3187,8 @@ async def job_oracle_lag_asset(context, asset:str):
     now = time.time()
     cur_slot = int(now//300)*300
     slot_remaining = cur_slot+300-now
-    win_start = 15 if asset=="SOL" else (20 if asset in ("ETH","XRP") else 25)  # v12.8: XRP T-20s
-    if slot_remaining > win_start or slot_remaining < 5: return
+    win_start = 45  # v12.9 — élargi uniformément à T-45s pour BTC/ETH/SOL/XRP (demande user 17/06)
+    if slot_remaining > win_start or slot_remaining < 10: return
     if asset=="ETH":
         spot=st.eth_price; spot_ts=st.eth_ts; oracle=st.eth_oracle_price
         oracle_ts=st.eth_oracle_ts; slot_open=st.eth_oracle_slot_open
@@ -3441,7 +3441,7 @@ async def job_resolve_passes(context):
 
 
 async def job_momentum_btc(context):
-    """v12.9 — 2ème fenêtre BTC: momentum T-90s→T-60s.
+    """v12.9 — 2ème fenêtre BTC: momentum T-150s→T-60s.
     Source: 69.6% WR live (23 trades), wallet $42K profit (24W/5L)
     Signal: BTC move ≥0.30% en 60s + token 0.55-0.65$ + anti-reversal ret3s
     """
@@ -3450,8 +3450,8 @@ async def job_momentum_btc(context):
     cur_slot = int(now // 300) * 300
     slot_remaining = cur_slot + 300 - now
 
-    # Fenêtre T-90s→T-60s uniquement
-    if not (60 <= slot_remaining <= 90): return
+    # Fenêtre T-150s→T-60s uniquement
+    if not (60 <= slot_remaining <= 150): return
     if st.momentum_last_slot == cur_slot: return
     if st.oracle_price <= 0 or st.ws_price <= 0: return
 
@@ -3480,6 +3480,26 @@ async def job_momentum_btc(context):
     # Filtre 2: anti-reversal ret3s dans même direction
     if direction == "UP" and ret_3s < -0.050: return
     if direction == "DOWN" and ret_3s > 0.050: return
+
+    # ✅ v12.9 — Filtre tendance macro 10min (source: étude live Jung-Hua Liu mars 2026:
+    # sans ce filtre, session réelle = -49.5% ROI avec 80% des trades UP pendant tendance DOWN;
+    # avec filtre 10min ajouté = pertes réduites de 93%→13%, biais directionnel éliminé)
+    # Appel API placé ICI (pas avant) pour ne pas spammer Binance à chaque tick de 2s —
+    # seulement quand un signal momentum candidat est déjà détecté.
+    try:
+        klines_10m = await fetch_klines("1m", limit=10, symbol="btcusdt")
+        if klines_10m and len(klines_10m) >= 5:
+            trend_10m = (klines_10m[-1]["close"] - klines_10m[0]["open"]) / klines_10m[0]["open"] * 100
+            if direction == "UP" and trend_10m <= -0.10:
+                log_skip(f"BTC [MOM]: trend10m {trend_10m:+.3f}% contre UP (tendance macro contraire)", direction,
+                         features={"gap":0,"delta":ret_60s,"ret3s":ret_3s,"votes":0,"filter":"mom_trend_contra","asset":"BTC","source":"momentum"}); return
+            if direction == "DOWN" and trend_10m >= 0.10:
+                log_skip(f"BTC [MOM]: trend10m {trend_10m:+.3f}% contre DOWN (tendance macro contraire)", direction,
+                         features={"gap":0,"delta":ret_60s,"ret3s":ret_3s,"votes":0,"filter":"mom_trend_contra","asset":"BTC","source":"momentum"}); return
+        else:
+            trend_10m = 0.0  # fallback si klines indisponibles — ne bloque pas le trade
+    except Exception:
+        trend_10m = 0.0  # sécurité: si l'appel échoue, ne pas bloquer le momentum sur une panne réseau
 
     # ── Récupérer marché + token ──
     market = await poly.get_market_by_slug(f"btc-updown-5m-{cur_slot}")
@@ -3517,7 +3537,7 @@ async def job_momentum_btc(context):
     market_end = market.get("end_date","")
     sess = session_ctx()
     conf_score = {"score":0,"signals":[]}
-    reasoning = f"⚡MOMENTUM BTC {direction} | ret60s={ret_60s:+.3f}% ret30s={ret_30s:+.3f}% ret3s={ret_3s:+.3f}% | tok={token_price:.2f}$ EV={ev*100:+.1f}% T-{int(slot_remaining)}s"
+    reasoning = f"⚡MOMENTUM BTC {direction} | ret60s={ret_60s:+.3f}% ret30s={ret_30s:+.3f}% ret3s={ret_3s:+.3f}% trend10m={trend_10m:+.3f}% | tok={token_price:.2f}$ EV={ev*100:+.1f}% T-{int(slot_remaining)}s"
 
     ok = await place_bet(context, direction, amount, round(p_mom,2), reasoning, conf_score, sess, tpu, tpd, market_end, source="momentum")
     if not ok: return
@@ -3528,6 +3548,7 @@ async def job_momentum_btc(context):
         f"🚀 *MOMENTUM BTC* [{mode}]\n━━━━━━━━━━━━━━\n"
         f"*{direction}* | `{amount:.2f}$` | P:`{p_mom*100:.0f}%` | ⏰T-`{int(slot_remaining)}s`\n"
         f"Ret 60s:`{ret_60s:+.3f}%` | 30s:`{ret_30s:+.3f}%` | 3s:`{ret_3s:+.3f}%`\n"
+        f"Trend 10m:`{trend_10m:+.3f}%` (filtre macro)\n"
         f"Token:`{token_price:.2f}$` | EV:`{ev*100:+.1f}%`\n\n"
         f"📝 _2ème fenêtre momentum — entrée tôt sur fort move_")
 
@@ -3775,11 +3796,11 @@ STRATÉGIE: Le bot exploite le lag entre Chainlink (oracle Polymarket) et le pri
 Il achète le token UP ou DOWN avant que le marché reprices l'oracle.
 
 PARAMÈTRES ACTUELS:
-- BTC: gap≥0.025% | T-25s→T-5s
-- ETH: gap≥0.020% | T-20s→T-5s
-- SOL: gap≥0.020% | T-15s→T-5s
-- XRP: gap≥0.025% | T-20s→T-5s
-- BTC MOMENTUM: ret60s≥0.30% | T-90s→T-60s | tok 0.55$-0.65$ (2ème fenêtre indépendante)
+- BTC: gap≥0.025% | T-45s→T-10s
+- ETH: gap≥0.020% | T-45s→T-10s
+- SOL: gap≥0.020% | T-45s→T-10s
+- XRP: gap≥0.025% | T-45s→T-10s
+- BTC MOMENTUM: ret60s≥0.30% | T-150s→T-60s | tok 0.55$-0.65$ | filtre trend macro 10min (bloque si tendance 10min contraire ≥0.10%, source: étude live ayant réduit pertes -93%→-13% avec ce filtre) (2ème fenêtre indépendante)
 - Commun: delta≥0.020% | token BTC 0.51$-0.80$ (exceptions: ret3s≤+0.010% OU delta≥0.114%+gap≥0.060%) | ETH/XRP/SOL(votes≤-1) token max 0.95$ | EV≥15% | votes≥2 (consensus pour la direction parié, pas score brut)
 - BTC deltaneg: bloqué sauf si gap≥0.040% ET ret3s>-0.050% (exception validée 9W/3L)
 - ETH/SOL/XRP deltaneg: seuil strict -0.010% (0% WR historique si assoupli)
@@ -3818,7 +3839,7 @@ INSTRUCTIONS:
 
 QUESTIONS CLÉS À RÉPONDRE:
 - Quel filtre bloque le plus de trades gagnants en ce moment ?
-- La 2ème fenêtre MOMENTUM BTC (T-90s→T-60s) performe-t-elle ? Faut-il ajuster ret60s seuil ou token range ?
+- La 2ème fenêtre MOMENTUM BTC (T-150s→T-60s) performe-t-elle ? Faut-il ajuster ret60s seuil ou token range ?
 - Quel seuil précis faudrait-il changer pour capturer ces gains ?
 - Y a-t-il un contexte (session, volatilité, gap fort) où on devrait être plus agressif ?
 
@@ -3870,7 +3891,7 @@ async def cmd_learn(update,context):
     lines.append(f"📐 *Seuils actuels:*")
     lines.append(f"  delta≥`{ORACLE_ENTRY_DELTA:.3f}%` | gap BTC≥`0.025%` | gap ETH/SOL≥`0.020%` | gap XRP≥`0.025%`")
     lines.append(f"  token:`{ORACLE_TOKEN_MIN:.2f}$`-`{ORACLE_TOKEN_MAX:.2f}$`(BTC) `0.95$`(ETH/XRP/SOL) | EV≥`{ORACLE_EDGE_MIN*100:.0f}%` | votes≥2(dir)")
-    lines.append(f"  BTC: T-25s→T-5s | ETH: T-20s→T-5s | SOL: T-15s→T-5s | XRP: T-20s→T-5s")
+    lines.append(f"  BTC: T-45s→T-10s | ETH: T-45s→T-10s | SOL: T-45s→T-10s | XRP: T-45s→T-10s")
 
     # ── Trades réels ──
     real=[t for t in merged_trades if not t.get("paper")]
@@ -4050,8 +4071,8 @@ async def cmd_run(update,context):
     await update.message.reply_text(
         f"🚀 *Bot v{BOT_VERSION} démarré !*\nMode:*{'📄 PAPER' if st.paper_mode else '💰 RÉEL'}*\n"
         f"Session:`{sess['session']}` | Seuils: score≥`{min_score}` mom≥`{min_mom}`\n"
-        f"⚡ BTC T-25→T-5s | ETH T-20→T-5s | SOL T-15→T-5s | XRP T-20→T-5s\n"
-        f"🚀 BTC Momentum T-90s→T-60s | move≥0.30%/60s | tok 0.55$-0.65$\n"
+        f"⚡ BTC T-45→T-10s | ETH T-45→T-10s | SOL T-45→T-10s | XRP T-45→T-10s\n"
+        f"🚀 BTC Momentum T-150s→T-60s | move≥0.30%/60s | tok 0.55$-0.65$ | filtre trend10m\n"
         f"  gap BTC/XRP≥2.5bps | ETH/SOL≥2.0bps | delta≥{int(ORACLE_ENTRY_DELTA*10000)}bps | Token≤{ORACLE_TOKEN_MAX}$(BTC)/0.95$(ETH/XRP/SOL) | EV≥{int(ORACLE_EDGE_MIN*100)}%\n"
         f"BR:`{st.bankroll:.2f}$` | ROI:`{roi()}`\n"
         f"📊 `{ob_txt}` | 💸 `{liq_txt}`\n"
@@ -4734,7 +4755,7 @@ async def cmd_resetskips(update,context):
 
 
 async def cmd_momentum(update,context):
-    """v12.9 — Signal momentum BTC T-90s→T-60s en temps réel."""
+    """v12.9 — Signal momentum BTC T-150s→T-60s en temps réel."""
     if not auth(update): return
     now = time.time()
     cur_slot = int(now // 300) * 300
@@ -4755,7 +4776,7 @@ async def cmd_momentum(update,context):
     ret_3s  = ret_over(3)
 
     # Status signal
-    in_window = 60 <= slot_remaining <= 90
+    in_window = 60 <= slot_remaining <= 150
     signal = abs(ret_60s) >= 0.30
     direction = "UP 📈" if ret_60s > 0 else "DOWN 📉"
     mom_ok = (ret_60s > 0 and ret_30s > 0.05) or (ret_60s < 0 and ret_30s < -0.05)
@@ -4764,7 +4785,7 @@ async def cmd_momentum(update,context):
     if signal and in_window and mom_ok and anti_rev:
         status = "🚀 *SIGNAL ACTIF* — Momentum trade en cours!"
     elif signal and not in_window:
-        status = f"⏳ Signal fort mais hors fenêtre (T-{int(slot_remaining)}s, fenêtre T-90s→T-60s)"
+        status = f"⏳ Signal fort mais hors fenêtre (T-{int(slot_remaining)}s, fenêtre T-150s→T-60s)"
     elif not signal:
         status = f"📡 Pas de signal (ret60s={ret_60s:+.3f}% < ±0.30%)"
     else:
@@ -4772,14 +4793,28 @@ async def cmd_momentum(update,context):
 
     last_mom = "jamais" if st.momentum_last_slot == 0 else f"slot {st.momentum_last_slot}"
 
+    # ✅ v12.9 — Affichage du filtre trend macro 10min (même logique que job_momentum_btc)
+    trend_10m = None
+    trend_ok = True
+    try:
+        klines_10m = await fetch_klines("1m", limit=10, symbol="btcusdt")
+        if klines_10m and len(klines_10m) >= 5:
+            trend_10m = (klines_10m[-1]["close"] - klines_10m[0]["open"]) / klines_10m[0]["open"] * 100
+            if ret_60s > 0 and trend_10m <= -0.10: trend_ok = False
+            if ret_60s < 0 and trend_10m >= 0.10: trend_ok = False
+    except Exception:
+        pass
+    trend_txt = f"`{trend_10m:+.3f}%` {'✅' if trend_ok else '❌ contraire'}" if trend_10m is not None else "`indisponible`"
+
     await update.message.reply_text(
-        f"🚀 *MOMENTUM BTC — T-90s→T-60s*\n━━━━━━━━━━━━━━\n"
+        f"🚀 *MOMENTUM BTC — T-150s→T-60s*\n━━━━━━━━━━━━━━\n"
         f"Fenêtre: `T-{int(slot_remaining)}s` {'✅ ACTIVE' if in_window else '❌ hors fenêtre'}\n\n"
         f"₿ BTC:`${st.ws_price:,.2f}`\n"
         f"  Ret 60s:`{ret_60s:+.3f}%` {'✅' if abs(ret_60s)>=0.30 else '❌'} (seuil ±0.30%)\n"
         f"  Ret 30s:`{ret_30s:+.3f}%` {'✅' if mom_ok else '❌'} (momentum continu)\n"
         f"  Ret 10s:`{ret_10s:+.3f}%`\n"
-        f"  Ret 3s:`{ret_3s:+.3f}%` {'✅' if anti_rev else '❌'} (anti-reversal)\n\n"
+        f"  Ret 3s:`{ret_3s:+.3f}%` {'✅' if anti_rev else '❌'} (anti-reversal)\n"
+        f"  Trend 10m: {trend_txt} (filtre macro)\n\n"
         f"Direction: {direction if signal else '— neutre'}\n"
         f"Token cible: 0.55$→0.65$ | EV min: {ORACLE_EDGE_MIN*100:.0f}%\n\n"
         f"{status}\n"
