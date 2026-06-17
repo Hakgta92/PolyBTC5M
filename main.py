@@ -3275,6 +3275,8 @@ async def job_oracle_lag_asset(context, asset:str):
     # ✅ v12.7 — Corrélation inverse BTC/ETH+SOL (SMT divergence)
     # Sources: sharpe.ai (corr 0.9), ICT SMT technique, mean reversion pairs trading
     # Principe: quand BTC et ETH/SOL divergent sur 15s → le laggard va rattraper
+    # ✅ v12.9 Point6: défaut sûr pour divergence (sinon NameError si pas assez de points)
+    divergence = 0.0
     alt_pts = list(st.eth_ws_prices if asset=="ETH" else st.sol_ws_prices)
     btc15 = [p for t,p in btc_pts if now-t<=15]
     alt15 = [p for t,p in alt_pts if now-t<=15]
@@ -3343,7 +3345,7 @@ async def job_oracle_lag_asset(context, asset:str):
                  features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":votes_for_direction,"filter":"votes_min"}); return
     if ev<ORACLE_EDGE_MIN:
         log_skip(f"{symbol}: EV {ev*100:+.1f}% insuffisant",direction,
-                 features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"filter":"ev","token":token_price,"ev":ev}); return
+                 features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"filter":"ev","token":token_price,"ev":ev,"smt_div":round(divergence,3)}); return
     payout=round(1/token_price,2)
     amount=kelly_bet(st.bankroll,p_oracle,payout,token_price,ev_bonus=True)
     if amount<MIN_BET_USD: return
@@ -3674,6 +3676,24 @@ async def job_haiku_analysis(context):
         else: by_filter[f]["l"]+=1
     filter_stats = " | ".join(f"{f}:{v['w']}W/{v['l']}L" for f,v in sorted(by_filter.items(), key=lambda x:x[1]["w"]+x[1]["l"],reverse=True)[:5])
 
+    # ✅ v12.9 Point1: snapshot filtres pour comparaison avec l'analyse suivante (boucle de feedback)
+    filter_snapshot = {f: {"w":v["w"], "l":v["l"]} for f,v in by_filter.items()}
+    evolution_note = ""
+    if st.haiku_insights:
+        prev_snap = st.haiku_insights[-1].get("filter_snapshot")
+        if prev_snap:
+            evo_lines = []
+            for f, cur in filter_snapshot.items():
+                if f in prev_snap:
+                    old = prev_snap[f]
+                    old_n, cur_n = old["w"]+old["l"], cur["w"]+cur["l"]
+                    if old_n > 0 and cur_n > 0:
+                        old_wr = old["w"]/old_n*100
+                        cur_wr = cur["w"]/cur_n*100
+                        evo_lines.append(f"{f}: WR {old_wr:.0f}%→{cur_wr:.0f}% (n={old_n}→{cur_n})")
+            if evo_lines:
+                evolution_note = "\n\nÉVOLUTION DEPUIS TA DERNIÈRE ANALYSE:\n" + " | ".join(evo_lines)
+
     # ── Trades réels si disponibles ──
     real_trades = [t for t in st.trades if not t.get("paper") and t.get("result")]
     trade_summary = ""
@@ -3702,16 +3722,28 @@ Trades réels ({len(real_trades)} total | WR:{wr:.0f}% | PnL:{pnl:+.2f}$):
             move = (pts[-1][1]-pts[0][1])/pts[0][1]*100
             btc_move = f"BTC move 2min: {move:+.3f}%"
 
+    # ✅ v12.9 Point3: contexte de régime marché 24h (réutilise fetch_klines existant, sûr si échec)
+    regime_note = ""
+    try:
+        klines_24h = await fetch_klines("1h", limit=24, symbol="btcusdt")
+        if klines_24h and len(klines_24h) >= 2:
+            chg_24h = (klines_24h[-1]["close"] - klines_24h[0]["open"]) / klines_24h[0]["open"] * 100
+            regime = "tendance forte" if abs(chg_24h) >= 2.0 else ("tendance modérée" if abs(chg_24h) >= 0.8 else "marché calme/range")
+            regime_note = f"BTC 24h: {chg_24h:+.2f}% ({regime})"
+    except Exception:
+        pass
+
     # ── Patterns détaillés ──
     summary = []
     for p in sample:
         asset = p.get("asset","BTC")
         tok = f" tok={p.get('token',0):.2f}$" if p.get("token") else ""
         ev = f" EV={p.get('ev',0)*100:+.1f}%" if p.get("ev") else ""
+        smt = f" smt={p.get('smt_div',0):+.3f}%" if p.get("smt_div") else ""
         summary.append(
             f"[{asset}] gap={p.get('gap',0):+.3f}% delta={p.get('delta',0):+.3f}% "
             f"ret3s={p.get('ret3s',0):+.3f}% votes={p.get('votes',0)}/5 "
-            f"filter={p.get('filter','?')}{tok}{ev} → {p['result']}")
+            f"filter={p.get('filter','?')}{tok}{ev}{smt} → {p['result']}")
 
     # ✅ v12.6 — Inclure les analyses précédentes dans le prompt
     previous_insights = ""
@@ -3737,7 +3769,7 @@ Trades réels ({len(real_trades)} total | WR:{wr:.0f}% | PnL:{pnl:+.2f}$):
 
     prompt = f"""Tu es un expert en trading algorithmique sur Polymarket (marchés prédiction crypto 5min).
 Analyse les skips d'un bot oracle lag v{BOT_VERSION} — {version_note}.
-Session actuelle: {session} | {btc_move}
+Session actuelle: {session} | {btc_move} | {regime_note}
 
 STRATÉGIE: Le bot exploite le lag entre Chainlink (oracle Polymarket) et le prix spot Binance.
 Il achète le token UP ou DOWN avant que le marché reprices l'oracle.
@@ -3748,8 +3780,10 @@ PARAMÈTRES ACTUELS:
 - SOL: gap≥0.020% | T-15s→T-5s
 - XRP: gap≥0.025% | T-20s→T-5s
 - BTC MOMENTUM: ret60s≥0.30% | T-90s→T-60s | tok 0.55$-0.65$ (2ème fenêtre indépendante)
-- Commun: delta≥0.020% | token 0.51$-0.80$ | EV≥15% | votes≥2
-- Filtres actifs: ret3s_brutal(<-0.055%) | delta_neg | gap_neg | tokenmax | tokenmin | ev
+- Commun: delta≥0.020% | token BTC 0.51$-0.80$ (exceptions: ret3s≤+0.010% OU delta≥0.114%+gap≥0.060%) | ETH/XRP/SOL(votes≤-1) token max 0.95$ | EV≥15% | votes≥2 (consensus pour la direction parié, pas score brut)
+- BTC deltaneg: bloqué sauf si gap≥0.040% ET ret3s>-0.050% (exception validée 9W/3L)
+- ETH/SOL/XRP deltaneg: seuil strict -0.010% (0% WR historique si assoupli)
+- Filtres actifs: ret3s_brutal(<-0.070%, ne bloque plus DOWN déjà confirmé) | delta_neg | gap_neg | tokenmax | tokenmin | ev
 {trade_summary}
 
 STATS FILTRES ({filter_stats}):
@@ -3757,6 +3791,7 @@ DONNÉES ({len(sample)} skips résolus — {asset_note}):
 {chr(10).join(summary)}
 
 {previous_insights}
+{evolution_note}
 
 CONTEXTE IMPORTANT:
 - Bankroll: {bankroll:.2f}$ | Mise Kelly estimée: ~{avg_bet:.2f}$ par trade
@@ -3765,6 +3800,7 @@ CONTEXTE IMPORTANT:
 - Objectif prioritaire: identifier des configurations qui AURAIENT dû trader et gagner
 - Token max actuel: {ORACLE_TOKEN_MAX}$ | EV min: {int(ORACLE_EDGE_MIN*100)}% | votes min: 2/5
 - {session_note}
+- Mécanisme SMT (ETH/SOL uniquement): quand BTC et ETH/SOL divergent de ≥0.025% sur 15s, le laggard tend à rattraper (corrélation ~0.9). Si tu vois "smt=" dans les données, c'est ce signal de divergence cross-asset — facteur supplémentaire à considérer, pas encore pleinement exploité historiquement (collecte en cours).
 
 ⚠️ RÈGLE ANTI-BIAIS OBLIGATOIRE:
 Si une session représente ≥60% des données (ex: nuit calme ASIA_EARLY ou forte tendance directionnelle),
@@ -3776,7 +3812,7 @@ INSTRUCTIONS:
 1. Identifie les patterns de skips qui auraient été GAGNANTS (WR élevé dans les ✅)
 2. Pour chaque pattern gagnant raté, propose UN ajustement de paramètre concret et chiffré
 3. Évalue le ratio risque/opportunité: combien de trades supplémentaires gagnerait-on vs perdrait-on
-4. Si une analyse précédente identifiait un pattern, confirme ou infirme avec les nouvelles données
+4. Si une analyse précédente identifiait un pattern OU si la section ÉVOLUTION montre un changement de WR sur un filtre, tu DOIS explicitement confirmer, infirmer, ou expliquer la contradiction — ne jamais ignorer silencieusement un résultat qui contredit ta dernière analyse
 5. Distingue [BTC]/[ETH]/[SOL] ou [COMMUN] selon l'asset concerné
 6. Priorise les suggestions qui augmentent le nombre de trades rentables
 
@@ -3792,9 +3828,11 @@ CALCUL DE PROFIT OBLIGATOIRE pour chaque suggestion:
 - Pour chaque suggestion: calcule (W supplémentaires × gain moyen) - (L supplémentaires × perte moyenne)
 - Gain moyen sur un trade: mise × (1/token - 1) | Perte moyenne: -mise
 - Si tu proposes un changement → chiffre l'impact net en dollars ET en % de bankroll
+- ⚠️ Si l'échantillon du pattern cité est <20 trades: donne une FOURCHETTE (ex: "+1$ à +4$") au lieu d'un chiffre exact — un chiffre précis sur petit échantillon est une fausse précision
+- Indique ton niveau de CONFIANCE (0-100%) pour chaque suggestion, basé sur: taille d'échantillon, biais de session, cohérence avec analyses précédentes
 
 Réponds en EXACTEMENT 3 bullet points actionnables en français:
-Format: "• [ASSET] [OBSERVATION + données]: [SUGGESTION CONCRÈTE] → Impact: +Xw/-Yl = +Y.YY$ net (+Z% BR)" """
+Format: "• [ASSET] [OBSERVATION + données]: [SUGGESTION CONCRÈTE] → Impact: +Xw/-Yl = +Y.YY$ net (+Z% BR) | Confiance: NN%" """
 
     try:
         async with aiohttp.ClientSession() as s:
@@ -3808,7 +3846,7 @@ Format: "• [ASSET] [OBSERVATION + données]: [SUGGESTION CONCRÈTE] → Impact
                 if r.status==200:
                     data=await r.json()
                     insight=data["content"][0]["text"].strip()
-                    st.haiku_insights.append({"type":"sonnet","ts":int(now),"insight":insight})
+                    st.haiku_insights.append({"type":"sonnet","ts":int(now),"insight":insight,"filter_snapshot":filter_snapshot})
                     if len(st.haiku_insights)>20: st.haiku_insights=st.haiku_insights[-20:]
                     st.last_haiku_ts=now
                     log.info(f"Sonnet analysis: {insight[:80]}")
@@ -3830,8 +3868,8 @@ async def cmd_learn(update,context):
     # ── Résumé général ──
     lines.append(f"📊 {len(merged_patterns)} patterns | {len(merged_trades)} trades en mémoire")
     lines.append(f"📐 *Seuils actuels:*")
-    lines.append(f"  delta≥`{ORACLE_ENTRY_DELTA:.3f}%` | gap BTC≥`0.025%` | gap ETH/SOL≥`0.030%`")
-    lines.append(f"  token:`{ORACLE_TOKEN_MIN:.2f}$`-`{ORACLE_TOKEN_MAX:.2f}$` | EV≥`{ORACLE_EDGE_MIN*100:.0f}%` | votes≥2")
+    lines.append(f"  delta≥`{ORACLE_ENTRY_DELTA:.3f}%` | gap BTC≥`0.025%` | gap ETH/SOL≥`0.020%` | gap XRP≥`0.025%`")
+    lines.append(f"  token:`{ORACLE_TOKEN_MIN:.2f}$`-`{ORACLE_TOKEN_MAX:.2f}$`(BTC) `0.95$`(ETH/XRP/SOL) | EV≥`{ORACLE_EDGE_MIN*100:.0f}%` | votes≥2(dir)")
     lines.append(f"  BTC: T-25s→T-5s | ETH: T-20s→T-5s | SOL: T-15s→T-5s | XRP: T-20s→T-5s")
 
     # ── Trades réels ──
@@ -4014,7 +4052,7 @@ async def cmd_run(update,context):
         f"Session:`{sess['session']}` | Seuils: score≥`{min_score}` mom≥`{min_mom}`\n"
         f"⚡ BTC T-25→T-5s | ETH T-20→T-5s | SOL T-15→T-5s | XRP T-20→T-5s\n"
         f"🚀 BTC Momentum T-90s→T-60s | move≥0.30%/60s | tok 0.55$-0.65$\n"
-        f"  gap BTC/XRP≥2.5bps | ETH/SOL≥2.0bps | delta≥{int(ORACLE_ENTRY_DELTA*10000)}bps | Token≤{ORACLE_TOKEN_MAX}$ | EV≥{int(ORACLE_EDGE_MIN*100)}%\n"
+        f"  gap BTC/XRP≥2.5bps | ETH/SOL≥2.0bps | delta≥{int(ORACLE_ENTRY_DELTA*10000)}bps | Token≤{ORACLE_TOKEN_MAX}$(BTC)/0.95$(ETH/XRP/SOL) | EV≥{int(ORACLE_EDGE_MIN*100)}%\n"
         f"BR:`{st.bankroll:.2f}$` | ROI:`{roi()}`\n"
         f"📊 `{ob_txt}` | 💸 `{liq_txt}`\n"
         f"Récap auto: 22h Paris 🕙",
