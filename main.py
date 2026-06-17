@@ -615,60 +615,71 @@ class PolyClient:
         except Exception as e: log.error(f"Polymarket init: {e}"); return False
 
     async def get_market_by_slug(self, slug:str):
-        """v12.4 — Récupère un marché par slug (BTC/ETH/SOL)."""
+        """v12.9 — CORRIGÉ (bug majeur trouvé 17/06): l'ancien code utilisait /events?slug=X et
+        /markets?slug=X (listes paginées avec filtrage CÔTÉ CLIENT) — ces endpoints ne garantissent
+        pas un filtre exact côté serveur, donc BTC (gros volume) apparaissait souvent dans la liste
+        retournée par défaut, alors qu'ETH/SOL/XRP (volume plus faible) en étaient souvent absents
+        → "marché non trouvé" récurrent, confirmé par /passes montrant ce skip pour SOL/XRP en boucle.
+        Fix: utilise les vrais endpoints DIRECTS documentés (docs.polymarket.com/api-reference/
+        markets/get-market-by-slug et .../events/get-event-by-slug) — slug dans l'URL, match exact
+        garanti côté serveur, peu importe le volume de l'asset."""
         headers={"User-Agent":"Mozilla/5.0","Accept":"application/json",
                  "Referer":"https://polymarket.com/","Origin":"https://polymarket.com"}
-        for endpoint in ["/events","/markets"]:
+        for endpoint in [f"/events/slug/{slug}", f"/markets/slug/{slug}"]:
             try:
                 async with aiohttp.ClientSession(headers=headers) as s:
-                    async with s.get(f"{POLY_GAMMA}{endpoint}",params={"slug":slug},
+                    async with s.get(f"{POLY_GAMMA}{endpoint}",
                                      timeout=aiohttp.ClientTimeout(total=10)) as r:
                         if r.status==200:
                             data=await r.json()
-                            items=data if isinstance(data,list) else data.get("events",data.get("markets",[]))
-                            for item in items:
-                                if slug in item.get("slug",""):
-                                    markets=item.get("markets",[item])
-                                    for m in markets:
-                                        ids=m.get("clobTokenIds","[]")
-                                        if isinstance(ids,str):
-                                            try: ids=json.loads(ids)
-                                            except: ids=[]
-                                        if len(ids)>=2:
-                                            return {"token_up":ids[0],"token_down":ids[1],
-                                                "question":item.get("title",slug),
-                                                "condition_id":m.get("conditionId",""),
-                                                "end_date":m.get("endDate",""),"market_slug":slug}
+                            if not isinstance(data,dict): continue
+                            # /events/slug/{slug} → objet Event avec "markets":[...]
+                            # /markets/slug/{slug} → objet Market direct (pas de liste à filtrer)
+                            markets_list = data.get("markets")
+                            candidates = markets_list if markets_list else [data]
+                            for m in candidates:
+                                ids=m.get("clobTokenIds","[]")
+                                if isinstance(ids,str):
+                                    try: ids=json.loads(ids)
+                                    except: ids=[]
+                                if len(ids)>=2:
+                                    return {"token_up":ids[0],"token_down":ids[1],
+                                        "question":data.get("title",m.get("question",slug)),
+                                        "condition_id":m.get("conditionId",""),
+                                        "end_date":m.get("endDate",""),"market_slug":slug}
             except Exception as e: log.warning(f"get_market_by_slug {slug}: {e}")
         return None
 
     async def find_btc_5min_market(self):
+        """v12.9 — CORRIGÉ (même bug que get_market_by_slug, fix 17/06): utilise maintenant les
+        endpoints DIRECTS /events/slug/{slug} et /markets/slug/{slug} au lieu de listes paginées
+        filtrées côté client. Garde le retry sur 3 timestamps (actuel, +300, -300) pour absorber
+        un éventuel décalage d'horloge."""
         now=int(time.time()); current_ts=(now//300)*300
         headers={"User-Agent":"Mozilla/5.0","Accept":"application/json",
                  "Referer":"https://polymarket.com/","Origin":"https://polymarket.com"}
         for ts in [current_ts,current_ts+300,current_ts-300]:
             slug=f"btc-updown-5m-{ts}"
-            for endpoint in ["/events","/markets"]:
+            for endpoint in [f"/events/slug/{slug}", f"/markets/slug/{slug}"]:
                 try:
                     async with aiohttp.ClientSession(headers=headers) as s:
-                        async with s.get(f"{POLY_GAMMA}{endpoint}",params={"slug":slug},
+                        async with s.get(f"{POLY_GAMMA}{endpoint}",
                                          timeout=aiohttp.ClientTimeout(total=10)) as r:
                             if r.status==200:
                                 data=await r.json()
-                                items=data if isinstance(data,list) else data.get("events",data.get("markets",[]))
-                                for item in items:
-                                    if slug in item.get("slug",""):
-                                        markets=item.get("markets",[item])
-                                        for m in markets:
-                                            ids=m.get("clobTokenIds","[]")
-                                            if isinstance(ids,str):
-                                                try: ids=json.loads(ids)
-                                                except: ids=[]
-                                            if len(ids)>=2:
-                                                return {"token_up":ids[0],"token_down":ids[1],
-                                                    "question":item.get("title",item.get("question",slug)),
-                                                    "condition_id":m.get("conditionId",""),
-                                                    "end_date":m.get("endDate",""),"market_slug":slug}
+                                if not isinstance(data,dict): continue
+                                markets_list = data.get("markets")
+                                candidates = markets_list if markets_list else [data]
+                                for m in candidates:
+                                    ids=m.get("clobTokenIds","[]")
+                                    if isinstance(ids,str):
+                                        try: ids=json.loads(ids)
+                                        except: ids=[]
+                                    if len(ids)>=2:
+                                        return {"token_up":ids[0],"token_down":ids[1],
+                                            "question":data.get("title",m.get("question",slug)),
+                                            "condition_id":m.get("conditionId",""),
+                                            "end_date":m.get("endDate",""),"market_slug":slug}
                 except Exception as e: log.warning(f"{slug}{endpoint}: {e}")
         return None
 
@@ -5435,7 +5446,11 @@ async def cmd_confluence(update,context):
     Montre le score TDS en temps réel = oracle_score × setup_score × (1-noise), même calcul que job_confluence_*."""
     if not auth(update): return
     now = time.time()
-    lines_out = ["🎯 *CONFLUENCE — TDS instantané*\n━━━━━━━━━━━━━━"]
+    cur_slot = int(now // 300) * 300
+    slot_remaining = cur_slot + 300 - now
+    in_window = 60 <= slot_remaining <= 150
+    lines_out = [f"🎯 *CONFLUENCE — TDS instantané*\n━━━━━━━━━━━━━━\n"
+                 f"Fenêtre: `T-{int(slot_remaining)}s` {'✅ ACTIVE' if in_window else '❌ hors fenêtre (T-150s→T-60s)'}"]
 
     for asset in ("BTC","ETH","SOL","XRP"):
         cfg = _asset_state_attrs(asset)
@@ -5490,7 +5505,10 @@ async def cmd_confluence(update,context):
 
         noise_penalty = 0.5 if ((ret_10s>0 and ret_3s<-0.030) or (ret_10s<0 and ret_3s>0.030)) else 0.0
         tds = oracle_score * setup_score * (1-noise_penalty)
-        status = "🟢 ACTIF" if (setup_dir is not None and tds >= TDS_MIN_SCORE) else "⚪ pas de setup"
+        if setup_dir is not None and tds >= TDS_MIN_SCORE:
+            status = "🟢 ACTIF" if in_window else "⏳ setup valide mais hors fenêtre"
+        else:
+            status = "⚪ pas de setup"
         conf_preview = ""
         if setup_dir is not None and tds >= TDS_MIN_SCORE:
             confidence = min(1.3, max(0.7, 0.7 + (tds - TDS_MIN_SCORE) / (1.0 - TDS_MIN_SCORE) * 0.6))
