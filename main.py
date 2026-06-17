@@ -3048,6 +3048,10 @@ async def job_oracle_lag(context):
         if spot_oracle_gap >= 0.005:
             direction = "DOWN"; ret3s_override = True
             log.info(f"BTC: ret3s signal DOWN {ret_3s:+.3f}% gap={spot_oracle_gap:+.3f}% → override")
+        elif direction == "DOWN":
+            # ✅ v12.9 — FIX asymétrie: chute brutale CONFIRME un pari DOWN déjà établi (gap/delta)
+            # → ne pas bloquer. Les autres filtres (deltaneg/tokenmax/EV) s'appliquent normalement ensuite.
+            log.debug(f"BTC: ret3s {ret_3s:+.3f}% confirme DOWN déjà établi (gap={spot_oracle_gap:+.3f}%) → continuer")
         else:
             log_skip(f"BTC: ret3s {ret_3s:+.3f}%<-0.055% (chute brutale)", direction,
                      features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":0,"filter":"ret3s_brutal","asset":"BTC"}); return
@@ -3095,6 +3099,9 @@ async def job_oracle_lag(context):
         1 if direction=="UP" and ret_15s>0 else (-1 if direction=="DOWN" and ret_15s<0 else 0),
         ob_vote, ta_vote,
     ])
+    # ✅ v12.9 FIX BUG MAJEUR: dir_votes négatif quand DOWN confirmé (convention "bullishness").
+    # ⚠️ dir_votes lui-même INCHANGÉ (exception SOL tokenmax dir_votes<=-1 ailleurs en dépend).
+    votes_for_direction = dir_votes if direction == "UP" else -dir_votes
 
     # Chainlink frais
     chainlink_age = now - st.oracle_chainlink_ts if st.oracle_chainlink_ts > 0 else 999
@@ -3134,15 +3141,15 @@ async def job_oracle_lag(context):
 
     fee = taker_fee_per_share(token_price)
     p_oracle = min(0.93, 0.85 + abs(spot_oracle_gap)*3.0) if primary_signal=="gap" else min(0.90, 0.80 + abs(oracle_delta)*2.0)
-    if dir_votes >= 3: p_oracle = min(0.95, p_oracle + 0.03)
-    if dir_votes >= 4: p_oracle = min(0.96, p_oracle + 0.02)
+    if votes_for_direction >= 3: p_oracle = min(0.95, p_oracle + 0.03)
+    if votes_for_direction >= 4: p_oracle = min(0.96, p_oracle + 0.02)
     if chainlink_age < 2.0: p_oracle = min(0.97, p_oracle + 0.03)
     ev = p_oracle - token_price - fee
 
-    # ✅ v12.6 — votes minimum 3/5
-    if dir_votes < 2:
-        log_skip(f"BTC: votes {dir_votes}/5 < 2 (→ skip: consensus faible)", direction,
-                 features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"filter":"votes_min","asset":"BTC"}); return
+    # ✅ v12.9 FIX: vérifie le consensus POUR la direction parié, pas le score brut haussier
+    if votes_for_direction < 2:
+        log_skip(f"BTC: votes {votes_for_direction}/5 < 2 (→ skip: consensus faible)", direction,
+                 features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":votes_for_direction,"filter":"votes_min","asset":"BTC"}); return
     if ev < ORACLE_EDGE_MIN:
         log_skip(f"BTC: EV {ev*100:+.1f}%<{ORACLE_EDGE_MIN*100:.0f}% (→ skip: edge insuffisant)", direction,
                  features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"filter":"ev","token":token_price,"ev":ev,"asset":"BTC"}); return
@@ -3224,6 +3231,9 @@ async def job_oracle_lag_asset(context, asset:str):
         if spot_oracle_gap >= 0.005:
             direction = "DOWN"; ret3s_override = True
             log.info(f"{symbol}: ret3s signal DOWN {ret_3s:+.3f}% gap={spot_oracle_gap:+.3f}% → override")
+        elif direction == "DOWN":
+            # ✅ v12.9 — FIX asymétrie: chute brutale CONFIRME un pari DOWN déjà établi (gap/delta)
+            log.debug(f"{symbol}: ret3s {ret_3s:+.3f}% confirme DOWN déjà établi (gap={spot_oracle_gap:+.3f}%) → continuer")
         else:
             log_skip(f"{symbol}: ret3s {ret_3s:+.3f}% (chute brutale)",direction,
                      features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":0,"filter":"ret3s_brutal"})
@@ -3294,6 +3304,9 @@ async def job_oracle_lag_asset(context, asset:str):
         1 if direction=="UP" and ret_15s>0 else (-1 if direction=="DOWN" and ret_15s<0 else 0),
         btc_cascade_vote, ta_vote,
     ])
+    # ✅ v12.9 FIX BUG MAJEUR: dir_votes négatif quand DOWN confirmé (convention "bullishness").
+    # ⚠️ dir_votes lui-même INCHANGÉ (exception SOL tokenmax dir_votes<=-1 plus bas en dépend).
+    votes_for_direction = dir_votes if direction == "UP" else -dir_votes
     market=await poly.get_market_by_slug(f"{slug_prefix}-{cur_slot}")
     if not market:
         log_skip(f"{symbol}: marché non trouvé",direction,
@@ -3322,12 +3335,12 @@ async def job_oracle_lag_asset(context, asset:str):
                  features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"filter":"tokenmin","token":token_price}); return
     fee=taker_fee_per_share(token_price)
     p_oracle=min(0.93,0.85+abs(spot_oracle_gap)*3.0) if primary_signal=="gap" else min(0.90,0.80+abs(oracle_delta)*2.0)
-    if dir_votes>=3: p_oracle=min(0.95,p_oracle+0.03)
+    if votes_for_direction>=3: p_oracle=min(0.95,p_oracle+0.03)
     ev=p_oracle-token_price-fee
-    # ✅ v12.6 — votes minimum 3/5 (données: 12/12 votes=2 sont LOSS)
-    if dir_votes < 2:
-        log_skip(f"{symbol}: votes {dir_votes}/5 < 2 (→ skip: consensus faible)", direction,
-                 features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"filter":"votes_min"}); return
+    # ✅ v12.9 FIX: consensus POUR la direction parié (était dir_votes brut, cassé pour DOWN)
+    if votes_for_direction < 2:
+        log_skip(f"{symbol}: votes {votes_for_direction}/5 < 2 (→ skip: consensus faible)", direction,
+                 features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":votes_for_direction,"filter":"votes_min"}); return
     if ev<ORACLE_EDGE_MIN:
         log_skip(f"{symbol}: EV {ev*100:+.1f}% insuffisant",direction,
                  features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"filter":"ev","token":token_price,"ev":ev}); return
