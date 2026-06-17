@@ -1646,10 +1646,12 @@ st=State()
 
 # ─── HELPERS v10.22 ────────────────────────────────────────────────────────
 def log_skip(reason, direction=None, features=None):
-    """✅ v10.37 — Log skip + features oracle pour auto-calibration."""
+    """✅ v10.37 — Log skip + features oracle pour auto-calibration.
+    v12.9 — Ajout tag session pour stats segmentées (Asia/EU/US)."""
     st.skipped += 1
     now = int(time.time())
-    entry = {"ts": now, "reason": reason, "dir": direction,
+    sess = session_ctx()
+    entry = {"ts": now, "reason": reason, "dir": direction, "session": sess.get("session","?"),
              "slot_end": (now // 300) * 300 + 300,
              # v12.8 — snapshot prix ACTUELS + oracle au moment du log
              "snap": {
@@ -3643,6 +3645,13 @@ async def job_haiku_analysis(context):
     oracle_p = [p for p in sample if p.get("source") != "momentum"]
     asset_note = f"BTC:{len(btc_p)} ETH:{len(eth_p)} SOL:{len(sol_p)} XRP:{len(xrp_p)} | OracleLag:{len(oracle_p)} Momentum:{len(mom_p)}"
 
+    # v12.9 — Répartition par session pour détecter un biais de tendance dominante
+    from collections import Counter as _Counter
+    session_counts = _Counter(p.get("session","?") for p in sample)
+    dominant_session, dominant_n = session_counts.most_common(1)[0] if session_counts else ("?",0)
+    dominant_pct = (dominant_n / max(len(sample),1)) * 100
+    session_note = f"Session dominante: {dominant_session} ({dominant_pct:.0f}% des données)" if dominant_pct >= 60 else "Données réparties sur plusieurs sessions"
+
     # ── Stats par filtre ──
     by_filter = {}
     for p in sample:
@@ -3742,6 +3751,13 @@ CONTEXTE IMPORTANT:
 - Le bot n'a eu AUCUN trade réel depuis l'ajout ETH/SOL (marché en forte tendance)
 - Objectif prioritaire: identifier des configurations qui AURAIENT dû trader et gagner
 - Token max actuel: {ORACLE_TOKEN_MAX}$ | EV min: {int(ORACLE_EDGE_MIN*100)}% | votes min: 2/5
+- {session_note}
+
+⚠️ RÈGLE ANTI-BIAIS OBLIGATOIRE:
+Si une session représente ≥60% des données (ex: nuit calme ASIA_EARLY ou forte tendance directionnelle),
+tu DOIS le signaler explicitement et baisser ta confiance dans la suggestion.
+Un WR de 90%+ sur une seule session/tendance ne généralise PAS aux autres conditions de marché.
+Ne propose un changement de paramètre que si le pattern semble structurel (pas juste "le marché montait").
 
 INSTRUCTIONS:
 1. Identifie les patterns de skips qui auraient été GAGNANTS (WR élevé dans les ✅)
@@ -4720,6 +4736,49 @@ async def cmd_momentum(update,context):
         parse_mode="Markdown")
 
 
+async def cmd_sessionstats(update,context):
+    """v12.9 — WR théorique des skips segmenté par session (Asia/EU/US).
+    Évite les conclusions biaisées par une seule session (ex: nuit calme)."""
+    if not auth(update): return
+    _resolve_pending_passes()
+
+    resolved = [p for p in st.pass_reasons if p.get("resolved") in ("WIN","LOSS")]
+    if not resolved:
+        await update.message.reply_text("❌ Aucune passe résolue encore."); return
+
+    by_session = {}
+    for p in resolved:
+        s = p.get("session", "?")
+        by_session.setdefault(s, {"W":0,"L":0})
+        if p.get("resolved") == "WIN": by_session[s]["W"] += 1
+        else: by_session[s]["L"] += 1
+
+    order = ["US_OPEN","US_AFTERNOON","EU_OPEN","US_CLOSE","ASIA_LATE","ASIA_EARLY","OVERNIGHT","?"]
+    label = {"US_OPEN":"🇺🇸 US Open (14-17h)","US_AFTERNOON":"🇺🇸 US PM (17-20h)",
+              "EU_OPEN":"🇪🇺 EU Open (9-14h)","US_CLOSE":"🌆 US Close (20-22h)",
+              "ASIA_LATE":"🌏 Asia Late (7-9h)","ASIA_EARLY":"🌏 Asia Early (1-7h)",
+              "OVERNIGHT":"🌙 Overnight (22-1h)","?":"❓ Inconnu"}
+
+    lines = ["📊 *WR théorique par SESSION*\n━━━━━━━━━━━━━━"]
+    total_w, total_l = 0, 0
+    for s in order:
+        if s not in by_session: continue
+        d = by_session[s]
+        n = d["W"] + d["L"]
+        if n == 0: continue
+        wr = d["W"]/n*100
+        total_w += d["W"]; total_l += d["L"]
+        bar = "█"*int(wr//10) + "░"*(10-int(wr//10))
+        lines.append(f"{label.get(s,s)}\n  `{bar}` {wr:.0f}% ({d['W']}W/{d['L']}L, n={n})")
+
+    total = total_w + total_l
+    lines.append(f"\n📈 *Global*: {total_w/max(total,1)*100:.0f}% ({total_w}W/{total_l}L, n={total})")
+    lines.append("\n⚠️ _Une session avec n<30 n'est pas statistiquement fiable._")
+    lines.append("_Une session biaisée (forte tendance) peut fausser le WR théorique pour TOUTES les sessions confondues._")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
 async def cmd_oracle(update,context):
     if not auth(update): return
     now = time.time()
@@ -4858,7 +4917,7 @@ def main():
         ("balance",cmd_balance),("paper",cmd_paper),("cooldown",cmd_cooldown),("reset",cmd_reset),("resetskips",cmd_resetskips),
         ("setbalance",cmd_setbalance),("backup",cmd_backup),("recap",cmd_recap),("dashboard",cmd_dashboard),
         ("history",cmd_history),("turbo",cmd_turbo),("sell",cmd_sell),("sellcheck",cmd_sellcheck),("fair",cmd_fair),
-        ("backtest",cmd_backtest),("oracle",cmd_oracle),("momentum",cmd_momentum),("calib",cmd_calib),("learn",cmd_learn),("revive",cmd_revive),("autotune",cmd_autotune)]:
+        ("backtest",cmd_backtest),("oracle",cmd_oracle),("momentum",cmd_momentum),("sessionstats",cmd_sessionstats),("calib",cmd_calib),("learn",cmd_learn),("revive",cmd_revive),("autotune",cmd_autotune)]:
         app.add_handler(CommandHandler(name,handler))
     app.add_handler(CallbackQueryHandler(cb))
     log.info(f"🧠 PolyBot v{BOT_VERSION} démarré")
