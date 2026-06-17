@@ -142,6 +142,17 @@ ORACLE_ENTRY_DELTA  = 0.02  # v12.4  # ✅ v10.31 — baissé 0.05→0.03% (-0.0
 ORACLE_TOKEN_MAX    = 0.80  # v12.6 — élargi pour accumuler des données  # ✅ v10.32 — breakeven exact @92%WR = token 0.92$ (EV>0 jusqu'à 0.92$)
 ORACLE_TOKEN_MIN    = 0.51  # Token min (trop proche de 0.50$ = incertitude trop haute)
 ORACLE_EDGE_MIN     = 0.15  # v12.4  # EV minimum après frais — 15% (commentaire "8%" précédent était obsolète/faux)
+
+# ✅ v12.9 — 4ème stratégie CONFLUENCE (/conf): combine oracle (biais) × régime/setup (mean-rev ou momentum) × bruit
+# Formule multiplicative: TDS = oracle_score × setup_score × (1-noise_penalty). Seuils de départ raisonnés, À CALIBRER.
+TDS_GAP_MIN          = 0.025  # seuil minimum gap oracle pour avoir un biais (cohérent avec gap_min existant)
+TDS_GAP_STRONG       = 0.060  # gap au-delà duquel le biais oracle est "fort" (score oracle=1.0)
+TDS_OVEREXT_STRONG   = 0.15   # overext Bollinger pour un setup mean-rev "fort" (score setup=1.0)
+TDS_RET60S_STRONG    = 0.60   # ret60s pour un setup momentum "fort" (score setup=1.0)
+TDS_MIN_SCORE        = 0.35   # TDS minimum pour trader (produit de 3 facteurs <1 → seuil plus bas qu'un score additif)
+TDS_ADAPT_MIN_SAMPLE = 20     # nb trades minimum par branche avant ajustement adaptatif (anti-overfitting, vs 5 proposé)
+TDS_TOKEN_MIN        = 0.52
+TDS_TOKEN_MAX        = 0.72
 ORACLE_WINDOW_START = 45    # v12.9 — élargi T-25→T-45 (demande user 17/06)    # Fenêtre normale: T-45s→T-10s
 ORACLE_WINDOW_END   = 10    # v12.9 — élargi T-5→T-10     # T-10s = nouveau dernier moment sûr
 # ✅ v10.32 — Mode T-10s (source: github.com/Archetapp — T-10s "direction quasi lockée")
@@ -276,12 +287,15 @@ def kelly_bet(bankroll, win_prob, payout_mult, token_price=0.5, ev_bonus=False):
     log.debug(f"Kelly tier={tier_name} EV={ev_real:.2f} P={win_prob:.2f} → {result:.2f}$")
     return result
 
-def kelly_bet_secondary(bankroll, win_prob, payout_mult):
+def kelly_bet_secondary(bankroll, win_prob, payout_mult, confidence=1.0):
     """
-    ✅ v12.9 — Kelly DÉDIÉ momentum + mean-reversion (multi-asset), séparé de kelly_bet() partagée
+    ✅ v12.9 — Kelly DÉDIÉ momentum + mean-reversion + confluence (multi-asset), séparé de kelly_bet() partagée
     (kelly_bet a un plancher dynamique ~4% BR minimum, incompatible avec un cap 1-3%).
     Fraction conservatrice (0.25x Kelly), cap strict entre 1% et 3% du bankroll.
     Stratégies secondaires (pas l'oracle lag) → sizing volontairement plus prudent.
+    ✅ v12.9 — paramètre `confidence` (défaut 1.0 = comportement identique, AUCUN changement pour
+    momentum/meanrev qui ne le passent pas). Permet un sizing dynamique pour la confluence:
+    confidence>1.0 augmente la mise (toujours capée 1-3%), <1.0 la réduit.
     """
     if win_prob <= 0 or payout_mult <= 1:
         return 0.0
@@ -290,9 +304,10 @@ def kelly_bet_secondary(bankroll, win_prob, payout_mult):
     kp = (win_prob * b - q) / b
     if kp <= 0:
         return 0.0  # Edge négatif → ne pas trader
-    pct = min(max(kp * 0.25, 0.01), 0.03)  # cap strict 1%-3% BR
+    pct = min(max(kp * 0.25, 0.01), 0.03)  # cap strict 1%-3% BR (base)
+    pct = min(max(pct * confidence, 0.01), 0.03)  # ajustement confidence, cap 1-3% toujours respecté
     result = round(bankroll * pct, 2)
-    log.debug(f"Kelly secondary: kp={kp:.3f} pct={pct*100:.1f}% → {result:.2f}$")
+    log.debug(f"Kelly secondary: kp={kp:.3f} pct={pct*100:.1f}% conf={confidence:.2f} → {result:.2f}$")
     return result
 
 # ─── DONNÉES AVANCÉES ──────────────────────────────────────────────────────
@@ -1442,7 +1457,7 @@ async def fetch_btc_24h():
 
 async def claude_decide(i1,i5,i15,i1h,i4h,adv,trades,bankroll,consec,fg,btc24,sess,conf_score,mom_score,tpu,tpd,ob=None,liq=None,eth_desc=""):
     """
-    ✅ v10.22 — Claude n'est PLUS appelé dans le chemin chaud (job_tick/job_snipe).
+    ✅ v10.22 — Claude n'est PLUS appelé dans le chemin chaud (job_tick).
     Latence 10-25s = prix d'entrée périmé sur un marché 5min.
     Reste utilisé uniquement par /signal pour l'analyse manuelle détaillée.
     """
@@ -1544,7 +1559,6 @@ class State:
         self.last_decision={}; self.last_conf_score={}; self.last_mom_score=0
         self.fg={"value":50,"label":"Neutral"}; self.btc24={}
         self.tick_job=self.price_job=self.macro_job=self.tp_job=self.backup_job=self.recap_job=None
-        self.snipe_job=None  # ✅ v10.22
         self.current_market=None; self.active_order_id=None; self.active_token_id=None
         self.entry_token_price=0.0; self.shares_bought=0.0
         self.token_price_peak=0.0; self.trailing_active=False
@@ -1587,6 +1601,8 @@ class State:
         self.momentum_last_slot_eth=0; self.momentum_last_slot_sol=0; self.momentum_last_slot_xrp=0
         self.meanrev_last_slot_eth=0; self.meanrev_last_slot_sol=0; self.meanrev_last_slot_xrp=0
         self.meanrev_regime_squeeze_count=0; self.meanrev_regime_expansion_count=0  # v12.9 — résumé agrégé pour /learn
+        # v12.9 — 4ème stratégie CONFLUENCE (/conf): oracle bias × régime/setup × bruit
+        self.tds_last_slot=0; self.tds_last_slot_eth=0; self.tds_last_slot_sol=0; self.tds_last_slot_xrp=0
         self.xrp_ob_imbalance=0.0; self.xrp_ob_ts=0.0; self.xrp_ob_asset_id=""; self.xrp_clob_ws_task=None
         self.oracle_lag_signal=None  # {"bias","desc","div_pct"}
         # ✅ v10.23 — Calibration sigma
@@ -2580,10 +2596,10 @@ async def job_staged_entry(context):
 async def job_tick(context):
     if not st.running or st.killed: return
 
-    # ✅ v10.25 — SNIPE-ONLY en mode réel
+    # ✅ v10.25 — job_tick désactivé en mode réel (paper/stats uniquement)
     # job_tick (entrée T-60s à T-50s, token 0.50-0.75$) = zone taker fees max = non rentable
     # En mode réel: on laisse tourner uniquement pour la résolution paper et les stats
-    # job_snipe gère tout le trading réel (token ≥ 0.82$, frais ~0¢)
+    # Le trading réel passe par job_oracle_lag + job_momentum_* + job_mean_reversion_*
     if not st.paper_mode:
         await resolve_paper_bet(context)  # résolution si position paper ouverte
         return
@@ -2831,112 +2847,6 @@ async def job_tick(context):
         f"BTC:`${st.price:,.2f}` | `{sess['session']}`\n"
         f"Ξ`{eth_desc}`{ob_info}\n\n"
         f"💭 _{dec['reasoning']}_\n🔑 Signaux:\n{sigs}")
-
-async def job_snipe(context):
-    """
-    ✅ v10.30 — SNIPE BROWNIEN: désactivé en mode RÉEL.
-    Sources (medium.com/mountain-movers, dev.to/fatherson): le vrai edge
-    sur BTC 5min n'est PAS la prédiction Brownienne mais l'oracle lag.
-    Brownien gardé en PAPER pour tests comparatifs.
-    Le trading réel passe par job_oracle_lag (T-35s→T-6s).
-    """
-    if not st.running or st.killed or st.bet: return
-    # ✅ v10.30 — Brownien désactivé en réel
-    if not st.paper_mode:
-        return
-    now_ts = time.time()
-    slot_remaining = 300 - (now_ts % 300)
-    if not (SNIPE_LAST_MIN <= slot_remaining < ENTRY_LAST_SECONDS): return
-    if st.last_trade_slot == int(now_ts//300)*300: return  # ✅ dédup slot
-    if check_daily() or in_cd(): return
-    if trades_last_hour(st.trades)>=MAX_TRADES_PER_H: return
-    # Snipe exige le WS (précision indispensable à T-45s)
-    if not st.ws_connected or st.ws_price<=0 or st.slot_open_price<=0: return
-    if st.slot_open_ts != int(now_ts//300)*300: return
-    sigma = realized_vol()
-    if sigma<=0: return
-    delta_pct = (st.ws_price - st.slot_open_price) / st.slot_open_price * 100
-    p_up = fair_prob_up(delta_pct, slot_remaining, sigma)
-    direction = "UP" if p_up>=0.5 else "DOWN"
-    p_dir = p_up if direction=="UP" else 1.0-p_up
-    if p_dir < SNIPE_MIN_PROB: return
-
-    # ✅ v10.27 — FILTRE BPS (polybacktest.com, 29,060 trades réels)
-    # Seuls les mouvements lents et stables (5-12 bps) sont rentables
-    cur_price = st.ws_price if st.ws_price > 0 else st.price
-    bps_ok, bps_cur, bps_tot, bps_reason = compute_btc_bps(st.slot_open_price, cur_price, direction)
-    if not bps_ok:
-        log_skip(f"SNIPE: {bps_reason}", direction)
-        return
-    log.info(f"✅ BPS filter passed: {bps_reason}")
-    sess=session_ctx()
-    # Récupérer le marché + prix du favori
-    tpu=0.5; tpd=0.5; market_end=0
-    if not st.paper_mode:
-        market=st.current_market
-        cur_slug=f"btc-updown-5m-{int(now_ts//300)*300}"
-        if not market or market.get("market_slug")!=cur_slug:
-            market=await poly.find_btc_5min_market()
-        if not market:
-            log_skip("SNIPE: aucun marché actif", direction); return
-        st.current_market=market
-        token_used=market["token_up"] if direction=="UP" else market["token_down"]
-        token_price_dir=await poly.get_token_price(token_used)
-        tpu=token_price_dir if direction=="UP" else 1.0-token_price_dir
-        tpd=1.0-tpu
-        try:
-            ed=market.get("end_date","")
-            if ed:
-                dt=datetime.fromisoformat(ed.replace("Z","+00:00"))
-                market_end=dt.timestamp()
-        except: pass
-    else:
-        token_price_dir=0.90  # Estimation paper: le favori se paie ~0.90 à T-40s
-        tpu=token_price_dir if direction=="UP" else 1.0-token_price_dir
-        tpd=1.0-tpu
-    if token_price_dir < SNIPE_TOKEN_MIN or token_price_dir > SNIPE_TOKEN_MAX:
-        log_skip(f"SNIPE: token {token_price_dir:.2f}$ hors zone [{SNIPE_TOKEN_MIN}-{SNIPE_TOKEN_MAX}] — frais trop élevés", direction)
-        return
-    fee=taker_fee_per_share(token_price_dir)
-    # ✅ v10.25 — Vérification frais explicite: à 0.82$+ les frais sont <0.2¢ (quasi nuls)
-    # ✅ v10.29 — Filtre fee_pct>0.5% SUPPRIMÉ: redondant avec EV gate, tuait zone 0.55-0.75$
-    # Les frais sont inclus dans ev=p_dir-token_price_dir-fee. EV gate à 10% suffit.
-    fee_pct = fee / token_price_dir * 100 if token_price_dir > 0 else 0
-    log.debug(f"Fee: {fee*100:.2f}¢/share ({fee_pct:.2f}%)")
-    ev=p_dir-token_price_dir-fee
-    st.last_fair={"p_up":round(p_up,3),"sigma":round(sigma,4),"ev":round(ev,3),
-                  "t_rem":int(slot_remaining),"fee":round(fee,4),"mode":"SNIPE"}
-    if ev < SNIPE_EDGE_MIN:
-        log_skip(f"SNIPE: EV {ev*100:+.1f}%<{SNIPE_EDGE_MIN*100:.0f}% (P:{p_dir:.2f} tok:{token_price_dir:.2f}$)", direction)
-        return
-    # ✅ v10.26 — Tier du setup pour le message
-    if ev >= 0.15 or p_dir >= 0.92:
-        tier_label = "🔥 EXCEPTIONNEL (~15% BR)"
-    elif ev >= 0.10 or p_dir >= 0.85:
-        tier_label = "⚡ FORT (~10% BR)"
-    else:
-        tier_label = "✅ NORMAL (~5% BR)"
-    payout=round(1/token_price_dir,2) if token_price_dir>0 else 1.1
-    amount=kelly_bet(st.bankroll, p_dir, payout, token_price_dir)
-    if st.win_streak_count >= BOOST_AFTER_WINS:
-        amount=round(min(amount*1.2, MAX_BET_USD),2)
-    if amount<MIN_BET_USD or st.bankroll<amount: return
-    conf_score=st.last_conf_score if st.last_conf_score else {"score":0,"signals":[]}
-    reasoning=f"SNIPE {tier_label} T-{int(slot_remaining)}s | P({direction})={p_dir:.2f} vs token {token_price_dir:.2f}$ | EV {ev*100:+.1f}% | Δ{delta_pct:+.3f}%"
-    ok=await place_bet(context, direction, amount, round(p_dir,2), reasoning, conf_score, sess, tpu, tpd, market_end, source="snipe")
-    if not ok: return
-    st.last_decision={"dir":direction,"conf":round(p_dir,2),"size":amount,"reasoning":reasoning,
-                      "risk":"LOW","trade":True,"kelly_pct":round(amount/st.bankroll*100,1) if st.bankroll>0 else 0}
-    mode="💰 RÉEL" if not st.paper_mode else "📄 paper"
-    entry_tp=st.entry_token_price if not st.paper_mode else token_price_dir
-    await send(context.bot,
-        f"🎯 *SNIPE placé* [{mode}]\n━━━━━━━━━━━━━━━\n"
-        f"*{direction}* | `{amount:.2f}$` ({round(amount/st.bankroll*100,1) if st.bankroll>0 else 0:.1f}% BR) | {tier_label}\n"
-        f"P:`{p_dir*100:.0f}%` | ⏰T-`{int(slot_remaining)}s` | EV:`{ev*100:+.1f}%`\n"
-        f"Token:`{entry_tp:.3f}$` | Frais:`{fee*100:.2f}¢`\n"
-        f"BPS: `{bps_cur}` vers {direction} | Total: `{bps_tot}` bps\n"
-        f"₿`${st.ws_price:,.2f}` Δslot:`{delta_pct:+.3f}%` σ:`{sigma:.4f}`\n\n"
-        f"💭 _{reasoning}_")
 
 async def ws_clob_loop(asset_id_up: str):
     """v12.4 — OB imbalance BTC via CLOB WebSocket Polymarket."""
@@ -3578,15 +3488,17 @@ async def job_momentum_btc(context):
 
 
 def _asset_state_attrs(asset):
-    """v12.9 — Mappe un asset vers ses noms d'attributs st.* (momentum/meanrev multi-asset).
+    """v12.9 — Mappe un asset vers ses noms d'attributs st.* (momentum/meanrev/confluence multi-asset).
     BTC garde ses attributs historiques sans préfixe; ETH/SOL/XRP utilisent le préfixe existant."""
     a = asset.upper()
     if a == "BTC":
         return dict(price="ws_price", prices="ws_prices", oracle="oracle_price",
-                     slug="btc-updown-5m", mom_slot="momentum_last_slot", mr_slot="meanrev_last_slot")
+                     slug="btc-updown-5m", mom_slot="momentum_last_slot", mr_slot="meanrev_last_slot",
+                     tds_slot="tds_last_slot")
     pfx = a.lower()
     return dict(price=f"{pfx}_price", prices=f"{pfx}_ws_prices", oracle=f"{pfx}_oracle_price",
-                 slug=f"{pfx}-updown-5m", mom_slot=f"momentum_last_slot_{pfx}", mr_slot=f"meanrev_last_slot_{pfx}")
+                 slug=f"{pfx}-updown-5m", mom_slot=f"momentum_last_slot_{pfx}", mr_slot=f"meanrev_last_slot_{pfx}",
+                 tds_slot=f"tds_last_slot_{pfx}")
 
 
 async def job_momentum_asset(context, asset):
@@ -3940,6 +3852,176 @@ async def job_mean_reversion_xrp(context):
     await job_mean_reversion_asset(context, "XRP")
 
 
+def _tds_adaptive_weight(setup_type):
+    """v12.9 — Poids adaptatif MR/momentum pour la confluence, basé sur l'historique RÉEL des trades confluence.
+    Reste neutre (1.0) tant qu'il n'y a pas ≥TDS_ADAPT_MIN_SAMPLE trades pour cette branche —
+    évite l'ajustement sur un échantillon trop petit (risque réel signalé: 0 trade réel après 5 jours)."""
+    tag = f"confluence-{setup_type}"
+    relevant = [t for t in st.trades if t.get("source")=="confluence" and tag in t.get("reasoning","")]
+    if len(relevant) < TDS_ADAPT_MIN_SAMPLE:
+        return 1.0
+    wins = sum(1 for t in relevant if t.get("result")=="WIN")
+    wr = wins / len(relevant)
+    return min(1.5, max(0.5, wr / 0.5))
+
+
+async def job_confluence_asset(context, asset):
+    """v12.9 — 4ème stratégie CONFLUENCE (/conf). Combine:
+    A) Biais oracle (gap spot vs oracle, direction + magnitude)
+    B) Régime + qualité setup (squeeze→mean-rev OU expansion→momentum, dans le sens de l'oracle uniquement)
+    C) Pénalité bruit (chop détecté si ret10s/ret3s ont des signes opposés)
+    Formule multiplicative TDS = oracle_score × setup_score × (1-noise) — vraie confluence, un facteur nul = pas de trade.
+    Poids adaptatifs MR/momentum (_tds_adaptive_weight) restent neutres tant que <20 trades/branche.
+    ⚠️ AJOUT PUR — ne modifie ni l'oracle lag, ni le momentum, ni le mean-reversion existants, les recombine seulement.
+    Sizing Kelly dédié 1-3% BR (kelly_bet_secondary).
+    """
+    if not st.running or st.killed: return
+    now = time.time()
+    cur_slot = int(now // 300) * 300
+    slot_remaining = cur_slot + 300 - now
+    if not (60 <= slot_remaining <= 150): return
+
+    cfg = _asset_state_attrs(asset)
+    if (getattr(st, cfg["mom_slot"]) == cur_slot or getattr(st, cfg["mr_slot"]) == cur_slot
+            or getattr(st, cfg["tds_slot"]) == cur_slot):
+        return
+
+    spot = getattr(st, cfg["price"])
+    oracle = getattr(st, cfg["oracle"])
+    pts = list(getattr(st, cfg["prices"]))
+    if spot <= 0 or oracle <= 0 or len(pts) < 20: return
+
+    # ── A. Biais oracle (léger, direction + magnitude — pas les filtres complets de job_oracle_lag) ──
+    gap_pct = (spot - oracle) / oracle * 100
+    if abs(gap_pct) < TDS_GAP_MIN: return
+    oracle_dir = "UP" if gap_pct > 0 else "DOWN"
+    oracle_score = min(1.0, abs(gap_pct) / TDS_GAP_STRONG)
+
+    # ── B. Régime + setup (même calcul Bollinger que mean-reversion) ──
+    window_pts = [p for t,p in pts if now-t <= 60]
+    if len(window_pts) < 10: return
+    sma = sum(window_pts) / len(window_pts)
+    if sma <= 0: return
+    variance = sum((p-sma)**2 for p in window_pts) / len(window_pts)
+    std = variance ** 0.5
+    upper = sma + 2*std; lower = sma - 2*std
+    bandwidth = (upper - lower) / sma * 100
+    is_squeeze = bandwidth <= 0.12
+
+    def ret_over(secs):
+        cutoff = now - secs
+        old = [p for t,p in pts if t <= cutoff]
+        return (spot - old[-1]) / old[-1] * 100 if old and old[-1] > 0 else 0.0
+    ret_60s = ret_over(60); ret_30s = ret_over(30); ret_10s = ret_over(10); ret_3s = ret_over(3)
+
+    setup_score = 0.0; setup_dir = None; setup_type = None; overext = 0.0
+    if is_squeeze:
+        if spot >= upper:
+            cand_dir = "DOWN"; overext = (spot-upper)/sma*100
+        elif spot <= lower:
+            cand_dir = "UP"; overext = (lower-spot)/sma*100
+        else:
+            cand_dir = None
+        if cand_dir is not None and cand_dir == oracle_dir:
+            base = min(1.0, overext / TDS_OVEREXT_STRONG)
+            setup_score = min(1.0, base * _tds_adaptive_weight("meanrev"))
+            setup_dir = cand_dir; setup_type = "meanrev"
+    else:
+        if abs(ret_60s) >= 0.30:
+            cand_dir = "UP" if ret_60s > 0 else "DOWN"
+            if cand_dir == oracle_dir:
+                confirm = 1.0 if (cand_dir=="UP" and ret_30s>=0.05) or (cand_dir=="DOWN" and ret_30s<=-0.05) else 0.6
+                base = min(1.0, abs(ret_60s) / TDS_RET60S_STRONG) * confirm
+                setup_score = min(1.0, base * _tds_adaptive_weight("momentum"))
+                setup_dir = cand_dir; setup_type = "momentum"
+
+    if setup_dir is None:
+        log_skip(f"{asset} [CONF]: oracle {oracle_dir} (gap{gap_pct:+.3f}%) mais pas de setup régime aligné (BW={bandwidth:.3f}%)", oracle_dir,
+                 features={"gap":gap_pct,"delta":bandwidth,"ret3s":ret_3s,"votes":0,"filter":"conf_no_setup","asset":asset,"source":"confluence"})
+        return
+
+    # ── C. Pénalité bruit (chop/whipsaw: signe récent contraire au mouvement 10s) ──
+    noise_penalty = 0.0
+    if (ret_10s > 0 and ret_3s < -0.030) or (ret_10s < 0 and ret_3s > 0.030):
+        noise_penalty = 0.5
+
+    tds = oracle_score * setup_score * (1 - noise_penalty)
+    if tds < TDS_MIN_SCORE:
+        log_skip(f"{asset} [CONF]: TDS {tds:.2f}<{TDS_MIN_SCORE} (oracle={oracle_score:.2f} setup={setup_score:.2f} noise={noise_penalty:.1f})", setup_dir,
+                 features={"gap":gap_pct,"delta":bandwidth,"ret3s":ret_3s,"votes":0,"filter":"conf_tds_low","asset":asset,"source":"confluence"})
+        return
+
+    direction = setup_dir  # == oracle_dir (déjà vérifié aligné ci-dessus)
+
+    market = await poly.get_market_by_slug(f"{cfg['slug']}-{cur_slot}")
+    if not market: return
+    token_used = market["token_up"] if direction=="UP" else market["token_down"]
+    token_price = await poly.get_token_price(token_used)
+    if not token_price or token_price <= 0: return
+
+    if token_price > TDS_TOKEN_MAX or token_price < TDS_TOKEN_MIN:
+        log_skip(f"{asset} [CONF]: token {token_price:.2f}$ hors range [{TDS_TOKEN_MIN}-{TDS_TOKEN_MAX}]", direction,
+                 features={"gap":gap_pct,"delta":bandwidth,"ret3s":ret_3s,"votes":0,"filter":"conf_token","asset":asset,"source":"confluence"})
+        return
+
+    fee = taker_fee_per_share(token_price)
+    if setup_type == "meanrev":
+        p_conf = min(0.85, 0.55 + overext * 5)
+    else:
+        p_conf = min(0.90, 0.65 + abs(ret_60s) * 0.5)
+    p_conf = min(0.92, p_conf + 0.03)  # bonus confluence (heuristique — confirmation oracle+setup), À CALIBRER
+    ev = p_conf - token_price - fee
+    if ev < ORACLE_EDGE_MIN:
+        log_skip(f"{asset} [CONF]: EV {ev*100:+.1f}%<{ORACLE_EDGE_MIN*100:.0f}%", direction,
+                 features={"gap":gap_pct,"delta":bandwidth,"ret3s":ret_3s,"votes":0,"filter":"conf_ev","asset":asset,"source":"confluence"})
+        return
+
+    payout = round(1/token_price, 2)
+    # ✅ v12.9 — Sizing dynamique: confidence dérivée du TDS lui-même (demande user 17/06).
+    # TDS≈seuil(0.35) → confidence=0.7x (mise plus petite, confluence à peine validée)
+    # TDS≈1.0 (confluence quasi-parfaite) → confidence=1.3x (mise plus grosse, dans le cap 1-3% BR)
+    confidence = 0.7 + (tds - TDS_MIN_SCORE) / (1.0 - TDS_MIN_SCORE) * 0.6
+    confidence = min(1.3, max(0.7, confidence))
+    amount = kelly_bet_secondary(st.bankroll, p_conf, payout, confidence=confidence)
+    if amount < MIN_BET_USD: return
+
+    log.info(f"🎯 CONFLUENCE {asset} {direction} | TDS={tds:.2f} conf={confidence:.2f} type={setup_type} oracle={oracle_score:.2f} setup={setup_score:.2f} tok={token_price:.2f}$ EV={ev*100:.1f}%")
+
+    tpu = market["token_up"]; tpd = market["token_down"]
+    market_end = market.get("end_date","")
+    sess = session_ctx()
+    conf_score = {"score":0,"signals":[]}
+    reasoning = (f"🎯CONFLUENCE confluence-{setup_type} {asset} {direction} | TDS={tds:.2f} conf={confidence:.2f} "
+                 f"(oracle={oracle_score:.2f} setup={setup_score:.2f} noise={noise_penalty:.1f}) | "
+                 f"gap={gap_pct:+.3f}% BW={bandwidth:.3f}% | tok={token_price:.2f}$ EV={ev*100:+.1f}% T-{int(slot_remaining)}s")
+
+    ok = await place_bet(context, direction, amount, round(p_conf,2), reasoning, conf_score, sess, tpu, tpd, market_end, source="confluence")
+    if not ok: return
+
+    setattr(st, cfg["tds_slot"], cur_slot)
+    mode = "💰 RÉEL" if not st.paper_mode else "📄 paper"
+    await send(context.bot,
+        f"🎯 *CONFLUENCE {asset}* [{mode}]\n━━━━━━━━━━━━━━\n"
+        f"*{direction}* | `{amount:.2f}$` | P:`{p_conf*100:.0f}%` | ⏰T-`{int(slot_remaining)}s`\n"
+        f"TDS:`{tds:.2f}` (seuil {TDS_MIN_SCORE}) | Sizing conf:`{confidence:.2f}x` | Type:`{setup_type}`\n"
+        f"Oracle:`{oracle_score:.2f}` (gap {gap_pct:+.3f}%) | Setup:`{setup_score:.2f}` | Noise:`{noise_penalty:.1f}`\n"
+        f"Token:`{token_price:.2f}$` | EV:`{ev*100:+.1f}%`\n\n"
+        f"📝 _4ème stratégie — confluence oracle+régime, sizing dynamique 1-3% BR (×{confidence:.2f} selon TDS)_")
+
+
+async def job_confluence_btc(context):
+    await job_confluence_asset(context, "BTC")
+
+async def job_confluence_eth(context):
+    await job_confluence_asset(context, "ETH")
+
+async def job_confluence_sol(context):
+    await job_confluence_asset(context, "SOL")
+
+async def job_confluence_xrp(context):
+    await job_confluence_asset(context, "XRP")
+
+
 async def job_auto_calibrate(context):
     """
     ✅ v10.37 — Point 1: Auto-calibration des seuils toutes les 2h.
@@ -4066,8 +4148,9 @@ async def job_haiku_analysis(context):
     xrp_p = [p for p in sample if p.get("asset")=="XRP"]
     mom_p = [p for p in sample if p.get("source")=="momentum"]
     meanrev_p = [p for p in sample if p.get("source")=="meanrev"]
-    oracle_p = [p for p in sample if p.get("source") not in ("momentum","meanrev")]
-    asset_note = f"BTC:{len(btc_p)} ETH:{len(eth_p)} SOL:{len(sol_p)} XRP:{len(xrp_p)} | OracleLag:{len(oracle_p)} Momentum:{len(mom_p)} MeanRev:{len(meanrev_p)}"
+    confluence_p = [p for p in sample if p.get("source")=="confluence"]
+    oracle_p = [p for p in sample if p.get("source") not in ("momentum","meanrev","confluence")]
+    asset_note = f"BTC:{len(btc_p)} ETH:{len(eth_p)} SOL:{len(sol_p)} XRP:{len(xrp_p)} | OracleLag:{len(oracle_p)} Momentum:{len(mom_p)} MeanRev:{len(meanrev_p)} Confluence:{len(confluence_p)}"
 
     # v12.9 — Répartition par session pour détecter un biais de tendance dominante
     from collections import Counter as _Counter
@@ -4190,6 +4273,7 @@ PARAMÈTRES ACTUELS:
 - XRP: gap≥0.025% | T-45s→T-10s
 - MOMENTUM (BTC/ETH/SOL/XRP): ret60s≥0.30% | T-150s→T-60s | tok 0.55$-0.65$ | filtre trend macro 10min (bloque si tendance 10min contraire ≥0.10%, source: étude live ayant réduit pertes -93%→-13% avec ce filtre) | Kelly dédié 1-3% BR (2ème fenêtre indépendante). Extension ETH/SOL/XRP NOUVELLE (17/06) — surveiller si ces assets, documentés plus bruités à court terme, performent moins bien que BTC.
 - MEAN-REVERSION (BTC/ETH/SOL/XRP): Bollinger Bandwidth≤0.12% (régime squeeze) | parie contre un spike (prix hors bandes 2σ) | tok 0.51$-0.70$ | Kelly dédié 1-3% BR (3ème fenêtre, même T-150s→T-60s, régime complémentaire au momentum — squeeze vs expansion). Stratégie NOUVELLE, seuils à calibrer avec données réelles. Extension ETH/SOL/XRP NOUVELLE (17/06).
+- CONFLUENCE (BTC/ETH/SOL/XRP, 4ème stratégie /conf): TDS = oracle_score(gap≥0.025%, fort≥0.060%) × setup_score(mean-rev ou momentum, UNIQUEMENT si aligné avec le biais oracle) × (1-noise_penalty si chop détecté) | seuil TDS≥0.35 | tok 0.52$-0.72$ | Kelly dédié 1-3% BR avec SIZING DYNAMIQUE (confidence 0.7x à TDS=seuil → 1.3x à TDS=1.0, toujours capé 1-3% BR) | même fenêtre T-150s→T-60s. Poids adaptatifs MR/momentum ajustés UNIQUEMENT après ≥20 trades par branche (neutres sinon — anti-overfitting). Stratégie TRÈS NOUVELLE (17/06), tous les seuils sont des points de départ raisonnés à calibrer en priorité avec les premières données réelles.
 - Commun: delta≥0.020% | token BTC 0.51$-0.80$ (exceptions: ret3s≤+0.010% OU delta≥0.114%+gap≥0.060%) | ETH/XRP/SOL(votes≤-1) token max 0.95$ | EV≥15% | votes≥2 (consensus pour la direction parié, pas score brut)
 - BTC deltaneg: bloqué sauf si gap≥0.040% ET ret3s>-0.050% (exception validée 9W/3L)
 - ETH/SOL/XRP deltaneg: seuil strict -0.010% (0% WR historique si assoupli)
@@ -4324,7 +4408,8 @@ async def cmd_learn(update,context):
         # WR par stratégie
         mom_trades = [t for t in real if t.get("source")=="momentum"]
         meanrev_trades = [t for t in real if t.get("source")=="meanrev"]
-        lag_trades = [t for t in real if t.get("source") not in ("momentum","meanrev")]
+        confluence_trades = [t for t in real if t.get("source")=="confluence"]
+        lag_trades = [t for t in real if t.get("source") not in ("momentum","meanrev","confluence")]
         if mom_trades:
             w_m=sum(1 for t in mom_trades if t.get("result")=="WIN")
             pnl_m=sum(t.get("pnl",0) for t in mom_trades)
@@ -4333,6 +4418,14 @@ async def cmd_learn(update,context):
             w_mr=sum(1 for t in meanrev_trades if t.get("result")=="WIN")
             pnl_mr=sum(t.get("pnl",0) for t in meanrev_trades)
             lines.append(f"  🔄 Mean-Rev: {len(meanrev_trades)} trades WR:`{w_mr/len(meanrev_trades)*100:.0f}%` PnL:`{pnl_mr:+.2f}$`")
+        if confluence_trades:
+            w_c=sum(1 for t in confluence_trades if t.get("result")=="WIN")
+            pnl_c=sum(t.get("pnl",0) for t in confluence_trades)
+            lines.append(f"  🎯 Confluence: {len(confluence_trades)} trades WR:`{w_c/len(confluence_trades)*100:.0f}%` PnL:`{pnl_c:+.2f}$`")
+            c_mr=[t for t in confluence_trades if "confluence-meanrev" in t.get("reasoning","")]
+            c_mom=[t for t in confluence_trades if "confluence-momentum" in t.get("reasoning","")]
+            if c_mr or c_mom:
+                lines.append(f"     └ MR:{len(c_mr)} (poids {_tds_adaptive_weight('meanrev'):.2f}) | MOM:{len(c_mom)} (poids {_tds_adaptive_weight('momentum'):.2f})")
         # ✅ v12.9 — Résumé agrégé régime squeeze/expansion (BTC+ETH+SOL+XRP cumulés, pas de spam /passes)
         total_regime = st.meanrev_regime_squeeze_count + st.meanrev_regime_expansion_count
         if total_regime > 0:
@@ -4437,7 +4530,6 @@ async def cmd_run(update,context):
     st.price_job=context.job_queue.run_repeating(job_price,interval=30,first=5)
     st.macro_job=context.job_queue.run_repeating(job_macro,interval=300,first=8)
     st.tick_job=context.job_queue.run_repeating(job_tick,interval=30,first=10)
-    st.snipe_job=context.job_queue.run_repeating(job_snipe,interval=10,first=12)  # ✅ v10.22
     st.tp_job=context.job_queue.run_repeating(job_take_profit,interval=TAKE_PROFIT_CHECK,first=10)
     st.backup_job=context.job_queue.run_repeating(job_backup,interval=120,first=60)  # v12.4 backup 2min
     st.recap_job=context.job_queue.run_repeating(job_daily_recap,interval=3600,first=60)
@@ -4457,6 +4549,11 @@ async def cmd_run(update,context):
     context.job_queue.run_repeating(job_mean_reversion_eth,interval=2,first=34)
     context.job_queue.run_repeating(job_mean_reversion_sol,interval=2,first=36)
     context.job_queue.run_repeating(job_mean_reversion_xrp,interval=2,first=38)
+    # ✅ v12.9 — 4ème stratégie CONFLUENCE (/conf), demande user 17/06
+    context.job_queue.run_repeating(job_confluence_btc,interval=2,first=40)
+    context.job_queue.run_repeating(job_confluence_eth,interval=2,first=42)
+    context.job_queue.run_repeating(job_confluence_sol,interval=2,first=44)
+    context.job_queue.run_repeating(job_confluence_xrp,interval=2,first=46)
     context.job_queue.run_repeating(job_resolve_passes,interval=30,first=35)
     context.job_queue.run_repeating(job_auto_calibrate,interval=7200,first=300)  # ✅ v10.37 seuils auto
     context.job_queue.run_repeating(job_pattern_memory,interval=3600,first=600)  # ✅ v10.37 mémoire patterns
@@ -4481,6 +4578,7 @@ async def cmd_run(update,context):
         f"/oracle BTC T-45→T-10s | ETH T-45→T-10s | SOL T-45→T-10s | XRP T-45→T-10s\n"
         f"/momentum BTC/ETH/SOL/XRP T-150s→T-60s | move≥0.30%/60s | tok 0.55$-0.65$ | filtre trend10m | Kelly 1-3%\n"
         f"/meanrev BTC/ETH/SOL/XRP T-150s→T-60s | squeeze BW≤0.12% | tok 0.51$-0.70$ | Kelly 1-3%\n"
+        f"/conf BTC/ETH/SOL/XRP T-150s→T-60s | TDS=oracle×setup×(1-bruit)≥0.35 | tok 0.52$-0.72$ | Kelly 1-3% dynamique\n"
         f"  gap BTC/XRP≥2.5bps | ETH/SOL≥2.0bps | delta≥{int(ORACLE_ENTRY_DELTA*10000)}bps | Token≤{ORACLE_TOKEN_MAX}$(BTC)/0.95$(ETH/XRP/SOL) | EV≥{int(ORACLE_EDGE_MIN*100)}%\n"
         f"BR:`{st.bankroll:.2f}$` | ROI:`{roi()}`\n"
         f"📊 `{ob_txt}` | 💸 `{liq_txt}`\n"
@@ -4491,11 +4589,11 @@ async def cmd_run(update,context):
 async def cmd_stop(update,context):
     if not auth(update): return
     st.running=False
-    for j in [st.tick_job,st.price_job,st.macro_job,st.tp_job,st.backup_job,st.recap_job,st.snipe_job]:
+    for j in [st.tick_job,st.price_job,st.macro_job,st.tp_job,st.backup_job,st.recap_job]:
         if j:
             try: j.schedule_removal()
             except: pass
-    st.tick_job=st.price_job=st.macro_job=st.tp_job=st.backup_job=st.recap_job=st.snipe_job=None
+    st.tick_job=st.price_job=st.macro_job=st.tp_job=st.backup_job=st.recap_job=None
     st.backup()
     await update.message.reply_text(
         f"⏹ *Arrêté* | `{upt()}` | BR:`{st.bankroll:.2f}` | ROI:`{roi()}` | WR:`{wr()}`\n💾 Backup OK.",
@@ -5010,7 +5108,7 @@ async def cmd_cooldown(update,context):
 async def cmd_reset(update,context):
     if not auth(update): return
     st.running=False
-    for j in [st.tick_job,st.price_job,st.macro_job,st.tp_job,st.backup_job,st.recap_job,st.snipe_job]:
+    for j in [st.tick_job,st.price_job,st.macro_job,st.tp_job,st.backup_job,st.recap_job]:
         if j:
             try: j.schedule_removal()
             except: pass
@@ -5130,13 +5228,12 @@ async def cmd_fair(update,context):
     cur = st.ws_price
     delta_live = (cur - st.slot_open_price) / st.slot_open_price * 100 if st.slot_open_price > 0 else 0.0
     p_up = fair_prob_up(delta_live, t_rem, sigma)
-    snipe_zone = SNIPE_LAST_MIN <= t_rem < ENTRY_LAST_SECONDS
     await update.message.reply_text(
         f"⚖️ *FAIR VALUE* (Brownien)\n━━━━━━━━━━━━━━\n"
         f"₿`${cur:,.2f}` | Slot open:`${st.slot_open_price:,.2f}`\n"
-        f"Δ:`{delta_live:+.3f}%` | ⏰`{t_rem}s` {'🎯SNIPE zone' if snipe_zone else ''} | σ:`{sigma:.4f}`\n\n"
+        f"Δ:`{delta_live:+.3f}%` | ⏰`{t_rem}s` | σ:`{sigma:.4f}`\n\n"
         f"🟢 P(UP):`{p_up*100:.0f}%` | 🔴 P(DOWN):`{(1-p_up)*100:.0f}%`\n\n"
-        f"💡 Normal: EV≥{FAIR_EDGE_MIN*100:.0f}pts | SNIPE: P≥{SNIPE_MIN_PROB*100:.0f}% + EV≥{SNIPE_EDGE_MIN*100:.0f}pts\n"
+        f"💡 EV≥{FAIR_EDGE_MIN*100:.0f}pts (job_tick, paper/stats uniquement — pas de trading réel)\n"
         f"_(frais taker déduits automatiquement)_",
         parse_mode="Markdown")
 
@@ -5289,6 +5386,123 @@ async def cmd_mean_reversion(update,context):
         f"{status}\n"
         f"Dernier trade mean-rev: `{last_mr}`",
         parse_mode="Markdown")
+
+
+async def cmd_regime(update,context):
+    """v12.9 — Diagnostic instantané RANGE (squeeze) vs TREND (expansion) + biais oracle sur BTC/ETH/SOL/XRP.
+    Réutilise le même calcul Bollinger Bandwidth que job_mean_reversion_*/job_confluence_*, lecture seule, instantané."""
+    if not auth(update): return
+    now = time.time()
+    lines_out = ["📐 *RÉGIME MARCHÉ — instantané*\n━━━━━━━━━━━━━━"]
+
+    for asset in ("BTC","ETH","SOL","XRP"):
+        cfg = _asset_state_attrs(asset)
+        cur_price = getattr(st, cfg["price"])
+        oracle_price = getattr(st, cfg["oracle"])
+        pts = list(getattr(st, cfg["prices"]))
+        window_pts = [p for t,p in pts if now-t <= 60]
+
+        if cur_price <= 0 or len(window_pts) < 10:
+            lines_out.append(f"\n{'₿' if asset=='BTC' else asset}: `données insuffisantes`")
+            continue
+
+        sma = sum(window_pts) / len(window_pts)
+        variance = sum((p-sma)**2 for p in window_pts) / len(window_pts)
+        std = variance ** 0.5
+        bandwidth = ((sma+2*std) - (sma-2*std)) / sma * 100 if sma > 0 else 0
+        is_squeeze = bandwidth <= 0.12
+
+        ret_60s = ((cur_price - window_pts[0]) / window_pts[0] * 100) if window_pts[0] > 0 else 0.0
+
+        gap_txt = "`indisponible`"
+        if oracle_price > 0:
+            gap_pct = (cur_price - oracle_price) / oracle_price * 100
+            oracle_dir = "UP 🟢" if gap_pct > 0 else "DOWN 🔴" if gap_pct < 0 else "neutre"
+            strength = "fort" if abs(gap_pct) >= TDS_GAP_STRONG else ("faible" if abs(gap_pct) < TDS_GAP_MIN else "modéré")
+            gap_txt = f"`{gap_pct:+.3f}%` {oracle_dir} ({strength})"
+
+        tag = "🟦 RANGE (squeeze)" if is_squeeze else "🟥 TREND (expansion)"
+        reco = "→ stratégie active: mean-reversion" if is_squeeze else "→ stratégie active: momentum"
+        emoji = "₿" if asset=="BTC" else asset
+        lines_out.append(f"\n{emoji} `${cur_price:,.4f}` | BW:`{bandwidth:.3f}%` | ret60s:`{ret_60s:+.3f}%`\n{tag}\nBiais oracle: {gap_txt}\n_{reco}_")
+
+    lines_out.append(f"\n\n_Seuil squeeze: BW≤0.12% (à calibrer avec données réelles)_")
+    await update.message.reply_text("\n".join(lines_out), parse_mode="Markdown")
+
+
+async def cmd_confluence(update,context):
+    """v12.9 — Diagnostic instantané CONFLUENCE (4ème stratégie /conf) sur BTC/ETH/SOL/XRP.
+    Montre le score TDS en temps réel = oracle_score × setup_score × (1-noise), même calcul que job_confluence_*."""
+    if not auth(update): return
+    now = time.time()
+    lines_out = ["🎯 *CONFLUENCE — TDS instantané*\n━━━━━━━━━━━━━━"]
+
+    for asset in ("BTC","ETH","SOL","XRP"):
+        cfg = _asset_state_attrs(asset)
+        spot = getattr(st, cfg["price"])
+        oracle = getattr(st, cfg["oracle"])
+        pts = list(getattr(st, cfg["prices"]))
+        emoji = "₿" if asset=="BTC" else asset
+
+        if spot <= 0 or oracle <= 0 or len(pts) < 20:
+            lines_out.append(f"\n{emoji}: `données insuffisantes`")
+            continue
+
+        gap_pct = (spot - oracle) / oracle * 100
+        if abs(gap_pct) < TDS_GAP_MIN:
+            lines_out.append(f"\n{emoji}: gap `{gap_pct:+.3f}%` trop faible → pas de biais oracle")
+            continue
+        oracle_dir = "UP" if gap_pct > 0 else "DOWN"
+        oracle_score = min(1.0, abs(gap_pct) / TDS_GAP_STRONG)
+
+        window_pts = [p for t,p in pts if now-t <= 60]
+        if len(window_pts) < 10:
+            lines_out.append(f"\n{emoji}: `pas assez de points sur 60s`")
+            continue
+        sma = sum(window_pts) / len(window_pts)
+        variance = sum((p-sma)**2 for p in window_pts) / len(window_pts)
+        std = variance ** 0.5
+        upper = sma + 2*std; lower = sma - 2*std
+        bandwidth = (upper-lower)/sma*100 if sma>0 else 0
+        is_squeeze = bandwidth <= 0.12
+
+        def ret_over(secs, _pts=pts, _now=now, _spot=spot):
+            cutoff = _now - secs
+            old = [p for t,p in _pts if t <= cutoff]
+            return (_spot - old[-1]) / old[-1] * 100 if old and old[-1] > 0 else 0.0
+        ret_60s = ret_over(60); ret_30s = ret_over(30); ret_10s = ret_over(10); ret_3s = ret_over(3)
+
+        setup_score = 0.0; setup_dir = None; setup_type = None
+        if is_squeeze:
+            if spot >= upper: cand_dir="DOWN"; overext=(spot-upper)/sma*100
+            elif spot <= lower: cand_dir="UP"; overext=(lower-spot)/sma*100
+            else: cand_dir=None; overext=0.0
+            if cand_dir is not None and cand_dir == oracle_dir:
+                setup_score = min(1.0, min(1.0, overext/TDS_OVEREXT_STRONG) * _tds_adaptive_weight("meanrev"))
+                setup_dir = cand_dir; setup_type = "meanrev"
+        else:
+            if abs(ret_60s) >= 0.30:
+                cand_dir = "UP" if ret_60s>0 else "DOWN"
+                if cand_dir == oracle_dir:
+                    confirm = 1.0 if (cand_dir=="UP" and ret_30s>=0.05) or (cand_dir=="DOWN" and ret_30s<=-0.05) else 0.6
+                    setup_score = min(1.0, min(1.0, abs(ret_60s)/TDS_RET60S_STRONG)*confirm * _tds_adaptive_weight("momentum"))
+                    setup_dir = cand_dir; setup_type = "momentum"
+
+        noise_penalty = 0.5 if ((ret_10s>0 and ret_3s<-0.030) or (ret_10s<0 and ret_3s>0.030)) else 0.0
+        tds = oracle_score * setup_score * (1-noise_penalty)
+        status = "🟢 ACTIF" if (setup_dir is not None and tds >= TDS_MIN_SCORE) else "⚪ pas de setup"
+        conf_preview = ""
+        if setup_dir is not None and tds >= TDS_MIN_SCORE:
+            confidence = min(1.3, max(0.7, 0.7 + (tds - TDS_MIN_SCORE) / (1.0 - TDS_MIN_SCORE) * 0.6))
+            conf_preview = f" | Sizing:`{confidence:.2f}x`"
+
+        lines_out.append(
+            f"\n{emoji} oracle:`{oracle_dir}` score:`{oracle_score:.2f}` | régime:`{'squeeze' if is_squeeze else 'expansion'}`\n"
+            f"Setup:`{setup_type or '—'}` score:`{setup_score:.2f}` | Noise:`{noise_penalty:.1f}`\n"
+            f"TDS:`{tds:.2f}` (seuil {TDS_MIN_SCORE}) {status}{conf_preview}")
+
+    lines_out.append(f"\n\n_Poids adaptatifs neutres tant que <{TDS_ADAPT_MIN_SAMPLE} trades/branche_")
+    await update.message.reply_text("\n".join(lines_out), parse_mode="Markdown")
 
 
 async def cmd_sessionstats(update,context):
@@ -5472,7 +5686,7 @@ def main():
         ("balance",cmd_balance),("paper",cmd_paper),("cooldown",cmd_cooldown),("reset",cmd_reset),("resetskips",cmd_resetskips),
         ("setbalance",cmd_setbalance),("backup",cmd_backup),("recap",cmd_recap),("dashboard",cmd_dashboard),
         ("history",cmd_history),("turbo",cmd_turbo),("sell",cmd_sell),("sellcheck",cmd_sellcheck),("fair",cmd_fair),
-        ("backtest",cmd_backtest),("oracle",cmd_oracle),("momentum",cmd_momentum),("meanrev",cmd_mean_reversion),("sessionstats",cmd_sessionstats),("calib",cmd_calib),("learn",cmd_learn),("revive",cmd_revive),("autotune",cmd_autotune)]:
+        ("backtest",cmd_backtest),("oracle",cmd_oracle),("momentum",cmd_momentum),("meanrev",cmd_mean_reversion),("regime",cmd_regime),("conf",cmd_confluence),("sessionstats",cmd_sessionstats),("calib",cmd_calib),("learn",cmd_learn),("revive",cmd_revive),("autotune",cmd_autotune)]:
         app.add_handler(CommandHandler(name,handler))
     app.add_handler(CallbackQueryHandler(cb))
     log.info(f"🧠 PolyBot v{BOT_VERSION} démarré")
