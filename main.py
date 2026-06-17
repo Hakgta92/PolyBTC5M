@@ -141,7 +141,7 @@ KILL_SWITCH_LOSSES  = 5      # Pertes consécutives → arrêt total (au-delà d
 ORACLE_ENTRY_DELTA  = 0.02  # v12.4  # ✅ v10.31 — baissé 0.05→0.03% (-0.049% bloqué mais ✅ dans passes)
 ORACLE_TOKEN_MAX    = 0.80  # v12.6 — élargi pour accumuler des données  # ✅ v10.32 — breakeven exact @92%WR = token 0.92$ (EV>0 jusqu'à 0.92$)
 ORACLE_TOKEN_MIN    = 0.51  # Token min (trop proche de 0.50$ = incertitude trop haute)
-ORACLE_EDGE_MIN     = 0.15  # v12.4  # EV minimum après frais (8%)
+ORACLE_EDGE_MIN     = 0.15  # v12.4  # EV minimum après frais — 15% (commentaire "8%" précédent était obsolète/faux)
 ORACLE_WINDOW_START = 45    # v12.9 — élargi T-25→T-45 (demande user 17/06)    # Fenêtre normale: T-45s→T-10s
 ORACLE_WINDOW_END   = 10    # v12.9 — élargi T-5→T-10     # T-10s = nouveau dernier moment sûr
 # ✅ v10.32 — Mode T-10s (source: github.com/Archetapp — T-10s "direction quasi lockée")
@@ -276,12 +276,12 @@ def kelly_bet(bankroll, win_prob, payout_mult, token_price=0.5, ev_bonus=False):
     log.debug(f"Kelly tier={tier_name} EV={ev_real:.2f} P={win_prob:.2f} → {result:.2f}$")
     return result
 
-def kelly_bet_meanrev(bankroll, win_prob, payout_mult):
+def kelly_bet_secondary(bankroll, win_prob, payout_mult):
     """
-    ✅ v12.9 — Kelly DÉDIÉ mean-reversion, complètement séparé de kelly_bet() partagée
-    (kelly_bet a un plancher dynamique ~4% BR minimum, incompatible avec un cap 1-4%).
-    Fraction conservatrice (0.25x Kelly), cap strict entre 1% et 4% du bankroll.
-    Stratégie nouvelle/non-validée en réel → sizing volontairement plus prudent que l'oracle lag.
+    ✅ v12.9 — Kelly DÉDIÉ momentum + mean-reversion (multi-asset), séparé de kelly_bet() partagée
+    (kelly_bet a un plancher dynamique ~4% BR minimum, incompatible avec un cap 1-3%).
+    Fraction conservatrice (0.25x Kelly), cap strict entre 1% et 3% du bankroll.
+    Stratégies secondaires (pas l'oracle lag) → sizing volontairement plus prudent.
     """
     if win_prob <= 0 or payout_mult <= 1:
         return 0.0
@@ -290,9 +290,9 @@ def kelly_bet_meanrev(bankroll, win_prob, payout_mult):
     kp = (win_prob * b - q) / b
     if kp <= 0:
         return 0.0  # Edge négatif → ne pas trader
-    pct = min(max(kp * 0.25, 0.01), 0.04)  # cap strict 1%-4% BR
+    pct = min(max(kp * 0.25, 0.01), 0.03)  # cap strict 1%-3% BR
     result = round(bankroll * pct, 2)
-    log.debug(f"Kelly meanrev: kp={kp:.3f} pct={pct*100:.1f}% → {result:.2f}$")
+    log.debug(f"Kelly secondary: kp={kp:.3f} pct={pct*100:.1f}% → {result:.2f}$")
     return result
 
 # ─── DONNÉES AVANCÉES ──────────────────────────────────────────────────────
@@ -1583,6 +1583,10 @@ class State:
         self.xrp_last_trade_slot=0
         self.momentum_last_slot=0  # v12.9 — 2ème fenêtre momentum BTC
         self.meanrev_last_slot=0  # v12.9 — 3ème fenêtre mean-reversion BTC (coordonne avec momentum_last_slot)
+        # v12.9 — Extension multi-asset momentum/meanrev (ETH/SOL/XRP), sizing dédié 1-3%
+        self.momentum_last_slot_eth=0; self.momentum_last_slot_sol=0; self.momentum_last_slot_xrp=0
+        self.meanrev_last_slot_eth=0; self.meanrev_last_slot_sol=0; self.meanrev_last_slot_xrp=0
+        self.meanrev_regime_squeeze_count=0; self.meanrev_regime_expansion_count=0  # v12.9 — résumé agrégé pour /learn
         self.xrp_ob_imbalance=0.0; self.xrp_ob_ts=0.0; self.xrp_ob_asset_id=""; self.xrp_clob_ws_task=None
         self.oracle_lag_signal=None  # {"bias","desc","div_pct"}
         # ✅ v10.23 — Calibration sigma
@@ -3548,7 +3552,7 @@ async def job_momentum_btc(context):
 
     # ── Kelly + bet ──
     payout = round(1/token_price, 2)
-    amount = kelly_bet(st.bankroll, p_mom, payout, token_price, ev_bonus=True)
+    amount = kelly_bet_secondary(st.bankroll, p_mom, payout)  # v12.9 — unifié 1-3% (était kelly_bet partagée 5-15%)
     if amount < MIN_BET_USD: return
 
     log.info(f"⚡ MOMENTUM BTC {direction} | ret60s={ret_60s:+.3f}% ret30s={ret_30s:+.3f}% tok={token_price:.2f}$ EV={ev*100:.1f}%")
@@ -3573,6 +3577,127 @@ async def job_momentum_btc(context):
         f"📝 _2ème fenêtre momentum — entrée tôt sur fort move_")
 
 
+def _asset_state_attrs(asset):
+    """v12.9 — Mappe un asset vers ses noms d'attributs st.* (momentum/meanrev multi-asset).
+    BTC garde ses attributs historiques sans préfixe; ETH/SOL/XRP utilisent le préfixe existant."""
+    a = asset.upper()
+    if a == "BTC":
+        return dict(price="ws_price", prices="ws_prices", oracle="oracle_price",
+                     slug="btc-updown-5m", mom_slot="momentum_last_slot", mr_slot="meanrev_last_slot")
+    pfx = a.lower()
+    return dict(price=f"{pfx}_price", prices=f"{pfx}_ws_prices", oracle=f"{pfx}_oracle_price",
+                 slug=f"{pfx}-updown-5m", mom_slot=f"momentum_last_slot_{pfx}", mr_slot=f"meanrev_last_slot_{pfx}")
+
+
+async def job_momentum_asset(context, asset):
+    """v12.9 — Momentum généralisé ETH/SOL/XRP (même logique que job_momentum_btc).
+    ⚠️ AJOUT PUR — job_momentum_btc reste la fonction dédiée BTC, totalement inchangée à part le sizing.
+    Sizing Kelly dédié 1-3% BR (kelly_bet_secondary), demande user 17/06.
+    """
+    if not st.running or st.killed: return
+    now = time.time()
+    cur_slot = int(now // 300) * 300
+    slot_remaining = cur_slot + 300 - now
+    if not (60 <= slot_remaining <= 150): return
+
+    cfg = _asset_state_attrs(asset)
+    if getattr(st, cfg["mom_slot"]) == cur_slot or getattr(st, cfg["mr_slot"]) == cur_slot: return
+
+    cur_price = getattr(st, cfg["price"])
+    oracle_price = getattr(st, cfg["oracle"])
+    if oracle_price <= 0 or cur_price <= 0: return
+
+    pts = list(getattr(st, cfg["prices"]))
+    if len(pts) < 5: return
+
+    def ret_over(secs):
+        cutoff = now - secs
+        old = [p for t,p in pts if t <= cutoff]
+        return (cur_price - old[-1]) / old[-1] * 100 if old and old[-1]>0 else 0.0
+
+    ret_60s = ret_over(60); ret_30s = ret_over(30); ret_3s = ret_over(3)
+    if abs(ret_60s) < 0.30: return
+    direction = "UP" if ret_60s > 0 else "DOWN"
+    if direction == "UP" and ret_30s < 0.05: return
+    if direction == "DOWN" and ret_30s > -0.05: return
+    if direction == "UP" and ret_3s < -0.050: return
+    if direction == "DOWN" and ret_3s > 0.050: return
+
+    # Filtre tendance macro 10min (même logique que BTC, symbole Binance adapté à l'asset)
+    try:
+        klines_10m = await fetch_klines("1m", limit=10, symbol=f"{asset.lower()}usdt")
+        if klines_10m and len(klines_10m) >= 5:
+            trend_10m = (klines_10m[-1]["close"] - klines_10m[0]["open"]) / klines_10m[0]["open"] * 100
+            if direction == "UP" and trend_10m <= -0.10:
+                log_skip(f"{asset} [MOM]: trend10m {trend_10m:+.3f}% contre UP", direction,
+                         features={"gap":0,"delta":ret_60s,"ret3s":ret_3s,"votes":0,"filter":"mom_trend_contra","asset":asset,"source":"momentum"}); return
+            if direction == "DOWN" and trend_10m >= 0.10:
+                log_skip(f"{asset} [MOM]: trend10m {trend_10m:+.3f}% contre DOWN", direction,
+                         features={"gap":0,"delta":ret_60s,"ret3s":ret_3s,"votes":0,"filter":"mom_trend_contra","asset":asset,"source":"momentum"}); return
+        else:
+            trend_10m = 0.0
+    except Exception:
+        trend_10m = 0.0
+
+    market = await poly.get_market_by_slug(f"{cfg['slug']}-{cur_slot}")
+    if not market: return
+    token_used = market["token_up"] if direction=="UP" else market["token_down"]
+    token_price = await poly.get_token_price(token_used)
+    if not token_price or token_price <= 0: return
+
+    MOMENTUM_TOKEN_MIN = 0.55
+    MOMENTUM_TOKEN_MAX = 0.65
+    if token_price > MOMENTUM_TOKEN_MAX:
+        log_skip(f"{asset} [MOM]: token {token_price:.2f}$>{MOMENTUM_TOKEN_MAX}$ (momentum déjà pricé)", direction,
+                 features={"gap":0,"delta":ret_60s,"ret3s":ret_3s,"votes":0,"filter":"mom_tokenmax","asset":asset,"source":"momentum"}); return
+    if token_price < MOMENTUM_TOKEN_MIN:
+        log_skip(f"{asset} [MOM]: token {token_price:.2f}$<{MOMENTUM_TOKEN_MIN}$ (signal trop faible)", direction,
+                 features={"gap":0,"delta":ret_60s,"ret3s":ret_3s,"votes":0,"filter":"mom_tokenmin","asset":asset,"source":"momentum"}); return
+
+    fee = taker_fee_per_share(token_price)
+    p_mom = min(0.90, 0.65 + abs(ret_60s) * 0.5)
+    ev = p_mom - token_price - fee
+    if ev < ORACLE_EDGE_MIN:
+        log_skip(f"{asset} [MOM]: EV {ev*100:+.1f}%<{ORACLE_EDGE_MIN*100:.0f}%", direction,
+                 features={"gap":0,"delta":ret_60s,"ret3s":ret_3s,"votes":0,"filter":"mom_ev","asset":asset,"source":"momentum"}); return
+
+    payout = round(1/token_price, 2)
+    amount = kelly_bet_secondary(st.bankroll, p_mom, payout)
+    if amount < MIN_BET_USD: return
+
+    log.info(f"⚡ MOMENTUM {asset} {direction} | ret60s={ret_60s:+.3f}% ret30s={ret_30s:+.3f}% tok={token_price:.2f}$ EV={ev*100:.1f}%")
+
+    tpu = market["token_up"]; tpd = market["token_down"]
+    market_end = market.get("end_date","")
+    sess = session_ctx()
+    conf_score = {"score":0,"signals":[]}
+    reasoning = (f"⚡MOMENTUM {asset} {direction} | ret60s={ret_60s:+.3f}% ret30s={ret_30s:+.3f}% ret3s={ret_3s:+.3f}% "
+                 f"trend10m={trend_10m:+.3f}% | tok={token_price:.2f}$ EV={ev*100:+.1f}% T-{int(slot_remaining)}s")
+
+    ok = await place_bet(context, direction, amount, round(p_mom,2), reasoning, conf_score, sess, tpu, tpd, market_end, source="momentum")
+    if not ok: return
+
+    setattr(st, cfg["mom_slot"], cur_slot)
+    mode = "💰 RÉEL" if not st.paper_mode else "📄 paper"
+    await send(context.bot,
+        f"🚀 *MOMENTUM {asset}* [{mode}]\n━━━━━━━━━━━━━━\n"
+        f"*{direction}* | `{amount:.2f}$` | P:`{p_mom*100:.0f}%` | ⏰T-`{int(slot_remaining)}s`\n"
+        f"Ret 60s:`{ret_60s:+.3f}%` | 30s:`{ret_30s:+.3f}%` | 3s:`{ret_3s:+.3f}%`\n"
+        f"Trend 10m:`{trend_10m:+.3f}%` (filtre macro)\n"
+        f"Token:`{token_price:.2f}$` | EV:`{ev*100:+.1f}%`\n\n"
+        f"📝 _Momentum {asset} — entrée tôt sur fort move_")
+
+
+async def job_momentum_eth(context):
+    await job_momentum_asset(context, "ETH")
+
+async def job_momentum_sol(context):
+    await job_momentum_asset(context, "SOL")
+
+async def job_momentum_xrp(context):
+    await job_momentum_asset(context, "XRP")
+
+
 async def job_mean_reversion_btc(context):
     """v12.9 — BTC Mean-Reversion: parie CONTRE les spikes en régime squeeze (faible volatilité).
     Source: PolyPredictor (Bollinger Bandwidth squeeze/expansion régime-adaptatif),
@@ -3582,7 +3707,7 @@ async def job_mean_reversion_btc(context):
     ⚠️ AJOUT PUR — ne touche ni à l'oracle lag, ni au momentum existant.
     Coordination anti-double-trade: partage st.momentum_last_slot avec job_momentum_btc
     (les 2 stratégies occupent la même fenêtre T-150s→T-60s, régimes complémentaires).
-    Sizing Kelly dédié 1-4% BR (kelly_bet_meanrev) — volontairement prudent, stratégie non
+    Sizing Kelly dédié 1-3% BR (kelly_bet_secondary) — volontairement prudent, stratégie non
     encore validée en réel.
     """
     if not st.running or st.killed: return
@@ -3613,7 +3738,9 @@ async def job_mean_reversion_btc(context):
     # ✅ Seuil squeeze — point de départ raisonné, À CALIBRER avec données réelles (comme tous nos autres seuils)
     SQUEEZE_MAX_BANDWIDTH = 0.12
     if bandwidth > SQUEEZE_MAX_BANDWIDTH:
+        st.meanrev_regime_expansion_count += 1  # v12.9 — résumé agrégé /learn (pas de log individuel, évite spam)
         return  # régime expansion/tendance → laisser momentum gérer ce cas, pas de mean-reversion ici
+    st.meanrev_regime_squeeze_count += 1
 
     # ── Détection du spike (prix actuel hors bandes de Bollinger) ──
     cur_price = st.ws_price
@@ -3634,9 +3761,13 @@ async def job_mean_reversion_btc(context):
     ret_10s = ret_over(10)
     ret_3s = ret_over(3)
     if direction == "DOWN" and ret_3s > 0 and abs(ret_3s) > abs(ret_10s)*0.5:
-        return  # spike haussier encore en accélération → pas encore de signe de retournement
+        log_skip(f"BTC [MEANREV]: spike haussier encore en accélération (ret3s={ret_3s:+.3f}%) — trop tôt pour reversion", direction,
+                 features={"gap":0,"delta":bandwidth,"ret3s":ret_3s,"votes":0,"filter":"mr_fakeout","asset":"BTC","source":"meanrev"})
+        return
     if direction == "UP" and ret_3s < 0 and abs(ret_3s) > abs(ret_10s)*0.5:
-        return  # spike baissier encore en accélération → idem
+        log_skip(f"BTC [MEANREV]: spike baissier encore en accélération (ret3s={ret_3s:+.3f}%) — trop tôt pour reversion", direction,
+                 features={"gap":0,"delta":bandwidth,"ret3s":ret_3s,"votes":0,"filter":"mr_fakeout","asset":"BTC","source":"meanrev"})
+        return
 
     # ── Marché + token ──
     market = await poly.get_market_by_slug(f"btc-updown-5m-{cur_slot}")
@@ -3664,7 +3795,7 @@ async def job_mean_reversion_btc(context):
 
     # ── Kelly dédié 1-4% BR (PAS kelly_bet partagée) ──
     payout = round(1/token_price, 2)
-    amount = kelly_bet_meanrev(st.bankroll, p_rev, payout)
+    amount = kelly_bet_secondary(st.bankroll, p_rev, payout)
     if amount < MIN_BET_USD: return
 
     log.info(f"🔄 MEAN-REV BTC {direction} | bandwidth={bandwidth:.3f}% overext={overext:.3f}% tok={token_price:.2f}$ EV={ev*100:.1f}%")
@@ -3689,6 +3820,124 @@ async def job_mean_reversion_btc(context):
         f"Ret 10s:`{ret_10s:+.3f}%` | 3s:`{ret_3s:+.3f}%`\n"
         f"Token:`{token_price:.2f}$` | EV:`{ev*100:+.1f}%`\n\n"
         f"📝 _3ème fenêtre — parie contre un spike en régime calme_")
+
+
+async def job_mean_reversion_asset(context, asset):
+    """v12.9 — Mean-reversion généralisé ETH/SOL/XRP (même logique que job_mean_reversion_btc).
+    ⚠️ AJOUT PUR — job_mean_reversion_btc reste la fonction dédiée BTC, totalement inchangée à part le sizing.
+    Sizing Kelly dédié 1-3% BR (kelly_bet_secondary), demande user 17/06.
+    """
+    if not st.running or st.killed: return
+    now = time.time()
+    cur_slot = int(now // 300) * 300
+    slot_remaining = cur_slot + 300 - now
+    if not (60 <= slot_remaining <= 150): return
+
+    cfg = _asset_state_attrs(asset)
+    if getattr(st, cfg["mom_slot"]) == cur_slot or getattr(st, cfg["mr_slot"]) == cur_slot: return
+
+    cur_price = getattr(st, cfg["price"])
+    oracle_price = getattr(st, cfg["oracle"])
+    if oracle_price <= 0 or cur_price <= 0: return
+
+    pts = list(getattr(st, cfg["prices"]))
+    if len(pts) < 20: return
+
+    window_pts = [p for t,p in pts if now-t <= 60]
+    if len(window_pts) < 10: return
+    sma = sum(window_pts) / len(window_pts)
+    if sma <= 0: return
+    variance = sum((p-sma)**2 for p in window_pts) / len(window_pts)
+    std = variance ** 0.5
+    upper = sma + 2*std
+    lower = sma - 2*std
+    bandwidth = (upper - lower) / sma * 100
+
+    SQUEEZE_MAX_BANDWIDTH = 0.12
+    if bandwidth > SQUEEZE_MAX_BANDWIDTH:
+        st.meanrev_regime_expansion_count += 1  # v12.9 — résumé agrégé /learn
+        return
+    st.meanrev_regime_squeeze_count += 1
+
+    if cur_price >= upper:
+        direction = "DOWN"; overext = (cur_price - upper) / sma * 100
+    elif cur_price <= lower:
+        direction = "UP"; overext = (lower - cur_price) / sma * 100
+    else:
+        return
+
+    def ret_over(secs):
+        cutoff = now - secs
+        old = [p for t,p in pts if t <= cutoff]
+        return (cur_price - old[-1]) / old[-1] * 100 if old and old[-1]>0 else 0.0
+    ret_10s = ret_over(10); ret_3s = ret_over(3)
+    if direction == "DOWN" and ret_3s > 0 and abs(ret_3s) > abs(ret_10s)*0.5:
+        log_skip(f"{asset} [MEANREV]: spike haussier encore en accélération (ret3s={ret_3s:+.3f}%) — trop tôt pour reversion", direction,
+                 features={"gap":0,"delta":bandwidth,"ret3s":ret_3s,"votes":0,"filter":"mr_fakeout","asset":asset,"source":"meanrev"})
+        return
+    if direction == "UP" and ret_3s < 0 and abs(ret_3s) > abs(ret_10s)*0.5:
+        log_skip(f"{asset} [MEANREV]: spike baissier encore en accélération (ret3s={ret_3s:+.3f}%) — trop tôt pour reversion", direction,
+                 features={"gap":0,"delta":bandwidth,"ret3s":ret_3s,"votes":0,"filter":"mr_fakeout","asset":asset,"source":"meanrev"})
+        return
+
+    market = await poly.get_market_by_slug(f"{cfg['slug']}-{cur_slot}")
+    if not market: return
+    token_used = market["token_up"] if direction=="UP" else market["token_down"]
+    token_price = await poly.get_token_price(token_used)
+    if not token_price or token_price <= 0: return
+
+    MEANREV_TOKEN_MIN = 0.51
+    MEANREV_TOKEN_MAX = 0.70
+    if token_price > MEANREV_TOKEN_MAX:
+        log_skip(f"{asset} [MEANREV]: token {token_price:.2f}$>{MEANREV_TOKEN_MAX}$ (spike déjà pricé)", direction,
+                 features={"gap":0,"delta":bandwidth,"ret3s":ret_3s,"votes":0,"filter":"mr_tokenmax","asset":asset,"source":"meanrev"}); return
+    if token_price < MEANREV_TOKEN_MIN:
+        log_skip(f"{asset} [MEANREV]: token {token_price:.2f}$<{MEANREV_TOKEN_MIN}$ (signal trop faible)", direction,
+                 features={"gap":0,"delta":bandwidth,"ret3s":ret_3s,"votes":0,"filter":"mr_tokenmin","asset":asset,"source":"meanrev"}); return
+
+    fee = taker_fee_per_share(token_price)
+    p_rev = min(0.85, 0.55 + overext * 5)
+    ev = p_rev - token_price - fee
+    if ev < ORACLE_EDGE_MIN:
+        log_skip(f"{asset} [MEANREV]: EV {ev*100:+.1f}%<{ORACLE_EDGE_MIN*100:.0f}%", direction,
+                 features={"gap":0,"delta":bandwidth,"ret3s":ret_3s,"votes":0,"filter":"mr_ev","asset":asset,"source":"meanrev"}); return
+
+    payout = round(1/token_price, 2)
+    amount = kelly_bet_secondary(st.bankroll, p_rev, payout)
+    if amount < MIN_BET_USD: return
+
+    log.info(f"🔄 MEAN-REV {asset} {direction} | bandwidth={bandwidth:.3f}% overext={overext:.3f}% tok={token_price:.2f}$ EV={ev*100:.1f}%")
+
+    tpu = market["token_up"]; tpd = market["token_down"]
+    market_end = market.get("end_date","")
+    sess = session_ctx()
+    conf_score = {"score":0,"signals":[]}
+    reasoning = (f"🔄MEAN-REV {asset} {direction} | bandwidth={bandwidth:+.3f}% overext={overext:+.3f}% "
+                 f"ret3s={ret_3s:+.3f}% | tok={token_price:.2f}$ EV={ev*100:+.1f}% T-{int(slot_remaining)}s")
+
+    ok = await place_bet(context, direction, amount, round(p_rev,2), reasoning, conf_score, sess, tpu, tpd, market_end, source="meanrev")
+    if not ok: return
+
+    setattr(st, cfg["mr_slot"], cur_slot)
+    setattr(st, cfg["mom_slot"], cur_slot)  # coordination anti-double-trade
+    mode = "💰 RÉEL" if not st.paper_mode else "📄 paper"
+    await send(context.bot,
+        f"🔄 *MEAN-REVERSION {asset}* [{mode}]\n━━━━━━━━━━━━━━\n"
+        f"*{direction}* | `{amount:.2f}$` | P:`{p_rev*100:.0f}%` | ⏰T-`{int(slot_remaining)}s`\n"
+        f"Bollinger BW:`{bandwidth:.3f}%` (squeeze) | Overext:`{overext:+.3f}%`\n"
+        f"Ret 10s:`{ret_10s:+.3f}%` | 3s:`{ret_3s:+.3f}%`\n"
+        f"Token:`{token_price:.2f}$` | EV:`{ev*100:+.1f}%`\n\n"
+        f"📝 _Mean-reversion {asset} — parie contre un spike en régime calme_")
+
+
+async def job_mean_reversion_eth(context):
+    await job_mean_reversion_asset(context, "ETH")
+
+async def job_mean_reversion_sol(context):
+    await job_mean_reversion_asset(context, "SOL")
+
+async def job_mean_reversion_xrp(context):
+    await job_mean_reversion_asset(context, "XRP")
 
 
 async def job_auto_calibrate(context):
@@ -3939,8 +4188,8 @@ PARAMÈTRES ACTUELS:
 - ETH: gap≥0.020% | T-45s→T-10s
 - SOL: gap≥0.020% | T-45s→T-10s
 - XRP: gap≥0.025% | T-45s→T-10s
-- BTC MOMENTUM: ret60s≥0.30% | T-150s→T-60s | tok 0.55$-0.65$ | filtre trend macro 10min (bloque si tendance 10min contraire ≥0.10%, source: étude live ayant réduit pertes -93%→-13% avec ce filtre) (2ème fenêtre indépendante)
-- BTC MEAN-REVERSION: Bollinger Bandwidth≤0.12% (régime squeeze) | parie contre un spike (prix hors bandes 2σ) | tok 0.51$-0.70$ | Kelly dédié 1-4% BR (3ème fenêtre, même T-150s→T-60s, régime complémentaire au momentum — squeeze vs expansion). Stratégie NOUVELLE, seuils à calibrer avec données réelles.
+- MOMENTUM (BTC/ETH/SOL/XRP): ret60s≥0.30% | T-150s→T-60s | tok 0.55$-0.65$ | filtre trend macro 10min (bloque si tendance 10min contraire ≥0.10%, source: étude live ayant réduit pertes -93%→-13% avec ce filtre) | Kelly dédié 1-3% BR (2ème fenêtre indépendante). Extension ETH/SOL/XRP NOUVELLE (17/06) — surveiller si ces assets, documentés plus bruités à court terme, performent moins bien que BTC.
+- MEAN-REVERSION (BTC/ETH/SOL/XRP): Bollinger Bandwidth≤0.12% (régime squeeze) | parie contre un spike (prix hors bandes 2σ) | tok 0.51$-0.70$ | Kelly dédié 1-3% BR (3ème fenêtre, même T-150s→T-60s, régime complémentaire au momentum — squeeze vs expansion). Stratégie NOUVELLE, seuils à calibrer avec données réelles. Extension ETH/SOL/XRP NOUVELLE (17/06).
 - Commun: delta≥0.020% | token BTC 0.51$-0.80$ (exceptions: ret3s≤+0.010% OU delta≥0.114%+gap≥0.060%) | ETH/XRP/SOL(votes≤-1) token max 0.95$ | EV≥15% | votes≥2 (consensus pour la direction parié, pas score brut)
 - BTC deltaneg: bloqué sauf si gap≥0.040% ET ret3s>-0.050% (exception validée 9W/3L)
 - ETH/SOL/XRP deltaneg: seuil strict -0.010% (0% WR historique si assoupli)
@@ -4084,6 +4333,11 @@ async def cmd_learn(update,context):
             w_mr=sum(1 for t in meanrev_trades if t.get("result")=="WIN")
             pnl_mr=sum(t.get("pnl",0) for t in meanrev_trades)
             lines.append(f"  🔄 Mean-Rev: {len(meanrev_trades)} trades WR:`{w_mr/len(meanrev_trades)*100:.0f}%` PnL:`{pnl_mr:+.2f}$`")
+        # ✅ v12.9 — Résumé agrégé régime squeeze/expansion (BTC+ETH+SOL+XRP cumulés, pas de spam /passes)
+        total_regime = st.meanrev_regime_squeeze_count + st.meanrev_regime_expansion_count
+        if total_regime > 0:
+            pct_squeeze = st.meanrev_regime_squeeze_count / total_regime * 100
+            lines.append(f"  📐 Régime (cumulé 4 assets): Squeeze `{pct_squeeze:.0f}%` ({st.meanrev_regime_squeeze_count}) | Expansion `{100-pct_squeeze:.0f}%` ({st.meanrev_regime_expansion_count})")
         if lag_trades:
             w_l=sum(1 for t in lag_trades if t.get("result")=="WIN")
             pnl_l=sum(t.get("pnl",0) for t in lag_trades)
@@ -4196,6 +4450,13 @@ async def cmd_run(update,context):
     context.job_queue.run_repeating(job_oracle_lag_xrp,interval=2,first=22)
     context.job_queue.run_repeating(job_momentum_btc,interval=2,first=24)  # ✅ v12.9 — 2ème fenêtre momentum
     context.job_queue.run_repeating(job_mean_reversion_btc,interval=2,first=26)  # ✅ v12.9 — 3ème fenêtre mean-reversion (ajout pur)
+    # ✅ v12.9 — Extension multi-asset momentum+meanrev (ETH/SOL/XRP), sizing 1-3% BR dédié (demande user 17/06)
+    context.job_queue.run_repeating(job_momentum_eth,interval=2,first=28)
+    context.job_queue.run_repeating(job_momentum_sol,interval=2,first=30)
+    context.job_queue.run_repeating(job_momentum_xrp,interval=2,first=32)
+    context.job_queue.run_repeating(job_mean_reversion_eth,interval=2,first=34)
+    context.job_queue.run_repeating(job_mean_reversion_sol,interval=2,first=36)
+    context.job_queue.run_repeating(job_mean_reversion_xrp,interval=2,first=38)
     context.job_queue.run_repeating(job_resolve_passes,interval=30,first=35)
     context.job_queue.run_repeating(job_auto_calibrate,interval=7200,first=300)  # ✅ v10.37 seuils auto
     context.job_queue.run_repeating(job_pattern_memory,interval=3600,first=600)  # ✅ v10.37 mémoire patterns
@@ -4218,8 +4479,8 @@ async def cmd_run(update,context):
         f"🚀 *Bot v{BOT_VERSION} démarré !*\nMode:*{'📄 PAPER' if st.paper_mode else '💰 RÉEL'}*\n"
         f"Session:`{sess['session']}` | Seuils: score≥`{min_score}` mom≥`{min_mom}`\n"
         f"/oracle BTC T-45→T-10s | ETH T-45→T-10s | SOL T-45→T-10s | XRP T-45→T-10s\n"
-        f"/momentum BTC T-150s→T-60s | move≥0.30%/60s | tok 0.55$-0.65$ | filtre trend10m\n"
-        f"/meanrev BTC T-150s→T-60s | squeeze BW≤0.12% | tok 0.51$-0.70$ | Kelly 1-4%\n"
+        f"/momentum BTC/ETH/SOL/XRP T-150s→T-60s | move≥0.30%/60s | tok 0.55$-0.65$ | filtre trend10m | Kelly 1-3%\n"
+        f"/meanrev BTC/ETH/SOL/XRP T-150s→T-60s | squeeze BW≤0.12% | tok 0.51$-0.70$ | Kelly 1-3%\n"
         f"  gap BTC/XRP≥2.5bps | ETH/SOL≥2.0bps | delta≥{int(ORACLE_ENTRY_DELTA*10000)}bps | Token≤{ORACLE_TOKEN_MAX}$(BTC)/0.95$(ETH/XRP/SOL) | EV≥{int(ORACLE_EDGE_MIN*100)}%\n"
         f"BR:`{st.bankroll:.2f}$` | ROI:`{roi()}`\n"
         f"📊 `{ob_txt}` | 💸 `{liq_txt}`\n"
@@ -4954,7 +5215,7 @@ async def cmd_momentum(update,context):
     trend_txt = f"`{trend_10m:+.3f}%` {'✅' if trend_ok else '❌ contraire'}" if trend_10m is not None else "`indisponible`"
 
     await update.message.reply_text(
-        f"🚀 *MOMENTUM BTC — T-150s→T-60s*\n━━━━━━━━━━━━━━\n"
+        f"🚀 *MOMENTUM BTC — T-150s→T-60s* _(vue détaillée BTC — trading actif aussi sur ETH/SOL/XRP)_\n━━━━━━━━━━━━━━\n"
         f"Fenêtre: `T-{int(slot_remaining)}s` {'✅ ACTIVE' if in_window else '❌ hors fenêtre'}\n\n"
         f"₿ BTC:`${st.ws_price:,.2f}`\n"
         f"  Ret 60s:`{ret_60s:+.3f}%` {'✅' if abs(ret_60s)>=0.30 else '❌'} (seuil ±0.30%)\n"
@@ -5018,13 +5279,13 @@ async def cmd_mean_reversion(update,context):
     last_mr = "jamais" if st.meanrev_last_slot == 0 else f"slot {st.meanrev_last_slot}"
 
     await update.message.reply_text(
-        f"🔄 *MEAN-REVERSION BTC — T-150s→T-60s*\n━━━━━━━━━━━━━━\n"
+        f"🔄 *MEAN-REVERSION BTC — T-150s→T-60s* _(vue détaillée BTC — trading actif aussi sur ETH/SOL/XRP)_\n━━━━━━━━━━━━━━\n"
         f"Fenêtre: `T-{int(slot_remaining)}s` {'✅ ACTIVE' if in_window else '❌ hors fenêtre'}\n\n"
         f"₿ BTC:`${st.ws_price:,.2f}`\n"
         f"  Bollinger Bandwidth:`{bandwidth:.3f}%` {'✅ squeeze' if is_squeeze else '❌ expansion'} (seuil ≤0.12%)\n"
         f"  Bandes: `{lower:,.2f}` → `{upper:,.2f}`\n"
         f"  Spike: {spike_dir} (overext `{overext:+.3f}%`)\n\n"
-        f"Token cible: 0.51$→0.70$ | EV min: {ORACLE_EDGE_MIN*100:.0f}% | Kelly: 1-4% BR\n\n"
+        f"Token cible: 0.51$→0.70$ | EV min: {ORACLE_EDGE_MIN*100:.0f}% | Kelly: 1-3% BR\n\n"
         f"{status}\n"
         f"Dernier trade mean-rev: `{last_mr}`",
         parse_mode="Markdown")
