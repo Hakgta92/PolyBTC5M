@@ -2403,28 +2403,29 @@ async def ws_oracle_loop():
                             if symbol == "btc/usd":
                                 st.oracle_price=p; st.oracle_ts=now
                                 if st.oracle_slot_ts!=slot_start:
-                                    # ✅ v12.9 SLOT RECORDER: capturer le close du slot précédent (dernier prix oracle avant bascule)
-                                    if st.oracle_slot_ts>0 and st.oracle_price>0:
-                                        st.slot_rec_close = getattr(st,'slot_rec_close',{}); st.slot_rec_close[("BTC",st.oracle_slot_ts)] = st.oracle_price
+                                    # ✅ v12.9 SLOT RECORDER (fix 18/06): enregistrer le slot précédent DIRECTEMENT à la bascule.
+                                    # open=ancien slot_open, close=dernier prix oracle avant bascule. Moment fiable et exact.
+                                    if st.oracle_slot_ts>0 and st.oracle_slot_open>0 and st.oracle_price>0:
+                                        _record_slot("BTC", st.oracle_slot_ts, st.oracle_slot_open, st.oracle_price, st.ws_prices)
                                     st.oracle_slot_ts=slot_start; st.oracle_slot_open=p
                                     log.info(f"📌 BTC slot open: ${p:,.2f}")
                             elif symbol == "eth/usd" and p>100:
                                 st.eth_oracle_price=p; st.eth_oracle_ts=now
                                 if st.eth_oracle_slot_ts!=slot_start:
-                                    if st.eth_oracle_slot_ts>0 and st.eth_oracle_price>0:
-                                        st.slot_rec_close = getattr(st,'slot_rec_close',{}); st.slot_rec_close[("ETH",st.eth_oracle_slot_ts)] = st.eth_oracle_price
+                                    if st.eth_oracle_slot_ts>0 and st.eth_oracle_slot_open>0 and st.eth_oracle_price>0:
+                                        _record_slot("ETH", st.eth_oracle_slot_ts, st.eth_oracle_slot_open, st.eth_oracle_price, st.eth_ws_prices)
                                     st.eth_oracle_slot_ts=slot_start; st.eth_oracle_slot_open=p
                             elif symbol == "sol/usd" and p>1:
                                 st.sol_oracle_price=p; st.sol_oracle_ts=now
                                 if st.sol_oracle_slot_ts!=slot_start:
-                                    if st.sol_oracle_slot_ts>0 and st.sol_oracle_price>0:
-                                        st.slot_rec_close = getattr(st,'slot_rec_close',{}); st.slot_rec_close[("SOL",st.sol_oracle_slot_ts)] = st.sol_oracle_price
+                                    if st.sol_oracle_slot_ts>0 and st.sol_oracle_slot_open>0 and st.sol_oracle_price>0:
+                                        _record_slot("SOL", st.sol_oracle_slot_ts, st.sol_oracle_slot_open, st.sol_oracle_price, st.sol_ws_prices)
                                     st.sol_oracle_slot_ts=slot_start; st.sol_oracle_slot_open=p
                             elif symbol == "xrp/usd" and p>0.01:
                                 st.xrp_oracle_price=p; st.xrp_oracle_ts=now
                                 if st.xrp_oracle_slot_ts!=slot_start:
-                                    if st.xrp_oracle_slot_ts>0 and st.xrp_oracle_price>0:
-                                        st.slot_rec_close = getattr(st,'slot_rec_close',{}); st.slot_rec_close[("XRP",st.xrp_oracle_slot_ts)] = st.xrp_oracle_price
+                                    if st.xrp_oracle_slot_ts>0 and st.xrp_oracle_slot_open>0 and st.xrp_oracle_price>0:
+                                        _record_slot("XRP", st.xrp_oracle_slot_ts, st.xrp_oracle_slot_open, st.xrp_oracle_price, st.xrp_ws_prices)
                                     st.xrp_oracle_slot_ts=slot_start; st.xrp_oracle_slot_open=p
                         elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                             break
@@ -4765,8 +4766,8 @@ async def cmd_run(update,context):
     context.job_queue.run_repeating(job_confluence_sol,interval=2,first=44)
     context.job_queue.run_repeating(job_confluence_xrp,interval=2,first=46)
     context.job_queue.run_repeating(job_resolve_passes,interval=30,first=35)
-    # ✅ v12.9 — SLOT RECORDER: journal de tous les slots résolus (indépendant du trading)
-    context.job_queue.run_repeating(job_slot_recorder,interval=30,first=50)
+    # ✅ v12.9 — SLOT RECORDER: l'enregistrement se fait DIRECTEMENT à la bascule de slot dans ws_oracle_loop
+    # (le job séparé était inopérant car oracle_slot_ts bascule instantanément). Plus besoin de job ici.
     context.job_queue.run_repeating(job_auto_calibrate,interval=7200,first=300)  # ✅ v10.37 seuils auto
     context.job_queue.run_repeating(job_pattern_memory,interval=3600,first=600)  # ✅ v10.37 mémoire patterns
     context.job_queue.run_repeating(job_haiku_analysis,interval=7200,first=900)  # ✅ v10.37 Haiku insights
@@ -5746,14 +5747,52 @@ async def cmd_confluence(update,context):
 
 async def cmd_slots(update,context):
     """✅ v12.9 — SLOT RECORDER (/slots): statistiques de TOUS les slots 5min résolus, indépendamment du trading.
-    Répond à 'quelles conditions donnent UP vs DOWN?'. Source: oracle Chainlink (règle officielle Polymarket)."""
+    Répond à 'quelles conditions donnent UP vs DOWN?'. Source: oracle Chainlink (règle officielle Polymarket).
+    En tête: PRÉDICTION du slot EN COURS sur les 4 cryptos (agrégation des signaux disponibles)."""
     if not auth(update): return
+
+    # ── PRÉDICTION SLOT EN COURS (temps réel) ──
+    now=time.time(); slot_rem=300-(now%300)
+    pred_lines=["🔮 *PRÉDICTION SLOT EN COURS* (T-`%ds`)" % int(slot_rem)]
+    for a,e,pdq_attr,o_attr,so_attr,px_attr in [
+        ("BTC","₿","ws_prices","oracle_price","oracle_slot_open","ws_price"),
+        ("ETH","Ξ","eth_ws_prices","eth_oracle_price","eth_oracle_slot_open","eth_price"),
+        ("SOL","◎","sol_ws_prices","sol_oracle_price","sol_oracle_slot_open","sol_price"),
+        ("XRP","✕","xrp_ws_prices","xrp_oracle_price","xrp_oracle_slot_open","xrp_price")]:
+        oracle=getattr(st,o_attr,0); slot_open=getattr(st,so_attr,0); spot=getattr(st,px_attr,0)
+        pdq=list(getattr(st,pdq_attr,[]))
+        if oracle<=0 or slot_open<=0:
+            pred_lines.append(f"{e} {a}: `données indispo`"); continue
+        # Signaux: delta oracle (sens du slot jusqu'ici), gap spot/oracle, dual TA
+        delta=(oracle-slot_open)/slot_open*100
+        gap=(spot-oracle)/oracle*100 if spot>0 else 0
+        votes_up=0; votes_dn=0; sig_txt=[]
+        # 1) delta du slot (où en est le prix vs ouverture)
+        if delta>0.005: votes_up+=1; sig_txt.append(f"Δ+{delta:.3f}%")
+        elif delta<-0.005: votes_dn+=1; sig_txt.append(f"Δ{delta:.3f}%")
+        # 2) dual model TA
+        dd=None
+        if len(pdq)>=35:
+            _s,_d,det=compute_ta_score([{"price":p,"ts":t} for t,p in pdq],a)
+            dd=det.get("dual_dir"); mh=det.get("macd_hist",0)
+            if dd=="UP": votes_up+=1; sig_txt.append("dual↑")
+            elif dd=="DOWN": votes_dn+=1; sig_txt.append("dual↓")
+            if mh>0: votes_up+=1; sig_txt.append("MACD+")
+            elif mh<0: votes_dn+=1; sig_txt.append("MACD-")
+        # Verdict
+        if votes_up>votes_dn: verdict=f"🟢 UP ({votes_up}/{votes_up+votes_dn})"
+        elif votes_dn>votes_up: verdict=f"🔴 DOWN ({votes_dn}/{votes_up+votes_dn})"
+        else: verdict="⚪ indécis"
+        pred_lines.append(f"{e} {a}: {verdict} | _{', '.join(sig_txt) or 'aucun signal'}_")
+    pred_lines.append("_⚠️ Indication seulement — ce n'est PAS une garantie, le 5min reste très bruité._")
+
     recs = list(st.slot_records)
     if not recs:
         await update.message.reply_text(
-            "📊 *SLOT RECORDER*\n━━━━━━━━━━━━━━\n"
-            "Aucun slot enregistré pour l'instant.\n"
-            "_Le journal se remplit ~toutes les 5min par asset. Reviens dans quelques minutes._",
+            "\n".join(pred_lines) +
+            "\n\n📊 *SLOT RECORDER*\n━━━━━━━━━━━━━━\n"
+            "Aucun slot résolu enregistré pour l'instant.\n"
+            "_Le journal s'enregistre à chaque bascule de slot (~toutes les 5min par asset). Reviens dans 10-15 min._",
             parse_mode="Markdown"); return
 
     def wr_up(sample):
@@ -5762,7 +5801,7 @@ async def cmd_slots(update,context):
         ups=sum(1 for r in sample if r["result"]=="UP")
         return ups/n*100, n
 
-    lines=["📊 *SLOT RECORDER — tous slots résolus*\n━━━━━━━━━━━━━━"]
+    lines=pred_lines+["\n📊 *SLOT RECORDER — tous slots résolus*\n━━━━━━━━━━━━━━"]
     pct,n = wr_up(recs)
     lines.append(f"Total: `{n}` slots | UP `{pct:.0f}%` / DOWN `{100-pct:.0f}%`")
     if abs(pct-50) < 3:
