@@ -1622,6 +1622,11 @@ class State:
         self.meanrev_regime_squeeze_count=0; self.meanrev_regime_expansion_count=0  # v12.9 — résumé agrégé pour /learn
         # v12.9 — 4ème stratégie CONFLUENCE (/conf): oracle bias × régime/setup × bruit
         self.tds_last_slot=0; self.tds_last_slot_eth=0; self.tds_last_slot_sol=0; self.tds_last_slot_xrp=0
+        # ✅ v12.9 — SLOT RECORDER (/slots): journal de TOUS les slots résolus avec conditions + résultat réel UP/DOWN.
+        # Indépendant du trading. Résolution = oracle Chainlink (close vs open), règle officielle Polymarket vérifiée.
+        self.slot_records=[]    # dicts: {asset,slot,open,close,result,gap,delta,rsi,macd,dual,regime,session,ts}
+        self.slot_rec_last={}   # {asset: dernier slot_start enregistré} anti-doublon
+        self.slot_rec_close={}  # {(asset,slot_start): close oracle exact capturé à la bascule}
         self.xrp_ob_imbalance=0.0; self.xrp_ob_ts=0.0; self.xrp_ob_asset_id=""; self.xrp_clob_ws_task=None
         self.oracle_lag_signal=None  # {"bias","desc","div_pct"}
         # ✅ v10.23 — Calibration sigma
@@ -2301,6 +2306,73 @@ def _resolve_pending_passes():
         log.debug(f"resolve_passes: {e}")
 
 
+def _record_slot(asset, slot_start, open_px, close_px, prices_deque):
+    """✅ v12.9 — Enregistre UN slot résolu avec ses conditions + résultat réel.
+    Résultat selon la règle officielle Polymarket: UP si close ≥ open (source Chainlink), sinon DOWN.
+    Capture les features au moment de l'enregistrement (proxy de fin de slot) pour analyse a posteriori."""
+    try:
+        result = "UP" if close_px >= open_px else "DOWN"
+        delta_pct = (close_px - open_px) / open_px * 100 if open_px > 0 else 0.0
+        # Features TA sur la fenêtre de prix disponible
+        rsi = macd_hist = 0.0; dual = None; regime = "?"
+        pts = list(prices_deque) if prices_deque else []
+        if len(pts) >= 35:
+            ph = [{"price": p, "ts": t} for t, p in pts]
+            _s, _d, det = compute_ta_score(ph, asset)
+            rsi = det.get("rsi", 0); macd_hist = det.get("macd_hist", 0); dual = det.get("dual_dir")
+            # régime via bandwidth Bollinger sur 60s
+            now = time.time()
+            wp = [p for t, p in pts if now - t <= 60]
+            if len(wp) >= 10:
+                sma = sum(wp) / len(wp)
+                if sma > 0:
+                    std = (sum((p - sma) ** 2 for p in wp) / len(wp)) ** 0.5
+                    bw = (4 * std) / sma * 100
+                    regime = "squeeze" if bw <= 0.12 else "expansion"
+        sess = session_ctx().get("session", "?")
+        st.slot_records.append({
+            "asset": asset, "slot": slot_start, "open": open_px, "close": close_px,
+            "result": result, "delta": round(delta_pct, 4), "rsi": round(rsi, 1),
+            "macd": round(macd_hist, 5), "dual": dual, "regime": regime,
+            "session": sess, "ts": int(time.time())})
+        if len(st.slot_records) > 5000:
+            st.slot_records = st.slot_records[-5000:]
+    except Exception as e:
+        log.debug(f"record_slot {asset}: {e}")
+
+
+async def job_slot_recorder(context):
+    """✅ v12.9 — SLOT RECORDER: enregistre TOUS les slots 5min résolus (BTC/ETH/SOL/XRP),
+    indépendamment du trading. Tourne toutes les 30s. Pour chaque asset, dès qu'un slot est
+    terminé (le slot courant a changé), on enregistre le slot précédent avec son open/close oracle.
+    Source de résolution = oracle Chainlink (règle officielle Polymarket: UP si close ≥ open)."""
+    if not st.running or st.killed: return
+    now = time.time()
+    cur_slot = int(now // 300) * 300
+    # Pour chaque asset: (slot_open_attr, oracle_price_attr, slot_ts_attr, prices_deque)
+    assets = [
+        ("BTC", "oracle_slot_open", "oracle_price", "oracle_slot_ts", st.ws_prices),
+        ("ETH", "eth_oracle_slot_open", "eth_oracle_price", "eth_oracle_slot_ts", st.eth_ws_prices),
+        ("SOL", "sol_oracle_slot_open", "sol_oracle_price", "sol_oracle_slot_ts", st.sol_ws_prices),
+        ("XRP", "xrp_oracle_slot_open", "xrp_oracle_price", "xrp_oracle_slot_ts", st.xrp_ws_prices),
+    ]
+    for asset, open_attr, price_attr, ts_attr, pdq in assets:
+        slot_open = getattr(st, open_attr, 0)
+        slot_ts = getattr(st, ts_attr, 0)
+        # Close exact capturé à la bascule du slot (préféré), sinon fallback sur dernier prix oracle
+        exact_close = st.slot_rec_close.get((asset, slot_ts), 0)
+        close_px = exact_close if exact_close > 0 else getattr(st, price_attr, 0)
+        # Le slot représenté par slot_ts est terminé si on a basculé dans un nouveau slot
+        if slot_open > 0 and slot_ts > 0 and slot_ts < cur_slot:
+            if st.slot_rec_last.get(asset) != slot_ts and close_px > 0:
+                _record_slot(asset, slot_ts, slot_open, close_px, pdq)
+                st.slot_rec_last[asset] = slot_ts
+                # Nettoyage du dict close (garder seulement les récents)
+                if len(st.slot_rec_close) > 200:
+                    cutoff = cur_slot - 3600
+                    st.slot_rec_close = {k:v for k,v in st.slot_rec_close.items() if k[1] > cutoff}
+
+
 
 async def ws_oracle_loop():
     """v12.4 — Oracle unifié BTC+ETH+SOL en UNE seule connexion (évite le rate limiting)."""
@@ -2331,19 +2403,28 @@ async def ws_oracle_loop():
                             if symbol == "btc/usd":
                                 st.oracle_price=p; st.oracle_ts=now
                                 if st.oracle_slot_ts!=slot_start:
+                                    # ✅ v12.9 SLOT RECORDER: capturer le close du slot précédent (dernier prix oracle avant bascule)
+                                    if st.oracle_slot_ts>0 and st.oracle_price>0:
+                                        st.slot_rec_close = getattr(st,'slot_rec_close',{}); st.slot_rec_close[("BTC",st.oracle_slot_ts)] = st.oracle_price
                                     st.oracle_slot_ts=slot_start; st.oracle_slot_open=p
                                     log.info(f"📌 BTC slot open: ${p:,.2f}")
                             elif symbol == "eth/usd" and p>100:
                                 st.eth_oracle_price=p; st.eth_oracle_ts=now
                                 if st.eth_oracle_slot_ts!=slot_start:
+                                    if st.eth_oracle_slot_ts>0 and st.eth_oracle_price>0:
+                                        st.slot_rec_close = getattr(st,'slot_rec_close',{}); st.slot_rec_close[("ETH",st.eth_oracle_slot_ts)] = st.eth_oracle_price
                                     st.eth_oracle_slot_ts=slot_start; st.eth_oracle_slot_open=p
                             elif symbol == "sol/usd" and p>1:
                                 st.sol_oracle_price=p; st.sol_oracle_ts=now
                                 if st.sol_oracle_slot_ts!=slot_start:
+                                    if st.sol_oracle_slot_ts>0 and st.sol_oracle_price>0:
+                                        st.slot_rec_close = getattr(st,'slot_rec_close',{}); st.slot_rec_close[("SOL",st.sol_oracle_slot_ts)] = st.sol_oracle_price
                                     st.sol_oracle_slot_ts=slot_start; st.sol_oracle_slot_open=p
                             elif symbol == "xrp/usd" and p>0.01:
                                 st.xrp_oracle_price=p; st.xrp_oracle_ts=now
                                 if st.xrp_oracle_slot_ts!=slot_start:
+                                    if st.xrp_oracle_slot_ts>0 and st.xrp_oracle_price>0:
+                                        st.slot_rec_close = getattr(st,'slot_rec_close',{}); st.slot_rec_close[("XRP",st.xrp_oracle_slot_ts)] = st.xrp_oracle_price
                                     st.xrp_oracle_slot_ts=slot_start; st.xrp_oracle_slot_open=p
                         elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                             break
@@ -4240,6 +4321,27 @@ async def job_haiku_analysis(context):
         else: by_filter[f]["l"]+=1
     filter_stats = " | ".join(f"{f}:{v['w']}W/{v['l']}L" for f,v in sorted(by_filter.items(), key=lambda x:x[1]["w"]+x[1]["l"],reverse=True)[:5])
 
+    # ✅ v12.9 — Résumé SLOT RECORDER pour Sonnet (stats UP/DOWN réelles par condition, indépendant du trading)
+    slot_rec_note = ""
+    try:
+        recs = list(st.slot_records)
+        if len(recs) >= 20:
+            def _upr(s):
+                return (sum(1 for r in s if r["result"]=="UP")/len(s)*100, len(s)) if s else (0,0)
+            g_pct,g_n = _upr(recs)
+            parts = [f"GLOBAL UP {g_pct:.0f}% (n={g_n})"]
+            for reg in ("squeeze","expansion"):
+                rp=[r for r in recs if r.get("regime")==reg]
+                if len(rp)>=10: p,nn=_upr(rp); parts.append(f"{reg} UP {p:.0f}% (n={nn})")
+            du=[r for r in recs if r.get("dual")=="UP"]; dd=[r for r in recs if r.get("dual")=="DOWN"]
+            if len(du)>=10: p,nn=_upr(du); parts.append(f"dual=UP→UP réel {p:.0f}% (n={nn})")
+            if len(dd)>=10: p,nn=_upr(dd); parts.append(f"dual=DOWN→UP réel {p:.0f}% (n={nn})")
+            slot_rec_note = ("\n📊 SLOT RECORDER (tous slots résolus, oracle Chainlink, INDÉPENDANT du trading — "
+                             "vérité terrain pour la valeur prédictive): " + " | ".join(parts) +
+                             ". Un indicateur n'a de valeur prédictive que s'il s'écarte nettement de 50% sur n≥100. "
+                             "Si dual=UP donne réellement >55% UP et dual=DOWN donne >55% DOWN, le dual model a une vraie valeur → recommander activation.")
+    except Exception: pass
+
     # ✅ v12.9 Point1: snapshot filtres pour comparaison avec l'analyse suivante (boucle de feedback)
     filter_snapshot = {f: {"w":v["w"], "l":v["l"]} for f,v in by_filter.items()}
     evolution_note = ""
@@ -4358,11 +4460,12 @@ DONNÉES ({len(sample)} skips résolus — {asset_note}):
 
 {previous_insights}
 {evolution_note}
+{slot_rec_note}
 
 CONTEXTE IMPORTANT:
 - Bankroll: {bankroll:.2f}$ | Mise Kelly estimée: ~{avg_bet:.2f}$ par trade
 - Gain moyen estimé par WIN: ~{avg_win:.2f}$ | Perte moyenne par LOSS: ~{avg_loss:.2f}$
-- Le bot n'a eu AUCUN trade réel depuis l'ajout ETH/SOL (marché en forte tendance)
+- Le bot a eu très peu/pas de trades réels récemment. CAUSE IMPORTANTE: un bug get_market_by_slug (endpoints /events?slug au lieu de /events/slug/) empêchait ETH/SOL/XRP (et parfois BTC) de trouver leur marché → trades tués en silence, corrigé le 18/06. Donc une partie du "0 trade" était TECHNIQUE, pas un excès de filtrage. Ne conclus PAS hâtivement que les filtres sont trop stricts: vérifie d'abord via le SLOT RECORDER si les conditions avaient une vraie valeur prédictive.
 - Objectif prioritaire: identifier des configurations qui AURAIENT dû trader et gagner
 - Token max actuel: {ORACLE_TOKEN_MAX}$ | EV min: {int(ORACLE_EDGE_MIN*100)}% | votes min: 2/5
 - {session_note}
@@ -4662,6 +4765,8 @@ async def cmd_run(update,context):
     context.job_queue.run_repeating(job_confluence_sol,interval=2,first=44)
     context.job_queue.run_repeating(job_confluence_xrp,interval=2,first=46)
     context.job_queue.run_repeating(job_resolve_passes,interval=30,first=35)
+    # ✅ v12.9 — SLOT RECORDER: journal de tous les slots résolus (indépendant du trading)
+    context.job_queue.run_repeating(job_slot_recorder,interval=30,first=50)
     context.job_queue.run_repeating(job_auto_calibrate,interval=7200,first=300)  # ✅ v10.37 seuils auto
     context.job_queue.run_repeating(job_pattern_memory,interval=3600,first=600)  # ✅ v10.37 mémoire patterns
     context.job_queue.run_repeating(job_haiku_analysis,interval=7200,first=900)  # ✅ v10.37 Haiku insights
@@ -4687,6 +4792,7 @@ async def cmd_run(update,context):
         f"/meanrev BTC/ETH/SOL/XRP T-150s→T-60s | squeeze BW≤0.12% | tok 0.51$-0.70$ | Kelly 1-3%\n"
         f"/conf BTC/ETH/SOL/XRP T-150s→T-60s | TDS=oracle×setup×(1-bruit)≥0.35 | tok 0.52$-0.72$ | Kelly 1-3% dynamique\n"
         f"🌑 SHADOW DOWN (log-only): mesure les DOWN ratés en marché baissier (gap+/delta- persistant). 0 trade réel — voir /passes et /learn\n"
+        f"📊 /slots: journal de TOUS les slots résolus (UP/DOWN réel + conditions) — indépendant du trading, pour analyse prédictive\n"
         f"  gap BTC/XRP≥2.5bps | ETH/SOL≥2.0bps | delta≥{int(ORACLE_ENTRY_DELTA*10000)}bps | Token≤{ORACLE_TOKEN_MAX}$(BTC)/0.95$(ETH/XRP/SOL) | EV≥{int(ORACLE_EDGE_MIN*100)}%\n"
         f"BR:`{st.bankroll:.2f}$` | ROI:`{roi()}`\n"
         f"📊 `{ob_txt}` | 💸 `{liq_txt}`\n"
@@ -5638,6 +5744,75 @@ async def cmd_confluence(update,context):
     await update.message.reply_text("\n".join(lines_out), parse_mode="Markdown")
 
 
+async def cmd_slots(update,context):
+    """✅ v12.9 — SLOT RECORDER (/slots): statistiques de TOUS les slots 5min résolus, indépendamment du trading.
+    Répond à 'quelles conditions donnent UP vs DOWN?'. Source: oracle Chainlink (règle officielle Polymarket)."""
+    if not auth(update): return
+    recs = list(st.slot_records)
+    if not recs:
+        await update.message.reply_text(
+            "📊 *SLOT RECORDER*\n━━━━━━━━━━━━━━\n"
+            "Aucun slot enregistré pour l'instant.\n"
+            "_Le journal se remplit ~toutes les 5min par asset. Reviens dans quelques minutes._",
+            parse_mode="Markdown"); return
+
+    def wr_up(sample):
+        n=len(sample)
+        if n==0: return 0,0
+        ups=sum(1 for r in sample if r["result"]=="UP")
+        return ups/n*100, n
+
+    lines=["📊 *SLOT RECORDER — tous slots résolus*\n━━━━━━━━━━━━━━"]
+    pct,n = wr_up(recs)
+    lines.append(f"Total: `{n}` slots | UP `{pct:.0f}%` / DOWN `{100-pct:.0f}%`")
+    if abs(pct-50) < 3:
+        lines.append("_→ ~équilibré: pas de biais directionnel structurel (normal)_")
+    else:
+        lines.append(f"_→ biais {'haussier' if pct>50 else 'baissier'} sur la période échantillonnée_")
+
+    # Par asset
+    lines.append("\n*Par asset:*")
+    for a,e in [("BTC","₿"),("ETH","Ξ"),("SOL","◎"),("XRP","✕")]:
+        ap=[r for r in recs if r["asset"]==a]
+        if ap:
+            p,nn=wr_up(ap); lines.append(f"{e} {a}: `{nn}` slots | UP `{p:.0f}%`")
+
+    # Par régime — la vraie question: est-ce qu'un régime prédit la direction?
+    lines.append("\n*Par régime:*")
+    for reg in ("squeeze","expansion"):
+        rp=[r for r in recs if r.get("regime")==reg]
+        if rp:
+            p,nn=wr_up(rp); lines.append(f"  {reg}: `{nn}` | UP `{p:.0f}%`")
+
+    # Valeur prédictive: quand RSI<35 (survendu) → plus de UP? quand MACD>0 → plus de UP?
+    lines.append("\n*Valeur prédictive (UP%):*")
+    rsi_lo=[r for r in recs if r.get("rsi",50)<35]
+    rsi_hi=[r for r in recs if r.get("rsi",50)>65]
+    if rsi_lo: p,nn=wr_up(rsi_lo); lines.append(f"  RSI<35 (survendu): `{nn}` | UP `{p:.0f}%`")
+    if rsi_hi: p,nn=wr_up(rsi_hi); lines.append(f"  RSI>65 (suracheté): `{nn}` | UP `{p:.0f}%`")
+    macd_pos=[r for r in recs if r.get("macd",0)>0]
+    macd_neg=[r for r in recs if r.get("macd",0)<0]
+    if macd_pos: p,nn=wr_up(macd_pos); lines.append(f"  MACD>0: `{nn}` | UP `{p:.0f}%`")
+    if macd_neg: p,nn=wr_up(macd_neg); lines.append(f"  MACD<0: `{nn}` | UP `{p:.0f}%`")
+    # Dual model: quand dual=UP, le slot finit-il vraiment UP?
+    dual_up=[r for r in recs if r.get("dual")=="UP"]
+    dual_dn=[r for r in recs if r.get("dual")=="DOWN"]
+    if dual_up: p,nn=wr_up(dual_up); lines.append(f"  🔀 dual=UP: `{nn}` | UP réel `{p:.0f}%`")
+    if dual_dn: p,nn=wr_up(dual_dn); lines.append(f"  🔀 dual=DOWN: `{nn}` | UP réel `{p:.0f}%` (donc DOWN `{100-p:.0f}%`)")
+
+    # Avertissement échantillon/biais
+    sessions = {}
+    for r in recs:
+        s=r.get("session","?"); sessions[s]=sessions.get(s,0)+1
+    if sessions:
+        dom = max(sessions.items(), key=lambda x:x[1])
+        if dom[1]/len(recs) >= 0.6:
+            lines.append(f"\n⚠️ _{dom[1]/len(recs)*100:.0f}% des slots en session {dom[0]} — biais possible, à confirmer sur d'autres sessions_")
+    lines.append(f"\n_Un indicateur n'a de valeur que s'il s'écarte nettement de 50% sur un gros échantillon (n≥100)._")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
 async def cmd_sessionstats(update,context):
     """v12.9 — WR théorique des skips segmenté par session (Asia/EU/US).
     Évite les conclusions biaisées par une seule session (ex: nuit calme)."""
@@ -5834,7 +6009,7 @@ def main():
         ("balance",cmd_balance),("paper",cmd_paper),("cooldown",cmd_cooldown),("reset",cmd_reset),("resetskips",cmd_resetskips),
         ("setbalance",cmd_setbalance),("backup",cmd_backup),("recap",cmd_recap),("dashboard",cmd_dashboard),
         ("history",cmd_history),("turbo",cmd_turbo),("sell",cmd_sell),("sellcheck",cmd_sellcheck),("fair",cmd_fair),
-        ("backtest",cmd_backtest),("oracle",cmd_oracle),("momentum",cmd_momentum),("meanrev",cmd_mean_reversion),("regime",cmd_regime),("conf",cmd_confluence),("sessionstats",cmd_sessionstats),("calib",cmd_calib),("learn",cmd_learn),("revive",cmd_revive),("autotune",cmd_autotune)]:
+        ("backtest",cmd_backtest),("oracle",cmd_oracle),("momentum",cmd_momentum),("meanrev",cmd_mean_reversion),("regime",cmd_regime),("conf",cmd_confluence),("slots",cmd_slots),("sessionstats",cmd_sessionstats),("calib",cmd_calib),("learn",cmd_learn),("revive",cmd_revive),("autotune",cmd_autotune)]:
         app.add_handler(CommandHandler(name,handler))
     app.add_handler(CallbackQueryHandler(cb))
     log.info(f"🧠 PolyBot v{BOT_VERSION} démarré")
