@@ -153,6 +153,14 @@ TDS_MIN_SCORE        = 0.35   # TDS minimum pour trader (produit de 3 facteurs <
 TDS_ADAPT_MIN_SAMPLE = 20     # nb trades minimum par branche avant ajustement adaptatif (anti-overfitting, vs 5 proposé)
 TDS_TOKEN_MIN        = 0.52
 TDS_TOKEN_MAX        = 0.72
+
+# ✅ v12.9 — SHADOW DOWN (mode log-only, demande user 18/06): mesure si les DOWN qu'on rate
+# en marché baissier (gap+ / delta- persistant, SANS chute brutale ret3s) auraient gagné.
+# AUCUN trade réel — juste un log_skip taggé shadow_down, résolu par le système existant.
+# Hypothèse à valider AVANT toute implémentation réelle: ces DOWN sont-ils un edge ou un piège?
+SHADOW_DOWN_ENABLED      = True   # passer à False pour désactiver le shadow logging
+SHADOW_DOWN_GAP_MIN      = 0.005  # gap positif minimum (spot encore au-dessus oracle figé)
+SHADOW_DOWN_DELTA_MIN    = 0.010  # |delta négatif| minimum (oracle descend de façon nette)
 ORACLE_WINDOW_START = 45    # v12.9 — élargi T-25→T-45 (demande user 17/06)    # Fenêtre normale: T-45s→T-10s
 ORACLE_WINDOW_END   = 10    # v12.9 — élargi T-5→T-10     # T-10s = nouveau dernier moment sûr
 # ✅ v10.32 — Mode T-10s (source: github.com/Archetapp — T-10s "direction quasi lockée")
@@ -1729,6 +1737,17 @@ def log_skip(reason, direction=None, features=None):
         if len(st.oracle_patterns) > 2000:
             st.oracle_patterns = st.oracle_patterns[-2000:]
 
+def log_shadow_down(asset, gap, delta, ret3s):
+    """✅ v12.9 — SHADOW DOWN (log-only). Enregistre un signal DOWN 'fantôme' dans le cas
+    gap+ / delta- persistant (marché baissier où l'oracle figé est encore au-dessus du spot tombant),
+    SANS chute brutale (sinon c'est déjà couvert par ret3s_override qui trade DOWN réellement).
+    Ne place AUCUN trade. Taggé filter='shadow_down' → isolé dans /passes, /learn, Sonnet.
+    Le système de résolution existant (_resolve_pending_passes) calculera WIN/LOSS automatiquement,
+    ce qui répondra à la question: ces DOWN ratés sont-ils un edge réel ou un piège (mean-reversion)?"""
+    if not SHADOW_DOWN_ENABLED: return
+    log_skip(f"{asset}: [SHADOW] DOWN fantôme gap{gap:+.3f}%/delta{delta:+.3f}% (log-only, pas de trade)", "DOWN",
+             features={"gap":gap,"delta":delta,"ret3s":ret3s,"votes":0,"filter":"shadow_down","asset":asset})
+
 def live_window_delta():
     """✅ v10.22 — Delta du slot en TEMPS RÉEL (WS prioritaire, fallback dernier tick)"""
     cur_slot = int(time.time() // 300) * 300
@@ -2182,31 +2201,64 @@ def compute_ema(prices, period):
     for p in prices[1:]: ema=p*k+ema*(1-k)
     return ema
 
+def compute_macd(prices, fast=12, slow=26, signal=9):
+    """✅ v12.9 — MACD (indicateur top-cité par les papiers ML pour la direction crypto, avec le RSI).
+    Retourne (macd_line, signal_line, histogram). histogram>0 = momentum haussier, <0 = baissier.
+    Le croisement macd/signal (histogram change de signe) est le signal directionnel classique."""
+    if len(prices) < slow + signal:
+        return 0.0, 0.0, 0.0
+    ema_fast = compute_ema(prices, fast)
+    ema_slow = compute_ema(prices, slow)
+    macd_line = ema_fast - ema_slow
+    # signal line = EMA du MACD: on approxime sur la série des MACD récents
+    macd_series = []
+    for i in range(slow, len(prices)+1):
+        sub = prices[:i]
+        macd_series.append(compute_ema(sub, fast) - compute_ema(sub, slow))
+    signal_line = compute_ema(macd_series, signal) if len(macd_series) >= signal else macd_line
+    return macd_line, signal_line, macd_line - signal_line
+
 def compute_ta_score(price_history, asset="BTC"):
     if len(price_history)<8: return 0,None,{}
     prices=[x["price"] for x in sorted(price_history,key=lambda x:x["ts"])]
     now=price_history[-1]["ts"] if price_history else 0
     score=0; details={}
+    # ✅ v12.9 — Dual score asymétrique (mode mesure): up_score et down_score séparés.
+    # Idée du modèle dual (papier CNN-LSTM): prédire UP et DOWN ne sont PAS symétriques.
+    # On accumule séparément les arguments haussiers et baissiers, sans forcer down=-up.
+    up_score=0.0; down_score=0.0
     rsi=compute_rsi(prices,7); details["rsi"]=round(rsi,1)
-    if rsi<35: score+=2
-    elif rsi<45: score+=1
-    elif rsi>65: score-=2
-    elif rsi>55: score-=1
+    if rsi<35: score+=2; up_score+=2.0
+    elif rsi<45: score+=1; up_score+=1.0
+    elif rsi>65: score-=2; down_score+=2.0
+    elif rsi>55: score-=1; down_score+=1.0
     if len(prices)>=21:
         ema9=compute_ema(prices[-21:],9); ema21=compute_ema(prices[-21:],21)
         gap_pct=(ema9-ema21)/ema21*100 if ema21 else 0
-        if gap_pct>0.02: score+=1
-        elif gap_pct<-0.02: score-=1
+        details["ema_gap"]=round(gap_pct,4)
+        if gap_pct>0.02: score+=1; up_score+=1.0
+        elif gap_pct<-0.02: score-=1; down_score+=1.0
+    # ✅ v12.9 — MACD (top-feature ML avec RSI): histogram>0 haussier, <0 baissier
+    macd_line, macd_signal, macd_hist = compute_macd(prices)
+    details["macd_hist"]=round(macd_hist,4)
+    if macd_hist > 0: score+=1; up_score+=1.0
+    elif macd_hist < 0: score-=1; down_score+=1.0
     pts_3m=[x for x in price_history if now-x["ts"]<=180]
     if len(pts_3m)>=2:
         roc=(pts_3m[-1]["price"]-pts_3m[0]["price"])/pts_3m[0]["price"]*100 if pts_3m[0]["price"] else 0
         details["mom3m"]=round(roc,4)
-        if roc>0.03: score+=1
-        elif roc<-0.03: score-=1
+        if roc>0.03: score+=1; up_score+=1.0
+        elif roc<-0.03: score-=1; down_score+=1.0
     if len(prices)>=10:
         recent=prices[-10:]; avg=sum(recent)/len(recent)
         std=(sum((p-avg)**2 for p in recent)/len(recent))**0.5
-        if avg>0 and std/avg*100>0.1: score=int(score*0.7)
+        if avg>0 and std/avg*100>0.1:
+            score=int(score*0.7); up_score*=0.7; down_score*=0.7  # chop → réduire conviction
+    details["up_score"]=round(up_score,2); details["down_score"]=round(down_score,2)
+    # Direction dual (mesure): qui domine nettement? (marge ≥1.0 pour éviter le bruit)
+    if up_score - down_score >= 1.0: details["dual_dir"]="UP"
+    elif down_score - up_score >= 1.0: details["dual_dir"]="DOWN"
+    else: details["dual_dir"]=None
     direction="UP" if score>0 else ("DOWN" if score<0 else None)
     return score,direction,details
 
@@ -3013,6 +3065,10 @@ async def job_oracle_lag(context):
         if (spot_oracle_gap >= 0.040 and abs(oracle_delta) >= 0.010 and ret_3s > -0.050):
             log.debug(f"BTC deltaneg override: gap={spot_oracle_gap:+.3f}% delta={oracle_delta:+.3f}% ret3s={ret_3s:+.3f}% → autoriser (9W/3L pattern)")
         else:
+            # ✅ v12.9 SHADOW DOWN: avant de skip, logger un DOWN fantôme (log-only) si gap+/delta- persistant
+            # sans chute brutale (ret3s pas en dessous du seuil override) → mesurer si DOWN aurait gagné
+            if (spot_oracle_gap >= SHADOW_DOWN_GAP_MIN and abs(oracle_delta) >= SHADOW_DOWN_DELTA_MIN and ret_3s >= -0.070):
+                log_shadow_down("BTC", spot_oracle_gap, oracle_delta, ret_3s)
             log_skip(f"BTC: delta {oracle_delta:+.3f}%<0 (→ skip: delta négatif LOSS garanti)", direction,
                      features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":0,"filter":"delta_neg","asset":"BTC"}); return
     if direction == "DOWN" and oracle_delta > 0.005 and not ret3s_override:
@@ -3021,8 +3077,9 @@ async def job_oracle_lag(context):
 
     # TA score
     price_hist = [{"price":p,"ts":t} for t,p in pts]
-    ta_score, ta_dir, _ = compute_ta_score(price_hist, "BTC")
+    ta_score, ta_dir, ta_details = compute_ta_score(price_hist, "BTC")
     ta_vote = 1 if ta_dir=="UP" else (-1 if ta_dir=="DOWN" else 0)
+    dual_dir = ta_details.get("dual_dir")  # ✅ v12.9 dual model (mesure)
 
     # OB vote
     ob_vote = 0
@@ -3079,10 +3136,10 @@ async def job_oracle_lag(context):
             log.debug(f"BTC tokenmax ultra-override: delta={oracle_delta:+.3f}% gap={spot_oracle_gap:+.3f}% (7W/0L pattern) → autoriser")
         else:
             log_skip(f"BTC: token {token_price:.2f}$>{ORACLE_TOKEN_MAX}$ (→ skip: marché a déjà pricé la direction)", direction,
-                     features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"filter":"tokenmax","token":token_price,"asset":"BTC"}); return
+                     features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"dual":dual_dir,"filter":"tokenmax","token":token_price,"asset":"BTC"}); return
     if token_price < ORACLE_TOKEN_MIN:
         log_skip(f"BTC: token {token_price:.2f}$<{ORACLE_TOKEN_MIN}$ (→ skip: trop incertain)", direction,
-                 features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"filter":"tokenmin","token":token_price,"asset":"BTC"}); return
+                 features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"dual":dual_dir,"filter":"tokenmin","token":token_price,"asset":"BTC"}); return
 
     fee = taker_fee_per_share(token_price)
     p_oracle = min(0.93, 0.85 + abs(spot_oracle_gap)*3.0) if primary_signal=="gap" else min(0.90, 0.80 + abs(oracle_delta)*2.0)
@@ -3094,10 +3151,10 @@ async def job_oracle_lag(context):
     # ✅ v12.9 FIX: vérifie le consensus POUR la direction parié, pas le score brut haussier
     if votes_for_direction < 2:
         log_skip(f"BTC: votes {votes_for_direction}/5 < 2 (→ skip: consensus faible)", direction,
-                 features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":votes_for_direction,"filter":"votes_min","asset":"BTC"}); return
+                 features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":votes_for_direction,"dual":dual_dir,"filter":"votes_min","asset":"BTC"}); return
     if ev < ORACLE_EDGE_MIN:
         log_skip(f"BTC: EV {ev*100:+.1f}%<{ORACLE_EDGE_MIN*100:.0f}% (→ skip: edge insuffisant)", direction,
-                 features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"filter":"ev","token":token_price,"ev":ev,"asset":"BTC"}); return
+                 features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"dual":dual_dir,"filter":"ev","token":token_price,"ev":ev,"asset":"BTC"}); return
 
     payout = round(1/token_price, 2)
     amount = kelly_bet(st.bankroll, p_oracle, payout, token_price, ev_bonus=True)
@@ -3200,14 +3257,18 @@ async def job_oracle_lag_asset(context, asset:str):
                  features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":0,"filter":"gap_neg"}); return
     # ✅ v12.9 Sonnet P2: ETH/SOL seuil deltaneg abaissé à -0.010% (0W/8L ETH, 0W/3L SOL)
     if direction=="UP" and oracle_delta<-0.010:
+        # ✅ v12.9 SHADOW DOWN: logger un DOWN fantôme (log-only) si gap+/delta- persistant sans chute brutale
+        if (spot_oracle_gap >= SHADOW_DOWN_GAP_MIN and abs(oracle_delta) >= SHADOW_DOWN_DELTA_MIN and ret_3s >= -0.070):
+            log_shadow_down(symbol, spot_oracle_gap, oracle_delta, ret_3s)
         log_skip(f"{symbol}: delta {oracle_delta:+.3f}%<-0.010% (delta négatif)",direction,
                  features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":0,"filter":"delta_neg"}); return
     if direction=="DOWN" and oracle_delta>0.005 and not ret3s_override:
         log_skip(f"{symbol}: delta {oracle_delta:+.3f}%>0 (→ skip: contre DOWN)",direction,
                  features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":0,"filter":"delta_contra"}); return
     price_hist=[{"price":p,"ts":t} for t,p in pts]
-    ta_score,ta_dir,_=compute_ta_score(price_hist,asset)
+    ta_score,ta_dir,ta_details=compute_ta_score(price_hist,asset)
     ta_vote=1 if ta_dir=="UP" else (-1 if ta_dir=="DOWN" else 0)
+    dual_dir = ta_details.get("dual_dir")  # ✅ v12.9 dual model (mesure)
     btc_cascade_vote=0
     btc_pts=list(st.ws_prices)
     if len(btc_pts)>=2:
@@ -3276,10 +3337,10 @@ async def job_oracle_lag_asset(context, asset:str):
     else: effective_token_max = ORACLE_TOKEN_MAX
     if token_price>effective_token_max:
         log_skip(f"{symbol}: token {token_price:.2f}$>{effective_token_max}$ (déjà pricé)",direction,
-                 features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"filter":"tokenmax","token":token_price}); return
+                 features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"dual":dual_dir,"filter":"tokenmax","token":token_price}); return
     if token_price<ORACLE_TOKEN_MIN:
         log_skip(f"{symbol}: token {token_price:.2f}$<{ORACLE_TOKEN_MIN}$ (incertain)",direction,
-                 features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"filter":"tokenmin","token":token_price}); return
+                 features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"dual":dual_dir,"filter":"tokenmin","token":token_price}); return
     fee=taker_fee_per_share(token_price)
     p_oracle=min(0.93,0.85+abs(spot_oracle_gap)*3.0) if primary_signal=="gap" else min(0.90,0.80+abs(oracle_delta)*2.0)
     if votes_for_direction>=3: p_oracle=min(0.95,p_oracle+0.03)
@@ -3287,10 +3348,10 @@ async def job_oracle_lag_asset(context, asset:str):
     # ✅ v12.9 FIX: consensus POUR la direction parié (était dir_votes brut, cassé pour DOWN)
     if votes_for_direction < 2:
         log_skip(f"{symbol}: votes {votes_for_direction}/5 < 2 (→ skip: consensus faible)", direction,
-                 features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":votes_for_direction,"filter":"votes_min"}); return
+                 features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":votes_for_direction,"dual":dual_dir,"filter":"votes_min"}); return
     if ev<ORACLE_EDGE_MIN:
         log_skip(f"{symbol}: EV {ev*100:+.1f}% insuffisant",direction,
-                 features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"filter":"ev","token":token_price,"ev":ev,"smt_div":round(divergence,3)}); return
+                 features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"dual":dual_dir,"filter":"ev","token":token_price,"ev":ev,"smt_div":round(divergence,3)}); return
     payout=round(1/token_price,2)
     amount=kelly_bet(st.bankroll,p_oracle,payout,token_price,ev_bonus=True)
     if amount<MIN_BET_USD: return
@@ -4306,6 +4367,8 @@ CONTEXTE IMPORTANT:
 - Token max actuel: {ORACLE_TOKEN_MAX}$ | EV min: {int(ORACLE_EDGE_MIN*100)}% | votes min: 2/5
 - {session_note}
 - Mécanisme SMT (ETH/SOL uniquement): quand BTC et ETH/SOL divergent de ≥0.025% sur 15s, le laggard tend à rattraper (corrélation ~0.9). Si tu vois "smt=" dans les données, c'est ce signal de divergence cross-asset — facteur supplémentaire à considérer, pas encore pleinement exploité historiquement (collecte en cours).
+- 🌑 SHADOW DOWN (filter=shadow_down): signaux DOWN "fantômes" en mode LOG-ONLY (aucun trade réel). Ils capturent le cas gap+/delta- persistant (marché baissier, oracle figé au-dessus du spot tombant) SANS chute brutale — un cas que les 4 stratégies ne tradent jamais actuellement. Question clé à trancher: ces DOWN auraient-ils GAGNÉ? Si shadow_down montre un WR≥58% sur n≥30 hors d'une seule session, c'est un EDGE réel à activer. Si WR≤48%, c'est un piège (mean-reversion: le spot rebondit au lieu de continuer à tomber) → garder désactivé. ATTENTION: ne te laisse pas piéger par un WR élevé issu d'une seule session 100% baissière (cf. règle anti-biais ci-dessous).
+- 🔀 DUAL MODEL (champ "dual" dans les features = UP/DOWN/None): inspiré des papiers CNN-LSTM qui entraînent des modèles UP et DOWN séparés. On calcule up_score et down_score indépendamment (RSI, EMA9/21, MACD, momentum 3min) au lieu d'un score symétrique. dual = la direction qui domine (marge ≥1.0). MODE MESURE uniquement: ne change AUCUNE décision pour l'instant. Si tu vois que "dual" prédit la direction gagnante nettement mieux que les votes actuels (≥58% sur n≥30), signale-le comme piste d'activation. MACD vient d'être ajouté aux votes TA (top-feature ML avec RSI) — son impact se mesure dans ta_vote.
 
 ⚠️ RÈGLE ANTI-BIAIS OBLIGATOIRE:
 Si une session représente ≥60% des données (ex: nuit calme ASIA_EARLY ou forte tendance directionnelle),
@@ -4470,6 +4533,39 @@ async def cmd_learn(update,context):
             tot=v["w"]+v["l"]; wr=v["w"]/tot*100 if tot else 0
             e="✅" if wr<35 else ("⚠️" if wr>60 else "➖")
             lines.append(f"  {e}`{f}`: {wr:.0f}% ({v['w']}W/{v['l']}L)")
+        # ✅ v12.9 — SHADOW DOWN: bloc dédié avec interprétation INVERSÉE (WR élevé = DOWN aurait gagné = EDGE réel)
+        if "shadow_down" in by_filter:
+            sv=by_filter["shadow_down"]; stot=sv["w"]+sv["l"]
+            if stot>0:
+                swr=sv["w"]/stot*100
+                if stot<30:
+                    verdict=f"⏳ échantillon insuffisant (n={stot}, besoin ≥30)"
+                elif swr>=58:
+                    verdict=f"🟢 EDGE POTENTIEL — DOWN aurait gagné {swr:.0f}% (envisager activation réelle)"
+                elif swr<=48:
+                    verdict=f"🔴 PIÈGE confirmé — DOWN perd ({swr:.0f}%), garder en log-only/désactiver"
+                else:
+                    verdict=f"➖ zone grise ({swr:.0f}%) — proche coinflip, pas d'edge net"
+                lines.append(f"\n  🌑 *SHADOW DOWN* (log-only): {sv['w']}W/{sv['l']}L\n     {verdict}")
+        # ✅ v12.9 — DUAL MODEL (mode mesure): le dual_dir (up_score vs down_score) prédit-il mieux?
+        # Un pattern a direction (signal oracle) + result (WIN si cette direction gagne) + dual (UP/DOWN/None).
+        # On reconstruit la direction réellement gagnante, puis on mesure si dual l'aurait devinée.
+        dual_pats=[p for p in sample if p.get("dual") in ("UP","DOWN")]
+        if dual_pats:
+            dual_correct=0
+            for p in dual_pats:
+                sig=p.get("direction"); res=p.get("result"); dd=p.get("dual")
+                if sig not in ("UP","DOWN") or res not in ("WIN","LOSS"): continue
+                winning_dir = sig if res=="WIN" else ("DOWN" if sig=="UP" else "UP")
+                if dd==winning_dir: dual_correct+=1
+            dtot=len([p for p in dual_pats if p.get("direction") in ("UP","DOWN") and p.get("result") in ("WIN","LOSS")])
+            if dtot>0:
+                dacc=dual_correct/dtot*100
+                if dtot<30: dverdict=f"⏳ n={dtot} insuffisant (besoin ≥30)"
+                elif dacc>=58: dverdict=f"🟢 dual prédit {dacc:.0f}% — signal utile (envisager vote dual)"
+                elif dacc<=45: dverdict=f"🔴 dual à {dacc:.0f}% — pire que hasard, ne pas activer"
+                else: dverdict=f"➖ dual {dacc:.0f}% — proche coinflip"
+                lines.append(f"\n  🔀 *DUAL MODEL* (mesure): {dual_correct}/{dtot} corrects\n     {dverdict}")
         # Par asset
         for asset_tag,emoji in [("BTC","₿"),("ETH","Ξ"),("SOL","◎"),("XRP","✕")]:
             ap=[p for p in sample if p.get("asset","BTC")==asset_tag]
@@ -4590,6 +4686,7 @@ async def cmd_run(update,context):
         f"/momentum BTC/ETH/SOL/XRP T-150s→T-60s | move≥0.30%/60s | tok 0.55$-0.65$ | filtre trend10m | Kelly 1-3%\n"
         f"/meanrev BTC/ETH/SOL/XRP T-150s→T-60s | squeeze BW≤0.12% | tok 0.51$-0.70$ | Kelly 1-3%\n"
         f"/conf BTC/ETH/SOL/XRP T-150s→T-60s | TDS=oracle×setup×(1-bruit)≥0.35 | tok 0.52$-0.72$ | Kelly 1-3% dynamique\n"
+        f"🌑 SHADOW DOWN (log-only): mesure les DOWN ratés en marché baissier (gap+/delta- persistant). 0 trade réel — voir /passes et /learn\n"
         f"  gap BTC/XRP≥2.5bps | ETH/SOL≥2.0bps | delta≥{int(ORACLE_ENTRY_DELTA*10000)}bps | Token≤{ORACLE_TOKEN_MAX}$(BTC)/0.95$(ETH/XRP/SOL) | EV≥{int(ORACLE_EDGE_MIN*100)}%\n"
         f"BR:`{st.bankroll:.2f}$` | ROI:`{roi()}`\n"
         f"📊 `{ob_txt}` | 💸 `{liq_txt}`\n"
@@ -5080,6 +5177,24 @@ async def _show_passes_page(update, context, page=1):
         if twr >= 58: lines.append("⚠️ Filtres peut-être trop stricts")
         elif twr <= 50: lines.append("✅ ~50% — les filtres ne coûtent rien, le marché était plat")
         else: lines.append("➖ Zone grise — encore besoin de données")
+    # ✅ v12.9 — Compteur SHADOW DOWN dédié (log-only, WR élevé = DOWN aurait gagné = edge)
+    shadow = [p for p in st.pass_reasons if "[SHADOW]" in str(p.get("reason","")) and p.get("resolved") in ("WIN","LOSS")]
+    if shadow:
+        sw = sum(1 for p in shadow if p.get("resolved")=="WIN")
+        swr = sw/len(shadow)*100
+        verdict = "🟢 edge?" if (swr>=58 and len(shadow)>=30) else ("🔴 piège" if swr<=48 and len(shadow)>=30 else "⏳ +data")
+        lines.append(f"🌑 SHADOW DOWN: {swr:.0f}% ({sw}/{len(shadow)}) {verdict}")
+    # ✅ v12.9 — Compteur DUAL MODEL (mesure): précision du dual_dir vs direction gagnante réelle
+    dual_res = [p for p in st.oracle_patterns if p.get("dual") in ("UP","DOWN")
+                and p.get("direction") in ("UP","DOWN") and p.get("result") in ("WIN","LOSS")]
+    if dual_res:
+        dc = 0
+        for p in dual_res:
+            sig=p["direction"]; win_dir = sig if p["result"]=="WIN" else ("DOWN" if sig=="UP" else "UP")
+            if p["dual"]==win_dir: dc+=1
+        dacc = dc/len(dual_res)*100
+        dv = "🟢 utile" if (dacc>=58 and len(dual_res)>=30) else ("🔴 faible" if dacc<=45 and len(dual_res)>=30 else "⏳ +data")
+        lines.append(f"🔀 DUAL: {dacc:.0f}% ({dc}/{len(dual_res)}) {dv}")
 
     text = "\n".join(lines)
 
@@ -5615,6 +5730,20 @@ async def cmd_oracle(update,context):
     xrp_ok=xrp_o>0 and now-st.xrp_oracle_ts<15
     xrp_sig="UP" if xrp_d>ORACLE_ENTRY_DELTA else ("DOWN" if xrp_d<-ORACLE_ENTRY_DELTA else None)
     xrp_rec=f"⚡ Signal XRP *{xrp_sig}* T-`{int(slot_remaining)}s`" if xrp_sig and xrp_ok else "📡 Pas de signal XRP"
+    # ✅ v12.9 — MACD + dual model BTC temps réel
+    ta_line = ""
+    try:
+        bpts = list(st.ws_prices)
+        if len(bpts) >= 35:
+            ph = [{"price":p,"ts":t} for t,p in bpts]
+            _ts, _td, _tdet = compute_ta_score(ph, "BTC")
+            mh = _tdet.get("macd_hist",0); rsi_v = _tdet.get("rsi",50)
+            us = _tdet.get("up_score",0); ds = _tdet.get("down_score",0); dd = _tdet.get("dual_dir")
+            macd_emoji = "🟢" if mh>0 else ("🔴" if mh<0 else "⚪")
+            dual_txt = f"`{dd}`" if dd else "`neutre`"
+            ta_line = (f"\n📊 TA BTC | RSI:`{rsi_v:.0f}` | MACD:{macd_emoji}`{mh:+.4f}`\n"
+                       f"  🔀 Dual: UP`{us:.1f}` vs DOWN`{ds:.1f}` → {dual_txt}\n")
+    except Exception: pass
     try:
         await update.message.reply_text(
             f"🔗 *ORACLE CHAINLINK — BTC/ETH/SOL/XRP*\n━━━━━━━━━━━━━━\n"
@@ -5630,6 +5759,7 @@ async def cmd_oracle(update,context):
             f"✕ XRP | Oracle:`${xrp_o:,.4f}` | Tick:`{int(now-st.xrp_oracle_ts) if st.xrp_oracle_ts>0 else 999}s` {'✅' if xrp_ok else '❌'}\n"
             f"  Δslot:`{xrp_d:+.3f}%` | Gap:`{xrp_g:+.3f}%` | XRP:`${st.xrp_price:,.4f}`\n"
             f"  → {xrp_rec}\n\n"
+            f"{ta_line}"
             f"WS: {' | '.join(srcs)}",
             parse_mode="Markdown")
     except Exception as e:
