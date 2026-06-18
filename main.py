@@ -2330,10 +2330,14 @@ def _record_slot(asset, slot_start, open_px, close_px, prices_deque):
                     bw = (4 * std) / sma * 100
                     regime = "squeeze" if bw <= 0.12 else "expansion"
         sess = session_ctx().get("session", "?")
+        # ✅ v12.9 — Order Book Imbalance (piste prédiction légitime: déséquilibre achat/vente Polymarket)
+        ob_map = {"BTC": getattr(st,"ob_imbalance",0), "ETH": getattr(st,"eth_ob_imbalance",0),
+                  "SOL": getattr(st,"sol_ob_imbalance",0), "XRP": getattr(st,"xrp_ob_imbalance",0)}
+        ob_imb = ob_map.get(asset, 0)
         st.slot_records.append({
             "asset": asset, "slot": slot_start, "open": open_px, "close": close_px,
             "result": result, "delta": round(delta_pct, 4), "rsi": round(rsi, 1),
-            "macd": round(macd_hist, 5), "dual": dual, "regime": regime,
+            "macd": round(macd_hist, 5), "dual": dual, "regime": regime, "ob": round(ob_imb, 3),
             "session": sess, "ts": int(time.time())})
         if len(st.slot_records) > 5000:
             st.slot_records = st.slot_records[-5000:]
@@ -2342,35 +2346,37 @@ def _record_slot(asset, slot_start, open_px, close_px, prices_deque):
 
 
 async def job_slot_recorder(context):
-    """✅ v12.9 — SLOT RECORDER: enregistre TOUS les slots 5min résolus (BTC/ETH/SOL/XRP),
-    indépendamment du trading. Tourne toutes les 30s. Pour chaque asset, dès qu'un slot est
-    terminé (le slot courant a changé), on enregistre le slot précédent avec son open/close oracle.
-    Source de résolution = oracle Chainlink (règle officielle Polymarket: UP si close ≥ open)."""
+    """✅ v12.9 (fix2 18/06) — FILET DE SÉCURITÉ du slot recorder, indépendant de la bascule oracle WS.
+    L'enregistrement principal se fait à la bascule dans ws_oracle_loop. Ce job est un backup:
+    il capture l'open de chaque nouveau slot (prix oracle au 1er passage du slot) et enregistre
+    le slot précédent s'il n'a pas déjà été enregistré par le mécanisme principal.
+    Garantit qu'on ne perd aucun slot même si un tick oracle est raté."""
     if not st.running or st.killed: return
     now = time.time()
     cur_slot = int(now // 300) * 300
-    # Pour chaque asset: (slot_open_attr, oracle_price_attr, slot_ts_attr, prices_deque)
     assets = [
-        ("BTC", "oracle_slot_open", "oracle_price", "oracle_slot_ts", st.ws_prices),
-        ("ETH", "eth_oracle_slot_open", "eth_oracle_price", "eth_oracle_slot_ts", st.eth_ws_prices),
-        ("SOL", "sol_oracle_slot_open", "sol_oracle_price", "sol_oracle_slot_ts", st.sol_ws_prices),
-        ("XRP", "xrp_oracle_slot_open", "xrp_oracle_price", "xrp_oracle_slot_ts", st.xrp_ws_prices),
+        ("BTC", "oracle_price", st.ws_prices),
+        ("ETH", "eth_oracle_price", st.eth_ws_prices),
+        ("SOL", "sol_oracle_price", st.sol_ws_prices),
+        ("XRP", "xrp_oracle_price", st.xrp_ws_prices),
     ]
-    for asset, open_attr, price_attr, ts_attr, pdq in assets:
-        slot_open = getattr(st, open_attr, 0)
-        slot_ts = getattr(st, ts_attr, 0)
-        # Close exact capturé à la bascule du slot (préféré), sinon fallback sur dernier prix oracle
-        exact_close = st.slot_rec_close.get((asset, slot_ts), 0)
-        close_px = exact_close if exact_close > 0 else getattr(st, price_attr, 0)
-        # Le slot représenté par slot_ts est terminé si on a basculé dans un nouveau slot
-        if slot_open > 0 and slot_ts > 0 and slot_ts < cur_slot:
-            if st.slot_rec_last.get(asset) != slot_ts and close_px > 0:
-                _record_slot(asset, slot_ts, slot_open, close_px, pdq)
-                st.slot_rec_last[asset] = slot_ts
-                # Nettoyage du dict close (garder seulement les récents)
-                if len(st.slot_rec_close) > 200:
-                    cutoff = cur_slot - 3600
-                    st.slot_rec_close = {k:v for k,v in st.slot_rec_close.items() if k[1] > cutoff}
+    # st.slot_rec_open: {asset: (slot_start, open_price)} — capturé par ce job
+    if not hasattr(st, "slot_rec_open"): st.slot_rec_open = {}
+    for asset, price_attr, pdq in assets:
+        oracle_px = getattr(st, price_attr, 0)
+        if oracle_px <= 0: continue
+        prev = st.slot_rec_open.get(asset)
+        if prev is None:
+            # Premier passage: mémoriser l'open du slot courant
+            st.slot_rec_open[asset] = (cur_slot, oracle_px)
+        elif prev[0] < cur_slot:
+            # Le slot précédent (prev[0]) est terminé. L'enregistrer si pas déjà fait par le mécanisme principal.
+            if st.slot_rec_last.get(asset) != prev[0]:
+                _record_slot(asset, prev[0], prev[1], oracle_px, pdq)
+                st.slot_rec_last[asset] = prev[0]
+                log.info(f"📝 SLOT REC (backup) {asset}: total={len(st.slot_records)}")
+            # Démarrer le suivi du slot courant
+            st.slot_rec_open[asset] = (cur_slot, oracle_px)
 
 
 
@@ -2401,32 +2407,36 @@ async def ws_oracle_loop():
                             slot_start = int(now//300)*300
                             st.oracle_chainlink_ts = cl_ts
                             if symbol == "btc/usd":
-                                st.oracle_price=p; st.oracle_ts=now
                                 if st.oracle_slot_ts!=slot_start:
-                                    # ✅ v12.9 SLOT RECORDER (fix 18/06): enregistrer le slot précédent DIRECTEMENT à la bascule.
-                                    # open=ancien slot_open, close=dernier prix oracle avant bascule. Moment fiable et exact.
-                                    if st.oracle_slot_ts>0 and st.oracle_slot_open>0 and st.oracle_price>0:
-                                        _record_slot("BTC", st.oracle_slot_ts, st.oracle_slot_open, st.oracle_price, st.ws_prices)
+                                    # ✅ v12.9 SLOT RECORDER (fix2 18/06): close = ANCIEN prix oracle (avant écrasement par le nouveau)
+                                    prev_close = st.oracle_price  # prix du slot qui se termine
+                                    if st.oracle_slot_ts>0 and st.oracle_slot_open>0 and prev_close>0:
+                                        _record_slot("BTC", st.oracle_slot_ts, st.oracle_slot_open, prev_close, st.ws_prices)
+                                        log.info(f"📝 SLOT REC BTC: open={st.oracle_slot_open:.2f} close={prev_close:.2f} → total={len(st.slot_records)}")
                                     st.oracle_slot_ts=slot_start; st.oracle_slot_open=p
                                     log.info(f"📌 BTC slot open: ${p:,.2f}")
+                                st.oracle_price=p; st.oracle_ts=now
                             elif symbol == "eth/usd" and p>100:
-                                st.eth_oracle_price=p; st.eth_oracle_ts=now
                                 if st.eth_oracle_slot_ts!=slot_start:
-                                    if st.eth_oracle_slot_ts>0 and st.eth_oracle_slot_open>0 and st.eth_oracle_price>0:
-                                        _record_slot("ETH", st.eth_oracle_slot_ts, st.eth_oracle_slot_open, st.eth_oracle_price, st.eth_ws_prices)
+                                    prev_close = st.eth_oracle_price
+                                    if st.eth_oracle_slot_ts>0 and st.eth_oracle_slot_open>0 and prev_close>0:
+                                        _record_slot("ETH", st.eth_oracle_slot_ts, st.eth_oracle_slot_open, prev_close, st.eth_ws_prices)
                                     st.eth_oracle_slot_ts=slot_start; st.eth_oracle_slot_open=p
+                                st.eth_oracle_price=p; st.eth_oracle_ts=now
                             elif symbol == "sol/usd" and p>1:
-                                st.sol_oracle_price=p; st.sol_oracle_ts=now
                                 if st.sol_oracle_slot_ts!=slot_start:
-                                    if st.sol_oracle_slot_ts>0 and st.sol_oracle_slot_open>0 and st.sol_oracle_price>0:
-                                        _record_slot("SOL", st.sol_oracle_slot_ts, st.sol_oracle_slot_open, st.sol_oracle_price, st.sol_ws_prices)
+                                    prev_close = st.sol_oracle_price
+                                    if st.sol_oracle_slot_ts>0 and st.sol_oracle_slot_open>0 and prev_close>0:
+                                        _record_slot("SOL", st.sol_oracle_slot_ts, st.sol_oracle_slot_open, prev_close, st.sol_ws_prices)
                                     st.sol_oracle_slot_ts=slot_start; st.sol_oracle_slot_open=p
+                                st.sol_oracle_price=p; st.sol_oracle_ts=now
                             elif symbol == "xrp/usd" and p>0.01:
-                                st.xrp_oracle_price=p; st.xrp_oracle_ts=now
                                 if st.xrp_oracle_slot_ts!=slot_start:
-                                    if st.xrp_oracle_slot_ts>0 and st.xrp_oracle_slot_open>0 and st.xrp_oracle_price>0:
-                                        _record_slot("XRP", st.xrp_oracle_slot_ts, st.xrp_oracle_slot_open, st.xrp_oracle_price, st.xrp_ws_prices)
+                                    prev_close = st.xrp_oracle_price
+                                    if st.xrp_oracle_slot_ts>0 and st.xrp_oracle_slot_open>0 and prev_close>0:
+                                        _record_slot("XRP", st.xrp_oracle_slot_ts, st.xrp_oracle_slot_open, prev_close, st.xrp_ws_prices)
                                     st.xrp_oracle_slot_ts=slot_start; st.xrp_oracle_slot_open=p
+                                st.xrp_oracle_price=p; st.xrp_oracle_ts=now
                         elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                             break
         except Exception as e:
@@ -4337,6 +4347,9 @@ async def job_haiku_analysis(context):
             du=[r for r in recs if r.get("dual")=="UP"]; dd=[r for r in recs if r.get("dual")=="DOWN"]
             if len(du)>=10: p,nn=_upr(du); parts.append(f"dual=UP→UP réel {p:.0f}% (n={nn})")
             if len(dd)>=10: p,nn=_upr(dd); parts.append(f"dual=DOWN→UP réel {p:.0f}% (n={nn})")
+            obb=[r for r in recs if r.get("ob",0)>0.15]; obs=[r for r in recs if r.get("ob",0)<-0.15]
+            if len(obb)>=10: p,nn=_upr(obb); parts.append(f"OB-acheteurs→UP {p:.0f}% (n={nn})")
+            if len(obs)>=10: p,nn=_upr(obs); parts.append(f"OB-vendeurs→UP {p:.0f}% (n={nn})")
             slot_rec_note = ("\n📊 SLOT RECORDER (tous slots résolus, oracle Chainlink, INDÉPENDANT du trading — "
                              "vérité terrain pour la valeur prédictive): " + " | ".join(parts) +
                              ". Un indicateur n'a de valeur prédictive que s'il s'écarte nettement de 50% sur n≥100. "
@@ -4766,8 +4779,8 @@ async def cmd_run(update,context):
     context.job_queue.run_repeating(job_confluence_sol,interval=2,first=44)
     context.job_queue.run_repeating(job_confluence_xrp,interval=2,first=46)
     context.job_queue.run_repeating(job_resolve_passes,interval=30,first=35)
-    # ✅ v12.9 — SLOT RECORDER: l'enregistrement se fait DIRECTEMENT à la bascule de slot dans ws_oracle_loop
-    # (le job séparé était inopérant car oracle_slot_ts bascule instantanément). Plus besoin de job ici.
+    # ✅ v12.9 — SLOT RECORDER: enregistrement principal à la bascule (ws_oracle_loop) + ce job en filet de sécurité
+    context.job_queue.run_repeating(job_slot_recorder,interval=30,first=50)
     context.job_queue.run_repeating(job_auto_calibrate,interval=7200,first=300)  # ✅ v10.37 seuils auto
     context.job_queue.run_repeating(job_pattern_memory,interval=3600,first=600)  # ✅ v10.37 mémoire patterns
     context.job_queue.run_repeating(job_haiku_analysis,interval=7200,first=900)  # ✅ v10.37 Haiku insights
@@ -5779,6 +5792,12 @@ async def cmd_slots(update,context):
             elif dd=="DOWN": votes_dn+=1; sig_txt.append("dual↓")
             if mh>0: votes_up+=1; sig_txt.append("MACD+")
             elif mh<0: votes_dn+=1; sig_txt.append("MACD-")
+        # 3) order book imbalance (déséquilibre acheteurs/vendeurs Polymarket)
+        ob_map={"BTC":getattr(st,"ob_imbalance",0),"ETH":getattr(st,"eth_ob_imbalance",0),
+                "SOL":getattr(st,"sol_ob_imbalance",0),"XRP":getattr(st,"xrp_ob_imbalance",0)}
+        obv=ob_map.get(a,0)
+        if obv>0.15: votes_up+=1; sig_txt.append(f"OB↑{obv:.2f}")
+        elif obv<-0.15: votes_dn+=1; sig_txt.append(f"OB↓{obv:.2f}")
         # Verdict
         if votes_up>votes_dn: verdict=f"🟢 UP ({votes_up}/{votes_up+votes_dn})"
         elif votes_dn>votes_up: verdict=f"🔴 DOWN ({votes_dn}/{votes_up+votes_dn})"
@@ -5833,6 +5852,11 @@ async def cmd_slots(update,context):
     macd_neg=[r for r in recs if r.get("macd",0)<0]
     if macd_pos: p,nn=wr_up(macd_pos); lines.append(f"  MACD>0: `{nn}` | UP `{p:.0f}%`")
     if macd_neg: p,nn=wr_up(macd_neg); lines.append(f"  MACD<0: `{nn}` | UP `{p:.0f}%`")
+    # ✅ v12.9 — Order book imbalance: déséquilibre acheteurs/vendeurs prédit-il la direction?
+    ob_buy=[r for r in recs if r.get("ob",0)>0.15]
+    ob_sell=[r for r in recs if r.get("ob",0)<-0.15]
+    if ob_buy: p,nn=wr_up(ob_buy); lines.append(f"  📖 OB acheteurs (>0.15): `{nn}` | UP `{p:.0f}%`")
+    if ob_sell: p,nn=wr_up(ob_sell); lines.append(f"  📖 OB vendeurs (<-0.15): `{nn}` | UP `{p:.0f}%`")
     # Dual model: quand dual=UP, le slot finit-il vraiment UP?
     dual_up=[r for r in recs if r.get("dual")=="UP"]
     dual_dn=[r for r in recs if r.get("dual")=="DOWN"]
