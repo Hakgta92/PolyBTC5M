@@ -94,7 +94,7 @@ FILTER_DELTA_CONTRA   = 0.017   # delta contra max
 FILTER_GAP_STRONG     = 0.025   # gap fort BTC
 
 
-MIN_BET_USD     = 2.0   # Minimum absolu
+MIN_BET_USD     = 1.0   # ✅ v12.9 (18/06) — abaissé 2$→1$ pour suivre le 4% du BR au plus près. 1$ = garde-fou minimal au-dessus du seuil d'ordre Polymarket
 FAIR_EDGE_MIN   = 0.08
 MAX_BET_USD     = 8.0   # ✅ v10.26 — Max 8$ (setup exceptionnel sur BR 35$ = ~23%)
 MAX_BET_PCT     = 0.15  # ✅ v10.26 — Max Kelly 15% sur setup exceptionnel
@@ -166,8 +166,8 @@ TDS_TOKEN_MAX        = 0.72
 SHADOW_DOWN_ENABLED      = True   # passer à False pour désactiver le shadow logging
 SHADOW_DOWN_GAP_MIN      = 0.005  # gap positif minimum (spot encore au-dessus oracle figé)
 SHADOW_DOWN_DELTA_MIN    = 0.010  # |delta négatif| minimum (oracle descend de façon nette)
-ORACLE_WINDOW_START = 45    # v12.9 — élargi T-25→T-45 (demande user 17/06)    # Fenêtre normale: T-45s→T-5s
-ORACLE_WINDOW_END   = 5     # v12.9 — élargi T-10→T-5 (demande user 18/06) — capte le dernier sursaut. ⚠️ risque: latence Polygon 2-5s peut empêcher le fill à temps
+ORACLE_WINDOW_START = 150   # v12.9 — élargi T-45→T-150 (demande user 18/06) pour mesurer la zone large + tracker timing  # Fenêtre: T-150s→T-30s
+ORACLE_WINDOW_END   = 30    # v12.9 — élargi T-5→T-30 (demande user 18/06) — fin plus sûre côté exécution (moins de latence)
 # ✅ v10.32 — Mode T-10s (source: github.com/Archetapp — T-10s "direction quasi lockée")
 ORACLE_ULTRA_WINDOW = 12    # Passe ultra-précise si T-12s→T-6s ET EV exceptionnelle
 ORACLE_ULTRA_EV_MIN = 0.05  # EV min pour passe ultra (moins strict car WR > 95% à T-10s)
@@ -1655,6 +1655,10 @@ class State:
         self.slot_records=[]    # dicts: {asset,slot,open,close,result,gap,delta,rsi,macd,dual,regime,session,ts}
         self.slot_rec_last={}   # {asset: dernier slot_start enregistré} anti-doublon
         self.slot_rec_close={}  # {(asset,slot_start): close oracle exact capturé à la bascule}
+        # ✅ v12.9 — TRACKER TIMING DE PRICING: à quel T-Xs le token dépasse 0.95$? (mesure si on entre trop tard)
+        self.price_timing=[]       # dicts: {asset, slot, t_remaining_at_095, token_max, ts}
+        self.price_timing_seen={}  # {(asset,slot): t_remaining où token a d'abord dépassé 0.95$} pour capturer le 1er franchissement
+        self.price_timing_max={}   # {(asset,slot): token_max observé sur le slot}
         self.xrp_ob_imbalance=0.0; self.xrp_ob_ts=0.0; self.xrp_ob_asset_id=""; self.xrp_clob_ws_task=None
         self.oracle_lag_signal=None  # {"bias","desc","div_pct"}
         # ✅ v10.23 — Calibration sigma
@@ -2439,6 +2443,41 @@ async def job_slot_recorder(context):
                 log.info(f"📝 SLOT REC (backup) {asset}: total={len(st.slot_records)}")
             # Démarrer le suivi du slot courant
             st.slot_rec_open[asset] = (cur_slot, oracle_px)
+
+
+async def job_price_timing(context):
+    """✅ v12.9 — TRACKER TIMING DE PRICING: mesure à quel moment (T-Xs) le token de chaque crypto
+    dépasse 0.95$, et le token max atteint. Répond à la question 'est-ce qu'on entre trop tard?'.
+    Tourne toutes les 10s. Lecture seule (best-effort). Enregistre le 1er franchissement de 0.95$ par slot."""
+    if not st.running or st.killed: return
+    now = time.time()
+    cur_slot = int(now // 300) * 300
+    t_remaining = cur_slot + 300 - now
+    for asset, e in [("BTC","₿"),("ETH","Ξ"),("SOL","◎"),("XRP","✕")]:
+        try:
+            cfg = _asset_state_attrs(asset)
+            market = await poly.get_market_by_slug(f"{cfg['slug']}-{cur_slot}")
+            if not market: continue
+            token = await poly.get_token_price(market["token_up"])
+            if token <= 0: continue
+            key = (asset, cur_slot)
+            # token max du slot
+            prev_max = st.price_timing_max.get(key, 0)
+            if token > prev_max: st.price_timing_max[key] = token
+            # 1er franchissement de 0.95$ (token "déjà pricé")
+            if token >= 0.95 and key not in st.price_timing_seen:
+                st.price_timing_seen[key] = t_remaining
+                st.price_timing.append({"asset": asset, "slot": cur_slot,
+                    "t_remaining_at_095": round(t_remaining,1),
+                    "token_at_cross": round(token,3), "ts": int(now)})
+                if len(st.price_timing) > 2000: st.price_timing = st.price_timing[-2000:]
+            # Nettoyage des dicts (garder ~1h)
+            if len(st.price_timing_seen) > 400:
+                cutoff = cur_slot - 3600
+                st.price_timing_seen = {k:v for k,v in st.price_timing_seen.items() if k[1] > cutoff}
+                st.price_timing_max = {k:v for k,v in st.price_timing_max.items() if k[1] > cutoff}
+        except Exception as ex:
+            log.debug(f"price_timing {asset}: {ex}")
 
 
 
@@ -3228,10 +3267,11 @@ async def job_oracle_lag(context):
     now = time.time()
     cur_slot = int(now // 300) * 300
     slot_remaining = cur_slot + 300 - now
-    # ✅ v12.9 — Régime trendsession: >60% deltaneg → T-15s
+    # ✅ v12.9 — Régime trendsession: >60% deltaneg → resserrer le DÉBUT (entrer plus tard, plus près de la décision)
+    # Doit rester > ORACLE_WINDOW_END (30) pour garder une fenêtre valide. Ajusté avec l'élargissement T-150s.
     recent_30=[p for p in st.pass_reasons if now-p.get("ts",0)<=1800]
     dn_ratio=sum(1 for p in recent_30 if "delta" in p.get("reason","").lower() and "<0" in p.get("reason",""))/max(len(recent_30),1)
-    btc_win_start=15 if dn_ratio>0.60 else ORACLE_WINDOW_START
+    btc_win_start=max(ORACLE_WINDOW_END+30, 90) if dn_ratio>0.60 else ORACLE_WINDOW_START
     if slot_remaining > btc_win_start or slot_remaining < ORACLE_WINDOW_END: return
 
     _resolve_pending_passes()  # ✅ v12.9 — Résolution immédiate
@@ -3240,8 +3280,10 @@ async def job_oracle_lag(context):
         log_skip(f"BTC: WS non dispo (T-{int(slot_remaining)}s)", None); return
     if now - st.oracle_ts > 15:
         log_skip(f"BTC: tick périmé {int(now-st.oracle_ts)}s (T-{int(slot_remaining)}s)", None); return
-    if st.last_trade_slot == cur_slot:
-        log_skip(f"BTC: slot déjà tradé (T-{int(slot_remaining)}s)", None); return
+    # ✅ v12.9 — verrou GLOBAL anti sur-exposition: 1 seul trade par slot toutes stratégies confondues
+    # (nécessaire car l'oracle lag T-150→T-30 chevauche désormais momentum/meanrev/confluence T-150→T-60)
+    if cur_slot in (st.last_trade_slot, getattr(st,"momentum_last_slot",0), getattr(st,"meanrev_last_slot",0), getattr(st,"tds_last_slot",0)):
+        log_skip(f"BTC: slot déjà tradé par une stratégie (T-{int(slot_remaining)}s)", None); return
 
     spot_now = consensus_price()
     if spot_now <= 0: return
@@ -3684,6 +3726,7 @@ async def job_momentum_btc(context):
     # Fenêtre T-150s→T-60s uniquement
     if not (60 <= slot_remaining <= 150): return
     if st.momentum_last_slot == cur_slot: return
+    if cur_slot in (st.last_trade_slot, getattr(st,"meanrev_last_slot",0), getattr(st,"tds_last_slot",0)): return  # ✅ v12.9 verrou global
     if st.oracle_price <= 0 or st.ws_price <= 0: return
 
     # ── Calcul momentum 60s et 30s ──
@@ -3928,6 +3971,7 @@ async def job_mean_reversion_btc(context):
     if not (60 <= slot_remaining <= 150): return
     # Anti-double-trade: vérifie les 2 guards (momentum a pu déjà trader ce slot, ou nous-même)
     if st.momentum_last_slot == cur_slot or st.meanrev_last_slot == cur_slot: return
+    if cur_slot in (st.last_trade_slot, getattr(st,"tds_last_slot",0)): return  # ✅ v12.9 verrou global
     if st.oracle_price <= 0 or st.ws_price <= 0: return
 
     pts = list(st.ws_prices)
@@ -4608,10 +4652,10 @@ STRATÉGIE: Le bot exploite le lag entre Chainlink (oracle Polymarket) et le pri
 Il achète le token UP ou DOWN avant que le marché reprices l'oracle.
 
 PARAMÈTRES ACTUELS:
-- BTC: gap≥0.025% | T-45s→T-5s
-- ETH: gap≥0.020% | T-45s→T-5s
-- SOL: gap≥0.020% | T-45s→T-5s
-- XRP: gap≥0.025% | T-45s→T-5s
+- BTC: gap≥0.025% | T-150s→T-30s
+- ETH: gap≥0.020% | T-150s→T-30s
+- SOL: gap≥0.020% | T-150s→T-30s
+- XRP: gap≥0.025% | T-150s→T-30s
 - MOMENTUM (BTC/ETH/SOL/XRP): ret60s≥0.30% | T-150s→T-60s | tok 0.55$-0.65$ | filtre trend macro 10min (bloque si tendance 10min contraire ≥0.10%, source: étude live ayant réduit pertes -93%→-13% avec ce filtre) | Kelly dédié 1-3% BR (2ème fenêtre indépendante). Extension ETH/SOL/XRP NOUVELLE (17/06) — surveiller si ces assets, documentés plus bruités à court terme, performent moins bien que BTC.
 - MEAN-REVERSION (BTC/ETH/SOL/XRP): Bollinger Bandwidth≤0.12% (régime squeeze) | parie contre un spike (prix hors bandes 2σ) | tok 0.51$-0.70$ | Kelly dédié 1-3% BR (3ème fenêtre, même T-150s→T-60s, régime complémentaire au momentum — squeeze vs expansion). Stratégie NOUVELLE, seuils à calibrer avec données réelles. Extension ETH/SOL/XRP NOUVELLE (17/06).
 - CONFLUENCE (BTC/ETH/SOL/XRP, 4ème stratégie /conf): TDS = oracle_score(gap≥0.025%, fort≥0.060%) × setup_score(mean-rev ou momentum, UNIQUEMENT si aligné avec le biais oracle) × (1-noise_penalty si chop détecté) | seuil TDS≥0.35 | tok 0.52$-0.72$ | Kelly dédié 1-3% BR avec SIZING DYNAMIQUE (confidence 0.7x à TDS=seuil → 1.3x à TDS=1.0, toujours capé 1-3% BR) | même fenêtre T-150s→T-60s. Poids adaptatifs MR/momentum ajustés UNIQUEMENT après ≥20 trades par branche (neutres sinon — anti-overfitting). Stratégie TRÈS NOUVELLE (17/06), tous les seuils sont des points de départ raisonnés à calibrer en priorité avec les premières données réelles.
@@ -4709,7 +4753,7 @@ async def cmd_learn(update,context):
     lines.append(f"📐 *Seuils actuels:*")
     lines.append(f"  delta≥`{ORACLE_ENTRY_DELTA:.3f}%` | gap BTC≥`0.025%` | gap ETH/SOL≥`0.020%` | gap XRP≥`0.025%`")
     lines.append(f"  token:`{ORACLE_TOKEN_MIN:.2f}$`-`{ORACLE_TOKEN_MAX:.2f}$`(BTC) `0.95$`(ETH/XRP/SOL) | EV≥`{ORACLE_EDGE_MIN_BTC*100:.0f}%`(BTC)/`{ORACLE_EDGE_MIN*100:.0f}%`(autres) | votes≥2(dir)")
-    lines.append(f"  BTC: T-45s→T-5s | ETH: T-45s→T-5s | SOL: T-45s→T-5s | XRP: T-45s→T-5s")
+    lines.append(f"  BTC: T-150s→T-30s | ETH: T-150s→T-30s | SOL: T-150s→T-30s | XRP: T-150s→T-30s")
 
     # ── Trades réels ──
     real=[t for t in merged_trades if not t.get("paper")]
@@ -4946,6 +4990,8 @@ async def cmd_run(update,context):
     context.job_queue.run_repeating(job_resolve_passes,interval=30,first=35)
     # ✅ v12.9 — SLOT RECORDER: enregistrement principal à la bascule (ws_oracle_loop) + ce job en filet de sécurité
     context.job_queue.run_repeating(job_slot_recorder,interval=30,first=50)
+    # ✅ v12.9 — TRACKER TIMING DE PRICING: mesure à quel T-Xs le token dépasse 0.95$ (10s)
+    context.job_queue.run_repeating(job_price_timing,interval=10,first=20)
     context.job_queue.run_repeating(job_auto_calibrate,interval=7200,first=300)  # ✅ v10.37 seuils auto
     context.job_queue.run_repeating(job_pattern_memory,interval=3600,first=600)  # ✅ v10.37 mémoire patterns
     context.job_queue.run_repeating(job_haiku_analysis,interval=7200,first=900)  # ✅ v10.37 Haiku insights
@@ -4966,7 +5012,7 @@ async def cmd_run(update,context):
     await update.message.reply_text(
         f"🚀 *Bot v{BOT_VERSION} démarré !*\nMode:*{'📄 PAPER' if st.paper_mode else '💰 RÉEL'}*\n"
         f"Session:`{sess['session']}` | Seuils: score≥`{min_score}` mom≥`{min_mom}`\n"
-        f"/oracle BTC T-45→T-5s | ETH T-45→T-5s | SOL T-45→T-5s | XRP T-45→T-5s\n"
+        f"/oracle BTC T-150→T-30s | ETH T-150→T-30s | SOL T-150→T-30s | XRP T-150→T-30s\n"
         f"/momentum BTC/ETH/SOL/XRP T-150s→T-60s | move≥0.30%/60s | tok 0.55$-0.65$ | filtre trend10m | Kelly 1-3%\n"
         f"/meanrev BTC/ETH/SOL/XRP T-150s→T-60s | squeeze BW≤0.12% | tok 0.51$-0.70$ | Kelly 1-3%\n"
         f"/conf BTC/ETH/SOL/XRP T-150s→T-60s | TDS=oracle×setup×(1-bruit)≥0.35 | tok 0.52$-0.72$ | Kelly 1-3% dynamique\n"
@@ -6079,6 +6125,20 @@ async def cmd_slots(update,context):
     if bs_slots:
         v = "🟢 calibré" if bs_slots["brier"]<0.20 else ("🟡 limite" if bs_slots["brier"]<=0.25 else "🔴 mal calibré")
         lines.append(f"\n🎯 *Brier score:* `{bs_slots['brier']}` {v} (conf `{bs_slots['avg_conf']*100:.0f}%` vs WR `{bs_slots['realized_wr']*100:.0f}%`, n={bs_slots['n']})")
+    # ✅ v12.9 — TIMING DE PRICING: à quel T-Xs le token dépasse 0.95$? (réponds à 'entre-t-on trop tard?')
+    pt = list(st.price_timing)
+    if pt:
+        lines.append("\n⏱️ *Timing de pricing (token→0.95$):*")
+        for a,e in [("BTC","₿"),("ETH","Ξ"),("SOL","◎"),("XRP","✕")]:
+            ap=[r["t_remaining_at_095"] for r in pt if r["asset"]==a]
+            if ap:
+                avg_t=sum(ap)/len(ap)
+                # token max moyen pour cet asset
+                maxes=[v for (k_a,k_s),v in st.price_timing_max.items() if k_a==a]
+                avg_max=sum(maxes)/len(maxes) if maxes else 0
+                warn=" ⚠️ avant ta fenêtre!" if avg_t>ORACLE_WINDOW_START else ""
+                lines.append(f"  {e} {a}: T-`{avg_t:.0f}s` en moy (n={len(ap)}) | tok max moy `{avg_max:.2f}$`{warn}")
+        lines.append(f"  _Ta fenêtre oracle: T-{ORACLE_WINDOW_START}s→T-{ORACLE_WINDOW_END}s. Si le token atteint 0.95$ AVANT T-{ORACLE_WINDOW_START}s, tu entres trop tard._")
     lines.append(f"\n_Un indicateur n'a de valeur que s'il s'écarte nettement de 50% sur un gros échantillon (n≥100)._")
 
     text = "\n".join(lines)
