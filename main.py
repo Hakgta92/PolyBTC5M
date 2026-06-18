@@ -141,7 +141,11 @@ KILL_SWITCH_LOSSES  = 5      # Pertes consécutives → arrêt total (au-delà d
 ORACLE_ENTRY_DELTA  = 0.02  # v12.4  # ✅ v10.31 — baissé 0.05→0.03% (-0.049% bloqué mais ✅ dans passes)
 ORACLE_TOKEN_MAX    = 0.80  # v12.6 — élargi pour accumuler des données  # ✅ v10.32 — breakeven exact @92%WR = token 0.92$ (EV>0 jusqu'à 0.92$)
 ORACLE_TOKEN_MIN    = 0.51  # Token min (trop proche de 0.50$ = incertitude trop haute)
-ORACLE_EDGE_MIN     = 0.15  # v12.4  # EV minimum après frais — 15% (ETH/SOL/XRP + momentum/meanrev/confluence)
+ORACLE_EDGE_MIN     = 0.15  # v12.4  # EV minimum — 15% (momentum/meanrev/confluence sur tous assets)
+# ✅ v12.9 (18/06) — EV oracle lag ETH/SOL/XRP abaissé 15%→10% (demande user). ⚠️ RISQUE DOCUMENTÉ:
+# les ev-skips ETH/SOL historiques sont 0W/7L (que des pertes dans cette zone). XRP non mesuré.
+# Surveillance OBLIGATOIRE: si les 1ers trades ETH/SOL/XRP à EV 10-15% perdent, remonter à 15%.
+ORACLE_EDGE_MIN_ALT = 0.10
 # ✅ v12.9 (18/06) — EV minimum SPÉCIFIQUE BTC oracle lag abaissé à 8% (Sonnet: ev-skips BTC 8W/2L=80%,
 # l'EV semblait sous-estimé par le token élevé au dénominateur). UNIQUEMENT BTC oracle lag — ETH/SOL/XRP
 # restent à 15% car leurs ev-skips sont 0W/7L (baisser = acheter des pertes). Surveillance rapprochée:
@@ -3616,8 +3620,8 @@ async def job_oracle_lag_asset(context, asset:str):
     if votes_for_direction < 2:
         log_skip(f"{symbol}: votes {votes_for_direction}/5 < 2 (→ skip: consensus faible)", direction,
                  features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":votes_for_direction,"dual":dual_dir,"filter":"votes_min"}); return
-    if ev<ORACLE_EDGE_MIN:
-        log_skip(f"{symbol}: EV {ev*100:+.1f}% insuffisant",direction,
+    if ev<ORACLE_EDGE_MIN_ALT:
+        log_skip(f"{symbol}: EV {ev*100:+.1f}%<{ORACLE_EDGE_MIN_ALT*100:.0f}% insuffisant",direction,
                  features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"dual":dual_dir,"filter":"ev","token":token_price,"ev":ev,"smt_div":round(divergence,3)}); return
     payout=round(1/token_price,2)
     amount=kelly_bet(st.bankroll,p_oracle,payout,token_price,ev_bonus=True)
@@ -4659,7 +4663,7 @@ PARAMÈTRES ACTUELS:
 - MOMENTUM (BTC/ETH/SOL/XRP): ret60s≥0.30% | T-150s→T-60s | tok 0.55$-0.65$ | filtre trend macro 10min (bloque si tendance 10min contraire ≥0.10%, source: étude live ayant réduit pertes -93%→-13% avec ce filtre) | Kelly dédié 1-3% BR (2ème fenêtre indépendante). Extension ETH/SOL/XRP NOUVELLE (17/06) — surveiller si ces assets, documentés plus bruités à court terme, performent moins bien que BTC.
 - MEAN-REVERSION (BTC/ETH/SOL/XRP): Bollinger Bandwidth≤0.12% (régime squeeze) | parie contre un spike (prix hors bandes 2σ) | tok 0.51$-0.70$ | Kelly dédié 1-3% BR (3ème fenêtre, même T-150s→T-60s, régime complémentaire au momentum — squeeze vs expansion). Stratégie NOUVELLE, seuils à calibrer avec données réelles. Extension ETH/SOL/XRP NOUVELLE (17/06).
 - CONFLUENCE (BTC/ETH/SOL/XRP, 4ème stratégie /conf): TDS = oracle_score(gap≥0.025%, fort≥0.060%) × setup_score(mean-rev ou momentum, UNIQUEMENT si aligné avec le biais oracle) × (1-noise_penalty si chop détecté) | seuil TDS≥0.35 | tok 0.52$-0.72$ | Kelly dédié 1-3% BR avec SIZING DYNAMIQUE (confidence 0.7x à TDS=seuil → 1.3x à TDS=1.0, toujours capé 1-3% BR) | même fenêtre T-150s→T-60s. Poids adaptatifs MR/momentum ajustés UNIQUEMENT après ≥20 trades par branche (neutres sinon — anti-overfitting). Stratégie TRÈS NOUVELLE (17/06), tous les seuils sont des points de départ raisonnés à calibrer en priorité avec les premières données réelles.
-- Commun: delta≥0.020% | token BTC 0.51$-0.80$ (exceptions: ret3s≤+0.010% OU delta≥0.114%+gap≥0.060%) | ETH/XRP/SOL(votes≤-1) token max 0.95$ | EV≥8% pour BTC oracle lag (abaissé de 15%→8% le 18/06 car ev-skips BTC 8W/2L=80%), EV≥15% pour ETH/SOL/XRP + momentum/meanrev/confluence (ev-skips ETH/SOL 0W/7L → ne PAS baisser) | votes≥2 (consensus pour la direction parié, pas score brut)
+- Commun: delta≥0.020% | token BTC 0.51$-0.80$ (exceptions: ret3s≤+0.010% OU delta≥0.114%+gap≥0.060%) | ETH/XRP/SOL(votes≤-1) token max 0.95$ | EV≥8% pour BTC oracle lag, EV≥10% pour ETH/SOL/XRP oracle lag (abaissé 15%→10% le 18/06 sur demande user — ⚠️ RISQUE: ev-skips ETH/SOL historiques 0W/7L, surveiller et remonter si pertes), EV≥15% pour momentum/meanrev/confluence | votes≥2 (consensus pour la direction parié, pas score brut)
 - BTC deltaneg: bloqué sauf si gap≥0.040% ET ret3s>-0.050% (exception validée 9W/3L)
 - ETH/SOL/XRP deltaneg: seuil strict -0.010% (0% WR historique si assoupli)
 - Filtres actifs: ret3s_brutal(<-0.070%, ne bloque plus DOWN déjà confirmé) | delta_neg | gap_neg | tokenmax | tokenmin | ev
@@ -4678,7 +4682,7 @@ CONTEXTE IMPORTANT:
 - Gain moyen estimé par WIN: ~{avg_win:.2f}$ | Perte moyenne par LOSS: ~{avg_loss:.2f}$
 - Le bot a eu très peu/pas de trades réels récemment. CAUSE IMPORTANTE: un bug get_market_by_slug (endpoints /events?slug au lieu de /events/slug/) empêchait ETH/SOL/XRP (et parfois BTC) de trouver leur marché → trades tués en silence, corrigé le 18/06. Donc une partie du "0 trade" était TECHNIQUE, pas un excès de filtrage. Ne conclus PAS hâtivement que les filtres sont trop stricts: vérifie d'abord via le SLOT RECORDER si les conditions avaient une vraie valeur prédictive.
 - Objectif prioritaire: identifier des configurations qui AURAIENT dû trader et gagner
-- Token max actuel: {ORACLE_TOKEN_MAX}$ | EV min: {int(ORACLE_EDGE_MIN_BTC*100)}% (BTC oracle lag) / {int(ORACLE_EDGE_MIN*100)}% (autres) | votes min: 2/5{brier_note}
+- Token max actuel: {ORACLE_TOKEN_MAX}$ | EV min: {int(ORACLE_EDGE_MIN_BTC*100)}% (BTC oracle lag) / {int(ORACLE_EDGE_MIN_ALT*100)}% (ETH/SOL/XRP oracle lag) / {int(ORACLE_EDGE_MIN*100)}% (momentum/meanrev/confluence) | votes min: 2/5{brier_note}
 - {session_note}
 - Mécanisme SMT (ETH/SOL uniquement): quand BTC et ETH/SOL divergent de ≥0.025% sur 15s, le laggard tend à rattraper (corrélation ~0.9). Si tu vois "smt=" dans les données, c'est ce signal de divergence cross-asset — facteur supplémentaire à considérer, pas encore pleinement exploité historiquement (collecte en cours).
 - 🌑 SHADOW DOWN (filter=shadow_down): signaux DOWN "fantômes" en mode LOG-ONLY (aucun trade réel). Ils capturent le cas gap+/delta- persistant (marché baissier, oracle figé au-dessus du spot tombant) SANS chute brutale — un cas que les 4 stratégies ne tradent jamais actuellement. Question clé à trancher: ces DOWN auraient-ils GAGNÉ? Si shadow_down montre un WR≥58% sur n≥30 hors d'une seule session, c'est un EDGE réel à activer. Si WR≤48%, c'est un piège (mean-reversion: le spot rebondit au lieu de continuer à tomber) → garder désactivé. ATTENTION: ne te laisse pas piéger par un WR élevé issu d'une seule session 100% baissière (cf. règle anti-biais ci-dessous).
@@ -4752,7 +4756,7 @@ async def cmd_learn(update,context):
     lines.append(f"📊 {len(merged_patterns)} patterns | {len(merged_trades)} trades en mémoire")
     lines.append(f"📐 *Seuils actuels:*")
     lines.append(f"  delta≥`{ORACLE_ENTRY_DELTA:.3f}%` | gap BTC≥`0.025%` | gap ETH/SOL≥`0.020%` | gap XRP≥`0.025%`")
-    lines.append(f"  token:`{ORACLE_TOKEN_MIN:.2f}$`-`{ORACLE_TOKEN_MAX:.2f}$`(BTC) `0.95$`(ETH/XRP/SOL) | EV≥`{ORACLE_EDGE_MIN_BTC*100:.0f}%`(BTC)/`{ORACLE_EDGE_MIN*100:.0f}%`(autres) | votes≥2(dir)")
+    lines.append(f"  token:`{ORACLE_TOKEN_MIN:.2f}$`-`{ORACLE_TOKEN_MAX:.2f}$`(BTC) `0.95$`(ETH/XRP/SOL) | EV≥`{ORACLE_EDGE_MIN_BTC*100:.0f}%`(BTC)/`{ORACLE_EDGE_MIN_ALT*100:.0f}%`(ETH/SOL/XRP) | votes≥2(dir)")
     lines.append(f"  BTC: T-150s→T-30s | ETH: T-150s→T-30s | SOL: T-150s→T-30s | XRP: T-150s→T-30s")
 
     # ── Trades réels ──
@@ -5019,7 +5023,7 @@ async def cmd_run(update,context):
         f"🌑 SHADOW DOWN (log-only): mesure les DOWN ratés en marché baissier (gap+/delta- persistant). 0 trade réel — voir /passes et /learn\n"
         f"📊 /slots: journal de TOUS les slots résolus (UP/DOWN réel + conditions) — indépendant du trading, pour analyse prédictive\n"
         f"🌊 /flow: order flow temps réel (derniers trades Polymarket des 4 cryptos, détecte le smart money)\n"
-        f"  gap BTC/XRP≥2.5bps | ETH/SOL≥2.0bps | delta≥{int(ORACLE_ENTRY_DELTA*10000)}bps | Token≤{ORACLE_TOKEN_MAX}$(BTC)/0.95$(ETH/XRP/SOL) | EV≥{int(ORACLE_EDGE_MIN_BTC*100)}%(BTC)/{int(ORACLE_EDGE_MIN*100)}%(ETH/SOL/XRP)\n"
+        f"  gap BTC/XRP≥2.5bps | ETH/SOL≥2.0bps | delta≥{int(ORACLE_ENTRY_DELTA*10000)}bps | Token≤{ORACLE_TOKEN_MAX}$(BTC)/0.95$(ETH/XRP/SOL) | EV≥{int(ORACLE_EDGE_MIN_BTC*100)}%(BTC)/{int(ORACLE_EDGE_MIN_ALT*100)}%(ETH/SOL/XRP)\n"
         f"BR:`{st.bankroll:.2f}$` | ROI:`{roi()}`\n"
         f"📊 `{ob_txt}` | 💸 `{liq_txt}`\n"
         f"Récap auto: 22h Paris 🕙",
