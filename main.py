@@ -166,8 +166,8 @@ TDS_TOKEN_MAX        = 0.72
 SHADOW_DOWN_ENABLED      = True   # passer à False pour désactiver le shadow logging
 SHADOW_DOWN_GAP_MIN      = 0.005  # gap positif minimum (spot encore au-dessus oracle figé)
 SHADOW_DOWN_DELTA_MIN    = 0.010  # |delta négatif| minimum (oracle descend de façon nette)
-ORACLE_WINDOW_START = 45    # v12.9 — élargi T-25→T-45 (demande user 17/06)    # Fenêtre normale: T-45s→T-10s
-ORACLE_WINDOW_END   = 10    # v12.9 — élargi T-5→T-10     # T-10s = nouveau dernier moment sûr
+ORACLE_WINDOW_START = 45    # v12.9 — élargi T-25→T-45 (demande user 17/06)    # Fenêtre normale: T-45s→T-5s
+ORACLE_WINDOW_END   = 5     # v12.9 — élargi T-10→T-5 (demande user 18/06) — capte le dernier sursaut. ⚠️ risque: latence Polygon 2-5s peut empêcher le fill à temps
 # ✅ v10.32 — Mode T-10s (source: github.com/Archetapp — T-10s "direction quasi lockée")
 ORACLE_ULTRA_WINDOW = 12    # Passe ultra-précise si T-12s→T-6s ET EV exceptionnelle
 ORACLE_ULTRA_EV_MIN = 0.05  # EV min pour passe ultra (moins strict car WR > 95% à T-10s)
@@ -705,6 +705,29 @@ class PolyClient:
                         return float((await r.json()).get("price",0.5))
         except: pass
         return 0.5
+
+    async def get_recent_trades(self, token_id, limit=20):
+        """✅ v12.9 — Order flow: derniers trades réels sur le marché Polymarket (pas le spot Binance).
+        Retourne une liste de dicts {price, size, side, ts}. Permet de voir si du smart money entre
+        juste avant la résolution. Lecture seule, best-effort (retourne [] si indisponible)."""
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get(f"{POLY_HOST}/trades", params={"market": token_id, "limit": limit},
+                                 timeout=aiohttp.ClientTimeout(total=5)) as r:
+                    if r.status==200:
+                        data = await r.json()
+                        trades = data if isinstance(data, list) else data.get("history", data.get("trades", []))
+                        out=[]
+                        for t in trades[:limit]:
+                            if not isinstance(t, dict): continue
+                            out.append({"price": float(t.get("price",0) or 0),
+                                        "size": float(t.get("size",0) or 0),
+                                        "side": t.get("side","") or t.get("taker_side",""),
+                                        "ts": t.get("timestamp", t.get("match_time",0))})
+                        return out
+        except Exception as e:
+            log.debug(f"get_recent_trades: {e}")
+        return []
 
     async def place_order(self, token_id, amount_usdc, ref_price, side="BUY"):
         """
@@ -2311,6 +2334,28 @@ def _resolve_pending_passes():
         log.debug(f"resolve_passes: {e}")
 
 
+def compute_brier_score(trades):
+    """✅ v12.9 — Brier score: mesure la CALIBRATION de nos probabilités estimées vs résultats réels.
+    BS = moyenne de (p_estimée - outcome)², où outcome = 1 si WIN, 0 si LOSS.
+    Standard utilisé par Metaculus/Good Judgment. Interprétation:
+      < 0.20 = bien calibré (edge réel, pas chance)  | ~0.25 = aléatoire (proba = du vent)  | > 0.25 = pire que le hasard
+    Un prédicteur qui dit toujours 50% obtient exactement 0.25. Donc battre 0.25 = avoir une vraie info.
+    Retourne (brier, n, avg_conf, realized_wr) ou None si pas assez de données."""
+    resolved = [t for t in trades if t.get("result") in ("WIN","LOSS") and isinstance(t.get("conf"), (int,float))]
+    if len(resolved) < 5:
+        return None
+    total = 0.0; conf_sum = 0.0; wins = 0
+    for t in resolved:
+        p = max(0.0, min(1.0, float(t["conf"])))
+        outcome = 1.0 if t["result"] == "WIN" else 0.0
+        total += (p - outcome) ** 2
+        conf_sum += p
+        wins += int(t["result"] == "WIN")
+    n = len(resolved)
+    return {"brier": round(total/n, 4), "n": n,
+            "avg_conf": round(conf_sum/n, 3), "realized_wr": round(wins/n, 3)}
+
+
 def _record_slot(asset, slot_start, open_px, close_px, prices_deque):
     """✅ v12.9 — Enregistre UN slot résolu avec ses conditions + résultat réel.
     Résultat selon la règle officielle Polymarket: UP si close ≥ open (source Chainlink), sinon DOWN.
@@ -2339,10 +2384,22 @@ def _record_slot(asset, slot_start, open_px, close_px, prices_deque):
         ob_map = {"BTC": getattr(st,"ob_imbalance",0), "ETH": getattr(st,"eth_ob_imbalance",0),
                   "SOL": getattr(st,"sol_ob_imbalance",0), "XRP": getattr(st,"xrp_ob_imbalance",0)}
         ob_imb = ob_map.get(asset, 0)
+        # ✅ v12.9 — spread + profondeur $ (nouveaux outils marché)
+        spr_map = {"BTC": getattr(st,"ob_spread",0), "ETH": getattr(st,"eth_ob_spread",0),
+                   "SOL": getattr(st,"sol_ob_spread",0), "XRP": getattr(st,"xrp_ob_spread",0)}
+        dep_map = {"BTC": getattr(st,"ob_depth",0), "ETH": getattr(st,"eth_ob_depth",0),
+                   "SOL": getattr(st,"sol_ob_depth",0), "XRP": getattr(st,"xrp_ob_depth",0)}
+        # ✅ v12.9 — microprice signal + OFI (mode mesure)
+        micro_map = {"BTC": getattr(st,"ob_micro_signal",0), "ETH": getattr(st,"eth_ob_micro_signal",0),
+                     "SOL": getattr(st,"sol_ob_micro_signal",0), "XRP": getattr(st,"xrp_ob_micro_signal",0)}
+        ofi_map = {"BTC": getattr(st,"ob_ofi",0), "ETH": getattr(st,"eth_ob_ofi",0),
+                   "SOL": getattr(st,"sol_ob_ofi",0), "XRP": getattr(st,"xrp_ob_ofi",0)}
         st.slot_records.append({
             "asset": asset, "slot": slot_start, "open": open_px, "close": close_px,
             "result": result, "delta": round(delta_pct, 4), "rsi": round(rsi, 1),
             "macd": round(macd_hist, 5), "dual": dual, "regime": regime, "ob": round(ob_imb, 3),
+            "spread": round(spr_map.get(asset,0),4), "depth": round(dep_map.get(asset,0),2),
+            "micro": round(micro_map.get(asset,0),4), "ofi": round(ofi_map.get(asset,0),2),
             "session": sess, "ts": int(time.time())})
         if len(st.slot_records) > 5000:
             st.slot_records = st.slot_records[-5000:]
@@ -3030,20 +3087,54 @@ async def ws_clob_loop(asset_id_up: str):
                                 if etype not in ("book","price_change","tick_size_change"): continue
                                 bids = m.get("bids") or []; asks = m.get("asks") or []
                                 bid_vol = ask_vol = 0.0
+                                # ✅ v12.9 — capture spread + profondeur $ + microprice + OFI
+                                best_bid = 0.0; best_ask = 0.0; depth_usd = 0.0
+                                best_bid_vol = 0.0; best_ask_vol = 0.0
                                 for b in bids:
                                     try:
-                                        if isinstance(b,dict): bid_vol+=float(b.get("size",0))
-                                        elif isinstance(b,(list,tuple)) and len(b)>=2: bid_vol+=float(b[1])
+                                        if isinstance(b,dict): bp=float(b.get("price",0)); bs=float(b.get("size",0))
+                                        elif isinstance(b,(list,tuple)) and len(b)>=2: bp=float(b[0]); bs=float(b[1])
+                                        else: continue
+                                        bid_vol+=bs; depth_usd+=bp*bs
+                                        if bp>best_bid: best_bid=bp; best_bid_vol=bs
                                     except: pass
                                 for a in asks:
                                     try:
-                                        if isinstance(a,dict): ask_vol+=float(a.get("size",0))
-                                        elif isinstance(a,(list,tuple)) and len(a)>=2: ask_vol+=float(a[1])
+                                        if isinstance(a,dict): ap=float(a.get("price",0)); asz=float(a.get("size",0))
+                                        elif isinstance(a,(list,tuple)) and len(a)>=2: ap=float(a[0]); asz=float(a[1])
+                                        else: continue
+                                        ask_vol+=asz; depth_usd+=ap*asz
+                                        if best_ask==0.0 or ap<best_ask: best_ask=ap; best_ask_vol=asz
                                     except: pass
                                 total = bid_vol + ask_vol
                                 if total > 0:
                                     st.ob_imbalance = round((bid_vol-ask_vol)/total,3)
                                     st.ob_ts = time.time()
+                                    st.ob_spread = round(best_ask-best_bid,4) if (best_bid>0 and best_ask>0) else 0.0
+                                    st.ob_depth = round(depth_usd,2)
+                                    # ✅ v12.9 — MICROPRICE (Stoikov, mode mesure): weighted mid pondéré par l'imbalance top-of-book.
+                                    # microprice = I×Pa + (1-I)×Pb, où I = Qb/(Qb+Qa). Penche vers le côté lourd du carnet.
+                                    tb = best_bid_vol + best_ask_vol
+                                    if best_bid>0 and best_ask>0 and tb>0:
+                                        I = best_bid_vol / tb
+                                        st.ob_microprice = round(I*best_ask + (1-I)*best_bid, 4)
+                                        mid = (best_bid+best_ask)/2
+                                        # signal microprice: >0 penche UP (microprice au-dessus du mid), <0 penche DOWN
+                                        st.ob_micro_signal = round(st.ob_microprice - mid, 4)
+                                    # ✅ v12.9 — OFI (Order Flow Imbalance, mode mesure): variation NETTE du top-of-book vs tick précédent.
+                                    prev = getattr(st, "ob_prev_bbo", None)
+                                    if prev and best_bid>0 and best_ask>0:
+                                        pbb, pbbv, pba, pbav = prev
+                                        # OFI standard: +ΔQb si bid monte/grossit, -ΔQa si ask monte/grossit
+                                        ofi = 0.0
+                                        if best_bid > pbb: ofi += best_bid_vol
+                                        elif best_bid == pbb: ofi += (best_bid_vol - pbbv)
+                                        else: ofi -= pbbv
+                                        if best_ask < pba: ofi -= best_ask_vol
+                                        elif best_ask == pba: ofi -= (best_ask_vol - pbav)
+                                        else: ofi += pbav
+                                        st.ob_ofi = round(ofi, 2)
+                                    st.ob_prev_bbo = (best_bid, best_bid_vol, best_ask, best_ask_vol)
                         except Exception as pe: log.debug(f"CLOB BTC parse: {pe}")
                     elif msg.type in (aiohttp.WSMsgType.CLOSED,aiohttp.WSMsgType.ERROR): break
     except Exception as e: log.warning(f"WS CLOB BTC: {e}")
@@ -3072,21 +3163,58 @@ async def ws_clob_loop_asset(asset_id_up: str, asset: str):
                                 if etype not in ("book","price_change","tick_size_change"): continue
                                 bids = m.get("bids") or []; asks = m.get("asks") or []
                                 bid_vol = ask_vol = 0.0
+                                # ✅ v12.9 — spread + profondeur $ + microprice + OFI (ETH/SOL)
+                                best_bid = 0.0; best_ask = 0.0; depth_usd = 0.0
+                                best_bid_vol = 0.0; best_ask_vol = 0.0
                                 for b in bids:
                                     try:
-                                        if isinstance(b,dict): bid_vol+=float(b.get("size",0))
-                                        elif isinstance(b,(list,tuple)) and len(b)>=2: bid_vol+=float(b[1])
+                                        if isinstance(b,dict): bp=float(b.get("price",0)); bs=float(b.get("size",0))
+                                        elif isinstance(b,(list,tuple)) and len(b)>=2: bp=float(b[0]); bs=float(b[1])
+                                        else: continue
+                                        bid_vol+=bs; depth_usd+=bp*bs
+                                        if bp>best_bid: best_bid=bp; best_bid_vol=bs
                                     except: pass
                                 for a in asks:
                                     try:
-                                        if isinstance(a,dict): ask_vol+=float(a.get("size",0))
-                                        elif isinstance(a,(list,tuple)) and len(a)>=2: ask_vol+=float(a[1])
+                                        if isinstance(a,dict): ap=float(a.get("price",0)); asz=float(a.get("size",0))
+                                        elif isinstance(a,(list,tuple)) and len(a)>=2: ap=float(a[0]); asz=float(a[1])
+                                        else: continue
+                                        ask_vol+=asz; depth_usd+=ap*asz
+                                        if best_ask==0.0 or ap<best_ask: best_ask=ap; best_ask_vol=asz
                                     except: pass
                                 total = bid_vol + ask_vol
                                 if total > 0:
                                     imb = round((bid_vol-ask_vol)/total,3)
-                                    if asset=="ETH": st.eth_ob_imbalance=imb; st.eth_ob_ts=time.time()
-                                    else: st.sol_ob_imbalance=imb; st.sol_ob_ts=time.time()
+                                    spr = round(best_ask-best_bid,4) if (best_bid>0 and best_ask>0) else 0.0
+                                    dep = round(depth_usd,2)
+                                    # microprice + signal
+                                    micro_sig = 0.0
+                                    tb = best_bid_vol + best_ask_vol
+                                    if best_bid>0 and best_ask>0 and tb>0:
+                                        I = best_bid_vol / tb
+                                        micro = I*best_ask + (1-I)*best_bid
+                                        micro_sig = round(micro - (best_bid+best_ask)/2, 4)
+                                    # OFI vs tick précédent (stocké par asset)
+                                    ofi = 0.0
+                                    prev_attr = "eth_ob_prev_bbo" if asset=="ETH" else "sol_ob_prev_bbo"
+                                    prev = getattr(st, prev_attr, None)
+                                    if prev and best_bid>0 and best_ask>0:
+                                        pbb, pbbv, pba, pbav = prev
+                                        if best_bid > pbb: ofi += best_bid_vol
+                                        elif best_bid == pbb: ofi += (best_bid_vol - pbbv)
+                                        else: ofi -= pbbv
+                                        if best_ask < pba: ofi -= best_ask_vol
+                                        elif best_ask == pba: ofi -= (best_ask_vol - pbav)
+                                        else: ofi += pbav
+                                        ofi = round(ofi, 2)
+                                    if best_bid>0 and best_ask>0:
+                                        setattr(st, prev_attr, (best_bid, best_bid_vol, best_ask, best_ask_vol))
+                                    if asset=="ETH":
+                                        st.eth_ob_imbalance=imb; st.eth_ob_ts=time.time(); st.eth_ob_spread=spr; st.eth_ob_depth=dep
+                                        st.eth_ob_micro_signal=micro_sig; st.eth_ob_ofi=ofi
+                                    else:
+                                        st.sol_ob_imbalance=imb; st.sol_ob_ts=time.time(); st.sol_ob_spread=spr; st.sol_ob_depth=dep
+                                        st.sol_ob_micro_signal=micro_sig; st.sol_ob_ofi=ofi
                         except Exception as pe: log.debug(f"CLOB {asset} parse: {pe}")
                     elif msg.type in (aiohttp.WSMsgType.CLOSED,aiohttp.WSMsgType.ERROR): break
     except Exception as e: log.warning(f"WS CLOB {asset}: {e}")
@@ -3286,8 +3414,8 @@ async def job_oracle_lag_asset(context, asset:str):
     now = time.time()
     cur_slot = int(now//300)*300
     slot_remaining = cur_slot+300-now
-    win_start = 45  # v12.9 — élargi uniformément à T-45s pour BTC/ETH/SOL/XRP (demande user 17/06)
-    if slot_remaining > win_start or slot_remaining < 10: return
+    win_start = ORACLE_WINDOW_START  # v12.9 — T-45s uniforme BTC/ETH/SOL/XRP
+    if slot_remaining > win_start or slot_remaining < ORACLE_WINDOW_END: return  # v12.9 — END T-5s (demande user 18/06)
     if asset=="ETH":
         spot=st.eth_price; spot_ts=st.eth_ts; oracle=st.eth_oracle_price
         oracle_ts=st.eth_oracle_ts; slot_open=st.eth_oracle_slot_open
@@ -4355,6 +4483,16 @@ async def job_haiku_analysis(context):
             obb=[r for r in recs if r.get("ob",0)>0.15]; obs=[r for r in recs if r.get("ob",0)<-0.15]
             if len(obb)>=10: p,nn=_upr(obb); parts.append(f"OB-acheteurs→UP {p:.0f}% (n={nn})")
             if len(obs)>=10: p,nn=_upr(obs); parts.append(f"OB-vendeurs→UP {p:.0f}% (n={nn})")
+            spr_v=[r.get("spread",0) for r in recs if r.get("spread",0)>0]
+            dep_v=[r.get("depth",0) for r in recs if r.get("depth",0)>0]
+            if spr_v: parts.append(f"spread moyen {sum(spr_v)/len(spr_v)*100:.1f}¢ (large=EV réel pire que calculé)")
+            if dep_v: parts.append(f"profondeur moyenne {sum(dep_v)/len(dep_v):.0f}$ (faible=exécution difficile)")
+            mu=[r for r in recs if r.get("micro",0)>0.002]; mdn=[r for r in recs if r.get("micro",0)<-0.002]
+            if len(mu)>=10: p,nn=_upr(mu); parts.append(f"microprice↑→UP {p:.0f}% (n={nn})")
+            if len(mdn)>=10: p,nn=_upr(mdn); parts.append(f"microprice↓→UP {p:.0f}% (n={nn})")
+            ofp=[r for r in recs if r.get("ofi",0)>0]; ofn=[r for r in recs if r.get("ofi",0)<0]
+            if len(ofp)>=10: p,nn=_upr(ofp); parts.append(f"OFI+→UP {p:.0f}% (n={nn})")
+            if len(ofn)>=10: p,nn=_upr(ofn); parts.append(f"OFI-→UP {p:.0f}% (n={nn})")
             slot_rec_note = ("\n📊 SLOT RECORDER (tous slots résolus, oracle Chainlink, INDÉPENDANT du trading — "
                              "vérité terrain pour la valeur prédictive): " + " | ".join(parts) +
                              ". Un indicateur n'a de valeur prédictive que s'il s'écarte nettement de 50% sur n≥100. "
@@ -4452,6 +4590,16 @@ Trades réels ({len(real_trades)} total | WR:{wr:.0f}% | PnL:{pnl:+.2f}$):
     if avg_win == 0: avg_win = round(avg_bet * 0.45, 2)  # estimation si pas de trades
     if avg_loss == 0: avg_loss = round(avg_bet * 0.85, 2)
 
+    # ✅ v12.9 — Note Brier pour Sonnet (calibration de nos probabilités)
+    brier_note = ""
+    _bs = compute_brier_score(st.trades)
+    if _bs:
+        cal = "bien calibré" if _bs["brier"]<0.20 else ("limite/aléatoire" if _bs["brier"]<=0.25 else "MAL calibré")
+        brier_note = (f"\n- 🎯 BRIER SCORE: {_bs['brier']} ({cal}). Confiance moyenne annoncée {_bs['avg_conf']*100:.0f}% "
+                      f"vs WR réel {_bs['realized_wr']*100:.0f}% sur n={_bs['n']}. "
+                      f"Si Brier>0.25 ou si conf>>WR réel, nos probabilités sont surestimées → le Kelly sur-mise et l'EV est faussé. "
+                      f"Dans ce cas, recommande de RÉDUIRE les probabilités estimées (p_conf) plutôt que d'assouplir des filtres.")
+
     prompt = f"""Tu es un expert en trading algorithmique sur Polymarket (marchés prédiction crypto 5min).
 Analyse les skips d'un bot oracle lag v{BOT_VERSION} — {version_note}.
 Session actuelle: {session} | {btc_move} | {regime_note}
@@ -4460,10 +4608,10 @@ STRATÉGIE: Le bot exploite le lag entre Chainlink (oracle Polymarket) et le pri
 Il achète le token UP ou DOWN avant que le marché reprices l'oracle.
 
 PARAMÈTRES ACTUELS:
-- BTC: gap≥0.025% | T-45s→T-10s
-- ETH: gap≥0.020% | T-45s→T-10s
-- SOL: gap≥0.020% | T-45s→T-10s
-- XRP: gap≥0.025% | T-45s→T-10s
+- BTC: gap≥0.025% | T-45s→T-5s
+- ETH: gap≥0.020% | T-45s→T-5s
+- SOL: gap≥0.020% | T-45s→T-5s
+- XRP: gap≥0.025% | T-45s→T-5s
 - MOMENTUM (BTC/ETH/SOL/XRP): ret60s≥0.30% | T-150s→T-60s | tok 0.55$-0.65$ | filtre trend macro 10min (bloque si tendance 10min contraire ≥0.10%, source: étude live ayant réduit pertes -93%→-13% avec ce filtre) | Kelly dédié 1-3% BR (2ème fenêtre indépendante). Extension ETH/SOL/XRP NOUVELLE (17/06) — surveiller si ces assets, documentés plus bruités à court terme, performent moins bien que BTC.
 - MEAN-REVERSION (BTC/ETH/SOL/XRP): Bollinger Bandwidth≤0.12% (régime squeeze) | parie contre un spike (prix hors bandes 2σ) | tok 0.51$-0.70$ | Kelly dédié 1-3% BR (3ème fenêtre, même T-150s→T-60s, régime complémentaire au momentum — squeeze vs expansion). Stratégie NOUVELLE, seuils à calibrer avec données réelles. Extension ETH/SOL/XRP NOUVELLE (17/06).
 - CONFLUENCE (BTC/ETH/SOL/XRP, 4ème stratégie /conf): TDS = oracle_score(gap≥0.025%, fort≥0.060%) × setup_score(mean-rev ou momentum, UNIQUEMENT si aligné avec le biais oracle) × (1-noise_penalty si chop détecté) | seuil TDS≥0.35 | tok 0.52$-0.72$ | Kelly dédié 1-3% BR avec SIZING DYNAMIQUE (confidence 0.7x à TDS=seuil → 1.3x à TDS=1.0, toujours capé 1-3% BR) | même fenêtre T-150s→T-60s. Poids adaptatifs MR/momentum ajustés UNIQUEMENT après ≥20 trades par branche (neutres sinon — anti-overfitting). Stratégie TRÈS NOUVELLE (17/06), tous les seuils sont des points de départ raisonnés à calibrer en priorité avec les premières données réelles.
@@ -4486,11 +4634,12 @@ CONTEXTE IMPORTANT:
 - Gain moyen estimé par WIN: ~{avg_win:.2f}$ | Perte moyenne par LOSS: ~{avg_loss:.2f}$
 - Le bot a eu très peu/pas de trades réels récemment. CAUSE IMPORTANTE: un bug get_market_by_slug (endpoints /events?slug au lieu de /events/slug/) empêchait ETH/SOL/XRP (et parfois BTC) de trouver leur marché → trades tués en silence, corrigé le 18/06. Donc une partie du "0 trade" était TECHNIQUE, pas un excès de filtrage. Ne conclus PAS hâtivement que les filtres sont trop stricts: vérifie d'abord via le SLOT RECORDER si les conditions avaient une vraie valeur prédictive.
 - Objectif prioritaire: identifier des configurations qui AURAIENT dû trader et gagner
-- Token max actuel: {ORACLE_TOKEN_MAX}$ | EV min: {int(ORACLE_EDGE_MIN_BTC*100)}% (BTC oracle lag) / {int(ORACLE_EDGE_MIN*100)}% (autres) | votes min: 2/5
+- Token max actuel: {ORACLE_TOKEN_MAX}$ | EV min: {int(ORACLE_EDGE_MIN_BTC*100)}% (BTC oracle lag) / {int(ORACLE_EDGE_MIN*100)}% (autres) | votes min: 2/5{brier_note}
 - {session_note}
 - Mécanisme SMT (ETH/SOL uniquement): quand BTC et ETH/SOL divergent de ≥0.025% sur 15s, le laggard tend à rattraper (corrélation ~0.9). Si tu vois "smt=" dans les données, c'est ce signal de divergence cross-asset — facteur supplémentaire à considérer, pas encore pleinement exploité historiquement (collecte en cours).
 - 🌑 SHADOW DOWN (filter=shadow_down): signaux DOWN "fantômes" en mode LOG-ONLY (aucun trade réel). Ils capturent le cas gap+/delta- persistant (marché baissier, oracle figé au-dessus du spot tombant) SANS chute brutale — un cas que les 4 stratégies ne tradent jamais actuellement. Question clé à trancher: ces DOWN auraient-ils GAGNÉ? Si shadow_down montre un WR≥58% sur n≥30 hors d'une seule session, c'est un EDGE réel à activer. Si WR≤48%, c'est un piège (mean-reversion: le spot rebondit au lieu de continuer à tomber) → garder désactivé. ATTENTION: ne te laisse pas piéger par un WR élevé issu d'une seule session 100% baissière (cf. règle anti-biais ci-dessous).
 - 🔀 DUAL MODEL (champ "dual" dans les features = UP/DOWN/None): inspiré des papiers CNN-LSTM qui entraînent des modèles UP et DOWN séparés. On calcule up_score et down_score indépendamment (RSI, EMA9/21, MACD, momentum 3min) au lieu d'un score symétrique. dual = la direction qui domine (marge ≥1.0). MODE MESURE uniquement: ne change AUCUNE décision pour l'instant. Si tu vois que "dual" prédit la direction gagnante nettement mieux que les votes actuels (≥58% sur n≥30), signale-le comme piste d'activation. MACD vient d'être ajouté aux votes TA (top-feature ML avec RSI) — son impact se mesure dans ta_vote.
+- 🎯 MICROPRICE (champ "micro") & 🌊 OFI (champ "ofi"): microstructure du carnet Polymarket, MODE MESURE. Le microprice (Stoikov) est le mid pondéré par l'imbalance top-of-book — la littérature (arxiv 2026) le donne meilleur prédicteur que l'imbalance brute, SURTOUT sur gros ticks comme Polymarket. micro>0 penche UP, <0 penche DOWN. L'OFI (Order Flow Imbalance) mesure la variation NETTE du top-of-book entre deux ticks (flux dynamique, pas photo statique). Question: micro et OFI prédisent-ils mieux que l'OB imbalance simple (déjà à ~62% UP côté acheteur)? Si micro↑→UP ou OFI+→UP dépassent nettement 55% sur n≥100 ET sur plusieurs sessions, ce sont des candidats d'activation. ATTENTION au biais directionnel de session (un signal qui "marche" en marché baissier peut être un artefact — cf. dual=DOWN qui s'est effondré de 68% à 50% en passant baissier→haussier).
 
 ⚠️ RÈGLE ANTI-BIAIS OBLIGATOIRE:
 Si une session représente ≥60% des données (ex: nuit calme ASIA_EARLY ou forte tendance directionnelle),
@@ -4560,7 +4709,7 @@ async def cmd_learn(update,context):
     lines.append(f"📐 *Seuils actuels:*")
     lines.append(f"  delta≥`{ORACLE_ENTRY_DELTA:.3f}%` | gap BTC≥`0.025%` | gap ETH/SOL≥`0.020%` | gap XRP≥`0.025%`")
     lines.append(f"  token:`{ORACLE_TOKEN_MIN:.2f}$`-`{ORACLE_TOKEN_MAX:.2f}$`(BTC) `0.95$`(ETH/XRP/SOL) | EV≥`{ORACLE_EDGE_MIN_BTC*100:.0f}%`(BTC)/`{ORACLE_EDGE_MIN*100:.0f}%`(autres) | votes≥2(dir)")
-    lines.append(f"  BTC: T-45s→T-10s | ETH: T-45s→T-10s | SOL: T-45s→T-10s | XRP: T-45s→T-10s")
+    lines.append(f"  BTC: T-45s→T-5s | ETH: T-45s→T-5s | SOL: T-45s→T-5s | XRP: T-45s→T-5s")
 
     # ── Trades réels ──
     real=[t for t in merged_trades if not t.get("paper")]
@@ -4575,6 +4724,17 @@ async def cmd_learn(update,context):
         wins_24h=sum(1 for t in recent if t.get("result")=="WIN")
         lines.append(f"\n💰 *Trades réels:* {len(real)} | WR:`{wr_r:.0f}%` | PnL:`{pnl_r:+.2f}$`")
         lines.append(f"  Gain moy:`+{avg_win:.2f}$` | Perte moy:`{avg_loss:.2f}$` | R:R:`{rr:.2f}`")
+        # ✅ v12.9 — Brier score: nos probabilités sont-elles calibrées?
+        bs = compute_brier_score(real)
+        if bs:
+            if bs["brier"] < 0.20: verdict="🟢 calibré (edge réel)"
+            elif bs["brier"] <= 0.25: verdict="🟡 limite (~aléatoire)"
+            else: verdict="🔴 mal calibré (proba peu fiable)"
+            lines.append(f"  🎯 Brier:`{bs['brier']}` {verdict}")
+            lines.append(f"     conf moy:`{bs['avg_conf']*100:.0f}%` vs WR réel:`{bs['realized_wr']*100:.0f}%` (n={bs['n']})")
+            gap_cal = bs['avg_conf'] - bs['realized_wr']
+            if abs(gap_cal) > 0.10:
+                lines.append(f"     ⚠️ surestimation `{gap_cal*100:+.0f}pts` — Kelly sur-mise, prudence")
         if recent:
             pnl_24h=sum(t.get("pnl",0) for t in recent)
             lines.append(f"  📅 24h: {len(recent)} trades | WR:`{wins_24h/len(recent)*100:.0f}%` | PnL:`{pnl_24h:+.2f}$`")
@@ -4806,12 +4966,13 @@ async def cmd_run(update,context):
     await update.message.reply_text(
         f"🚀 *Bot v{BOT_VERSION} démarré !*\nMode:*{'📄 PAPER' if st.paper_mode else '💰 RÉEL'}*\n"
         f"Session:`{sess['session']}` | Seuils: score≥`{min_score}` mom≥`{min_mom}`\n"
-        f"/oracle BTC T-45→T-10s | ETH T-45→T-10s | SOL T-45→T-10s | XRP T-45→T-10s\n"
+        f"/oracle BTC T-45→T-5s | ETH T-45→T-5s | SOL T-45→T-5s | XRP T-45→T-5s\n"
         f"/momentum BTC/ETH/SOL/XRP T-150s→T-60s | move≥0.30%/60s | tok 0.55$-0.65$ | filtre trend10m | Kelly 1-3%\n"
         f"/meanrev BTC/ETH/SOL/XRP T-150s→T-60s | squeeze BW≤0.12% | tok 0.51$-0.70$ | Kelly 1-3%\n"
         f"/conf BTC/ETH/SOL/XRP T-150s→T-60s | TDS=oracle×setup×(1-bruit)≥0.35 | tok 0.52$-0.72$ | Kelly 1-3% dynamique\n"
         f"🌑 SHADOW DOWN (log-only): mesure les DOWN ratés en marché baissier (gap+/delta- persistant). 0 trade réel — voir /passes et /learn\n"
         f"📊 /slots: journal de TOUS les slots résolus (UP/DOWN réel + conditions) — indépendant du trading, pour analyse prédictive\n"
+        f"🌊 /flow: order flow temps réel (derniers trades Polymarket des 4 cryptos, détecte le smart money)\n"
         f"  gap BTC/XRP≥2.5bps | ETH/SOL≥2.0bps | delta≥{int(ORACLE_ENTRY_DELTA*10000)}bps | Token≤{ORACLE_TOKEN_MAX}$(BTC)/0.95$(ETH/XRP/SOL) | EV≥{int(ORACLE_EDGE_MIN_BTC*100)}%(BTC)/{int(ORACLE_EDGE_MIN*100)}%(ETH/SOL/XRP)\n"
         f"BR:`{st.bankroll:.2f}$` | ROI:`{roi()}`\n"
         f"📊 `{ob_txt}` | 💸 `{liq_txt}`\n"
@@ -5803,6 +5964,18 @@ async def cmd_slots(update,context):
         obv=ob_map.get(a,0)
         if obv>0.15: votes_up+=1; sig_txt.append(f"OB↑{obv:.2f}")
         elif obv<-0.15: votes_dn+=1; sig_txt.append(f"OB↓{obv:.2f}")
+        # 4) microprice signal (penche vers le côté lourd du carnet, pondéré spread)
+        micro_map={"BTC":getattr(st,"ob_micro_signal",0),"ETH":getattr(st,"eth_ob_micro_signal",0),
+                   "SOL":getattr(st,"sol_ob_micro_signal",0),"XRP":getattr(st,"xrp_ob_micro_signal",0)}
+        msig=micro_map.get(a,0)
+        if msig>0.002: votes_up+=1; sig_txt.append("micro↑")
+        elif msig<-0.002: votes_dn+=1; sig_txt.append("micro↓")
+        # 5) OFI (flux dynamique)
+        ofi_map={"BTC":getattr(st,"ob_ofi",0),"ETH":getattr(st,"eth_ob_ofi",0),
+                 "SOL":getattr(st,"sol_ob_ofi",0),"XRP":getattr(st,"xrp_ob_ofi",0)}
+        ofiv=ofi_map.get(a,0)
+        if ofiv>0: votes_up+=1; sig_txt.append("OFI+")
+        elif ofiv<0: votes_dn+=1; sig_txt.append("OFI-")
         # Verdict
         if votes_up>votes_dn: verdict=f"🟢 UP ({votes_up}/{votes_up+votes_dn})"
         elif votes_dn>votes_up: verdict=f"🔴 DOWN ({votes_dn}/{votes_up+votes_dn})"
@@ -5865,6 +6038,27 @@ async def cmd_slots(update,context):
     ob_sell=[r for r in recs if r.get("ob",0)<-0.15]
     if ob_buy: p,nn=wr_up(ob_buy); lines.append(f"  📖 OB acheteurs (>0.15): `{nn}` | UP `{p:.0f}%`")
     if ob_sell: p,nn=wr_up(ob_sell); lines.append(f"  📖 OB vendeurs (<-0.15): `{nn}` | UP `{p:.0f}%`")
+    # ✅ v12.9 — Microprice signal: penche-t-il vers la bonne direction? (meilleur que l'imbalance brute selon la littérature)
+    micro_up=[r for r in recs if r.get("micro",0)>0.002]
+    micro_dn=[r for r in recs if r.get("micro",0)<-0.002]
+    if micro_up: p,nn=wr_up(micro_up); lines.append(f"  🎯 microprice↑ (>0.002): `{nn}` | UP `{p:.0f}%`")
+    if micro_dn: p,nn=wr_up(micro_dn); lines.append(f"  🎯 microprice↓ (<-0.002): `{nn}` | UP `{p:.0f}%`")
+    # ✅ v12.9 — OFI (flux dynamique du carnet): >0 pression acheteuse, <0 pression vendeuse
+    ofi_pos=[r for r in recs if r.get("ofi",0)>0]
+    ofi_neg=[r for r in recs if r.get("ofi",0)<0]
+    if ofi_pos: p,nn=wr_up(ofi_pos); lines.append(f"  🌊 OFI>0 (flux acheteur): `{nn}` | UP `{p:.0f}%`")
+    if ofi_neg: p,nn=wr_up(ofi_neg); lines.append(f"  🌊 OFI<0 (flux vendeur): `{nn}` | UP `{p:.0f}%`")
+    # ✅ v12.9 — Spread & profondeur: contexte de liquidité (pas prédictif de direction, mais d'exécution)
+    spr_vals=[r.get("spread",0) for r in recs if r.get("spread",0)>0]
+    dep_vals=[r.get("depth",0) for r in recs if r.get("depth",0)>0]
+    if spr_vals or dep_vals:
+        lines.append("\n*Liquidité (exécution):*")
+        if spr_vals:
+            avg_spr=sum(spr_vals)/len(spr_vals)
+            lines.append(f"  Spread moyen: `{avg_spr*100:.1f}¢` (n={len(spr_vals)}) — large=EV réel pire")
+        if dep_vals:
+            avg_dep=sum(dep_vals)/len(dep_vals)
+            lines.append(f"  Profondeur moyenne: `{avg_dep:.0f}$` (n={len(dep_vals)}) — faible=ordre dur à remplir")
     # Dual model: quand dual=UP, le slot finit-il vraiment UP?
     dual_up=[r for r in recs if r.get("dual")=="UP"]
     dual_dn=[r for r in recs if r.get("dual")=="DOWN"]
@@ -5880,6 +6074,11 @@ async def cmd_slots(update,context):
         if dom[1]/len(recs) >= 0.6:
             sess_safe = dom[0].replace("_"," ")  # éviter que ASIA_LATE casse l'italique Markdown
             lines.append(f"\n⚠️ _{dom[1]/len(recs)*100:.0f}% des slots en session {sess_safe} — biais possible, à confirmer sur d'autres sessions_")
+    # ✅ v12.9 — Brier score sur les trades réels (calibration de nos probabilités)
+    bs_slots = compute_brier_score(st.trades)
+    if bs_slots:
+        v = "🟢 calibré" if bs_slots["brier"]<0.20 else ("🟡 limite" if bs_slots["brier"]<=0.25 else "🔴 mal calibré")
+        lines.append(f"\n🎯 *Brier score:* `{bs_slots['brier']}` {v} (conf `{bs_slots['avg_conf']*100:.0f}%` vs WR `{bs_slots['realized_wr']*100:.0f}%`, n={bs_slots['n']})")
     lines.append(f"\n_Un indicateur n'a de valeur que s'il s'écarte nettement de 50% sur un gros échantillon (n≥100)._")
 
     text = "\n".join(lines)
@@ -5890,6 +6089,41 @@ async def cmd_slots(update,context):
         clean = text.replace("*","").replace("`","").replace("_","")
         if len(clean) > 4000: clean = clean[:4000] + "\n…(tronqué)"
         await update.message.reply_text(clean)
+
+
+async def cmd_flow(update,context):
+    """✅ v12.9 — ORDER FLOW (/flow): derniers trades réels sur le marché Polymarket des 4 cryptos.
+    Montre si du smart money entre (gros trades) et de quel côté, juste avant la résolution.
+    Lecture seule, best-effort. Complète OB imbalance (statique) avec le flux (dynamique)."""
+    if not auth(update): return
+    now=time.time(); cur_slot=int(now//300)*300; slot_rem=300-(now%300)
+    lines=[f"🌊 *ORDER FLOW — marché Polymarket* (T-`{int(slot_rem)}s`)\n━━━━━━━━━━━━━━"]
+    for asset,e in [("BTC","₿"),("ETH","Ξ"),("SOL","◎"),("XRP","✕")]:
+        cfg=_asset_state_attrs(asset)
+        try:
+            market=await poly.get_market_by_slug(f"{cfg['slug']}-{cur_slot}")
+            if not market:
+                lines.append(f"\n{e} {asset}: `marché non trouvé`"); continue
+            trades=await poly.get_recent_trades(market["token_up"], limit=15)
+            if not trades:
+                lines.append(f"\n{e} {asset}: `pas de trades récents`"); continue
+            buy_vol=sum(t["size"] for t in trades if "buy" in str(t["side"]).lower())
+            sell_vol=sum(t["size"] for t in trades if "sell" in str(t["side"]).lower())
+            tot=buy_vol+sell_vol
+            big=max(trades, key=lambda t:t["size"]) if trades else None
+            flow_dir="🟢 acheteur" if buy_vol>sell_vol*1.3 else ("🔴 vendeur" if sell_vol>buy_vol*1.3 else "⚪ équilibré")
+            line=f"\n{e} {asset}: {flow_dir} | {len(trades)} trades"
+            if tot>0: line+=f" | achat `{buy_vol/tot*100:.0f}%`"
+            if big and big["size"]>0: line+=f"\n   gros: `{big['size']:.0f}` @ `{big['price']:.2f}$`"
+            lines.append(line)
+        except Exception as ex:
+            lines.append(f"\n{e} {asset}: `erreur lecture`"); log.debug(f"flow {asset}: {ex}")
+    lines.append("\n_Order flow = trades réels Polymarket (≠ prix spot Binance). Gros trade d'un côté = smart money possible._")
+    text="\n".join(lines)
+    try:
+        await update.message.reply_text(text, parse_mode="Markdown")
+    except Exception:
+        await update.message.reply_text(text.replace("*","").replace("`","").replace("_",""))
 
 
 async def cmd_sessionstats(update,context):
@@ -5997,6 +6231,15 @@ async def cmd_oracle(update,context):
             dual_txt = f"`{dd}`" if dd else "`neutre`"
             ta_line = (f"\n📊 TA BTC | RSI:`{rsi_v:.0f}` | MACD:{macd_emoji}`{mh:+.4f}`\n"
                        f"  🔀 Dual: UP`{us:.1f}` vs DOWN`{ds:.1f}` → {dual_txt}\n")
+            # ✅ v12.9 — spread + profondeur BTC temps réel
+            _spr=getattr(st,"ob_spread",0); _dep=getattr(st,"ob_depth",0)
+            if _spr>0 or _dep>0:
+                ta_line += f"  📖 Spread:`{_spr*100:.1f}¢` | Profondeur:`{_dep:.0f}$`\n"
+            _msig=getattr(st,"ob_micro_signal",0); _ofi=getattr(st,"ob_ofi",0)
+            if _msig!=0 or _ofi!=0:
+                md="↑" if _msig>0 else ("↓" if _msig<0 else "—")
+                od="+" if _ofi>0 else ("-" if _ofi<0 else "0")
+                ta_line += f"  🎯 Microprice:`{md}` ({_msig:+.4f}) | 🌊 OFI:`{od}` ({_ofi:+.1f})\n"
     except Exception: pass
     try:
         await update.message.reply_text(
@@ -6088,7 +6331,7 @@ def main():
         ("balance",cmd_balance),("paper",cmd_paper),("cooldown",cmd_cooldown),("reset",cmd_reset),("resetskips",cmd_resetskips),
         ("setbalance",cmd_setbalance),("backup",cmd_backup),("recap",cmd_recap),("dashboard",cmd_dashboard),
         ("history",cmd_history),("turbo",cmd_turbo),("sell",cmd_sell),("sellcheck",cmd_sellcheck),("fair",cmd_fair),
-        ("backtest",cmd_backtest),("oracle",cmd_oracle),("momentum",cmd_momentum),("meanrev",cmd_mean_reversion),("regime",cmd_regime),("conf",cmd_confluence),("slots",cmd_slots),("sessionstats",cmd_sessionstats),("calib",cmd_calib),("learn",cmd_learn),("revive",cmd_revive),("autotune",cmd_autotune)]:
+        ("backtest",cmd_backtest),("oracle",cmd_oracle),("momentum",cmd_momentum),("meanrev",cmd_mean_reversion),("regime",cmd_regime),("conf",cmd_confluence),("slots",cmd_slots),("flow",cmd_flow),("sessionstats",cmd_sessionstats),("calib",cmd_calib),("learn",cmd_learn),("revive",cmd_revive),("autotune",cmd_autotune)]:
         app.add_handler(CommandHandler(name,handler))
     app.add_handler(CallbackQueryHandler(cb))
     log.info(f"🧠 PolyBot v{BOT_VERSION} démarré")
