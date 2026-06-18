@@ -5807,12 +5807,15 @@ async def cmd_slots(update,context):
 
     recs = list(st.slot_records)
     if not recs:
-        await update.message.reply_text(
-            "\n".join(pred_lines) +
+        msg_empty = ("\n".join(pred_lines) +
             "\n\n📊 *SLOT RECORDER*\n━━━━━━━━━━━━━━\n"
             "Aucun slot résolu enregistré pour l'instant.\n"
-            "_Le journal s'enregistre à chaque bascule de slot (~toutes les 5min par asset). Reviens dans 10-15 min._",
-            parse_mode="Markdown"); return
+            "_Le journal s'enregistre à chaque bascule de slot (~toutes les 5min par asset). Reviens dans 10-15 min._")
+        try:
+            await update.message.reply_text(msg_empty, parse_mode="Markdown")
+        except Exception:
+            await update.message.reply_text(msg_empty.replace("*","").replace("`","").replace("_",""))
+        return
 
     def wr_up(sample):
         n=len(sample)
@@ -5870,10 +5873,18 @@ async def cmd_slots(update,context):
     if sessions:
         dom = max(sessions.items(), key=lambda x:x[1])
         if dom[1]/len(recs) >= 0.6:
-            lines.append(f"\n⚠️ _{dom[1]/len(recs)*100:.0f}% des slots en session {dom[0]} — biais possible, à confirmer sur d'autres sessions_")
+            sess_safe = dom[0].replace("_"," ")  # éviter que ASIA_LATE casse l'italique Markdown
+            lines.append(f"\n⚠️ _{dom[1]/len(recs)*100:.0f}% des slots en session {sess_safe} — biais possible, à confirmer sur d'autres sessions_")
     lines.append(f"\n_Un indicateur n'a de valeur que s'il s'écarte nettement de 50% sur un gros échantillon (n≥100)._")
 
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    text = "\n".join(lines)
+    try:
+        await update.message.reply_text(text, parse_mode="Markdown")
+    except Exception:
+        # Fallback: si le Markdown casse (caractère non apparié) ou message trop long, envoyer en clair
+        clean = text.replace("*","").replace("`","").replace("_","")
+        if len(clean) > 4000: clean = clean[:4000] + "\n…(tronqué)"
+        await update.message.reply_text(clean)
 
 
 async def cmd_sessionstats(update,context):
