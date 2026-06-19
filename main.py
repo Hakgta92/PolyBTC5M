@@ -150,7 +150,7 @@ ORACLE_EDGE_MIN_ALT = 0.10
 # OB vendeur→88% DOWN n=156, sur marché neutre). Trade dans le sens du carnet quand l'imbalance est nette.
 # ⚠️ NON VALIDÉ en exécution réelle (le 73% est mesuré à la résolution, possible look-ahead). Mise mini, surveillance.
 OB_SIGNAL_ENABLED   = True
-OB_SIGNAL_THRESHOLD = 0.15   # |imbalance| minimum pour trader (correspond aux 237 cas mesurés à 73%)
+OB_SIGNAL_THRESHOLD = 0.12   # ✅ v12.9 (18/06) — abaissé 0.15→0.12 (demande user) pour plus de trades. Le filtre EV (3%) bloque naturellement les tokens trop chers, donc la qualité reste protégée
 OB_SIGNAL_TOKEN_MIN = 0.40   # éviter les tokens déjà trop pricés ou trop incertains
 OB_SIGNAL_TOKEN_MAX = 0.75
 OB_SIGNAL_WIN_START = 90      # fenêtre T-90s→T-30s (zone où le pricing se forme selon le tracker timing)
@@ -4260,7 +4260,7 @@ async def job_ob_signal_asset(context, asset):
 
     if token_price < OB_SIGNAL_TOKEN_MIN or token_price > OB_SIGNAL_TOKEN_MAX:
         log_skip(f"{asset} [OB]: token {token_price:.2f}$ hors plage {OB_SIGNAL_TOKEN_MIN}-{OB_SIGNAL_TOKEN_MAX}$", direction,
-                 features={"ob":ob,"filter":"ob_token","asset":asset,"token":token_price}); return
+                 features={"ob":ob,"filter":"ob_token","asset":asset,"token":token_price,"source":"ob_signal"}); return
 
     # Proba estimée: basée sur la force de l'imbalance (calibré sur les 73%/88% observés, capé prudemment)
     p_conf = min(0.72, 0.55 + abs(ob) * 0.30)
@@ -4269,7 +4269,7 @@ async def job_ob_signal_asset(context, asset):
     ev = p_conf * (payout - 1) - (1 - p_conf) - fee
     if ev < OB_SIGNAL_EV_MIN:
         log_skip(f"{asset} [OB]: EV {ev*100:+.1f}%<{OB_SIGNAL_EV_MIN*100:.0f}% (OB={ob:+.2f})", direction,
-                 features={"ob":ob,"filter":"ob_ev","asset":asset,"token":token_price,"ev":ev}); return
+                 features={"ob":ob,"filter":"ob_ev","asset":asset,"token":token_price,"ev":ev,"source":"ob_signal"}); return
 
     amount = kelly_bet(st.bankroll, p_conf, payout, token_price)
     if amount < MIN_BET_USD: return
@@ -4576,8 +4576,9 @@ async def job_haiku_analysis(context):
     mom_p = [p for p in sample if p.get("source")=="momentum"]
     meanrev_p = [p for p in sample if p.get("source")=="meanrev"]
     confluence_p = [p for p in sample if p.get("source")=="confluence"]
-    oracle_p = [p for p in sample if p.get("source") not in ("momentum","meanrev","confluence")]
-    asset_note = f"BTC:{len(btc_p)} ETH:{len(eth_p)} SOL:{len(sol_p)} XRP:{len(xrp_p)} | OracleLag:{len(oracle_p)} Momentum:{len(mom_p)} MeanRev:{len(meanrev_p)} Confluence:{len(confluence_p)}"
+    ob_p = [p for p in sample if p.get("source")=="ob_signal" or p.get("filter","").startswith("ob_")]
+    oracle_p = [p for p in sample if p.get("source") not in ("momentum","meanrev","confluence","ob_signal") and not p.get("filter","").startswith("ob_")]
+    asset_note = f"BTC:{len(btc_p)} ETH:{len(eth_p)} SOL:{len(sol_p)} XRP:{len(xrp_p)} | OracleLag:{len(oracle_p)} Momentum:{len(mom_p)} MeanRev:{len(meanrev_p)} Confluence:{len(confluence_p)} OB:{len(ob_p)}"
 
     # v12.9 — Répartition par session pour détecter un biais de tendance dominante
     from collections import Counter as _Counter
@@ -4770,7 +4771,7 @@ CONTEXTE IMPORTANT:
 - 🌑 SHADOW DOWN (filter=shadow_down): signaux DOWN "fantômes" en mode LOG-ONLY (aucun trade réel). Ils capturent le cas gap+/delta- persistant (marché baissier, oracle figé au-dessus du spot tombant) SANS chute brutale — un cas que les 4 stratégies ne tradent jamais actuellement. Question clé à trancher: ces DOWN auraient-ils GAGNÉ? Si shadow_down montre un WR≥58% sur n≥30 hors d'une seule session, c'est un EDGE réel à activer. Si WR≤48%, c'est un piège (mean-reversion: le spot rebondit au lieu de continuer à tomber) → garder désactivé. ATTENTION: ne te laisse pas piéger par un WR élevé issu d'une seule session 100% baissière (cf. règle anti-biais ci-dessous).
 - 🔀 DUAL MODEL (champ "dual" dans les features = UP/DOWN/None): inspiré des papiers CNN-LSTM qui entraînent des modèles UP et DOWN séparés. On calcule up_score et down_score indépendamment (RSI, EMA9/21, MACD, momentum 3min) au lieu d'un score symétrique. dual = la direction qui domine (marge ≥1.0). MODE MESURE uniquement: ne change AUCUNE décision pour l'instant. Si tu vois que "dual" prédit la direction gagnante nettement mieux que les votes actuels (≥58% sur n≥30), signale-le comme piste d'activation. MACD vient d'être ajouté aux votes TA (top-feature ML avec RSI) — son impact se mesure dans ta_vote.
 - 🎯 MICROPRICE (champ "micro") & 🌊 OFI (champ "ofi"): microstructure du carnet Polymarket, MODE MESURE. Le microprice (Stoikov) est le mid pondéré par l'imbalance top-of-book — la littérature (arxiv 2026) le donne meilleur prédicteur que l'imbalance brute, SURTOUT sur gros ticks comme Polymarket. micro>0 penche UP, <0 penche DOWN. L'OFI (Order Flow Imbalance) mesure la variation NETTE du top-of-book entre deux ticks (flux dynamique, pas photo statique). Question: micro et OFI prédisent-ils mieux que l'OB imbalance simple (déjà à ~62% UP côté acheteur)? Si micro↑→UP ou OFI+→UP dépassent nettement 55% sur n≥100 ET sur plusieurs sessions, ce sont des candidats d'activation. ATTENTION au biais directionnel de session (un signal qui "marche" en marché baissier peut être un artefact — cf. dual=DOWN qui s'est effondré de 68% à 50% en passant baissier→haussier).
-- 📖 STRATÉGIE OB SIGNAL (source="ob_signal", trades RÉELS depuis 18/06): trade dans le sens du carnet quand |imbalance|≥0.15, fenêtre T-90→T-30s, token 0.40-0.75$, mise minimale. Basée sur le slot recorder (OB acheteur→73% UP, vendeur→88% DOWN, n>150 en marché neutre). ⚠️ NON validée en exécution réelle: le 73% est mesuré à la RÉSOLUTION, pas à l'entrée (risque de look-ahead). Surveille ces trades de près: si leur WR réel est nettement < au 73% mesuré, c'est que le signal à l'entrée est plus faible qu'à la résolution (look-ahead confirmé) → recommande de désactiver ou resserrer le seuil. Compare le WR réel ob_signal au 73% théorique.
+- 📖 STRATÉGIE OB SIGNAL (source="ob_signal", trades RÉELS depuis 18/06): trade dans le sens du carnet quand |imbalance|≥0.12, fenêtre T-90→T-30s, token 0.40-0.75$, mise minimale. Basée sur le slot recorder (OB acheteur→73% UP, vendeur→88% DOWN, n>150 en marché neutre — mais mesuré à |OB|>0.15, donc à 0.12 le signal est un peu plus faible). ⚠️ NON validée en exécution réelle: le 73% est mesuré à la RÉSOLUTION, pas à l'entrée (risque de look-ahead). Surveille ces trades de près: si leur WR réel est nettement < au 73% mesuré, c'est que le signal à l'entrée est plus faible qu'à la résolution (look-ahead confirmé) → recommande de désactiver ou resserrer le seuil. Compare le WR réel ob_signal au 73% théorique.
 
 ⚠️ RÈGLE ANTI-BIAIS OBLIGATOIRE:
 Si une session représente ≥60% des données (ex: nuit calme ASIA_EARLY ou forte tendance directionnelle),
