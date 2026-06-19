@@ -4231,6 +4231,9 @@ async def job_ob_signal_asset(context, asset):
     now = time.time()
     cur_slot = int(now // 300) * 300
     slot_remaining = cur_slot + 300 - now
+    if asset == "BTC":
+        in_win = OB_SIGNAL_WIN_END <= slot_remaining <= OB_SIGNAL_WIN_START
+        log.info(f"🔍 OB BTC entrée: T-{int(slot_remaining)}s in_window={in_win} imb={getattr(st,'ob_imbalance',0):+.3f} age={now-getattr(st,'ob_ts',0):.0f}s lastslot={st.last_trade_slot==cur_slot}")
     if not (OB_SIGNAL_WIN_END <= slot_remaining <= OB_SIGNAL_WIN_START): return
 
     # Verrou slot: 1 seul trade par slot par asset, toutes stratégies confondues
@@ -4273,8 +4276,6 @@ async def job_ob_signal_asset(context, asset):
                "ETH": (getattr(st,"eth_ob_imbalance",0), getattr(st,"eth_ob_ts",0)),
                "SOL": (getattr(st,"sol_ob_imbalance",0), getattr(st,"sol_ob_ts",0))}
     ob, ob_ts = ob_data.get(asset, (0,0))
-    if asset == "BTC":
-        log.info(f"🔍 OB BTC diag: imb={ob:+.3f} age={now-ob_ts:.0f}s seuil={OB_SIGNAL_THRESHOLD} ws_actif={hasattr(st,'clob_ws_task') and st.clob_ws_task and not st.clob_ws_task.done()}")
     if now - ob_ts > 30: return  # carnet périmé, on attend des données fraîches
     if abs(ob) < OB_SIGNAL_THRESHOLD: return  # imbalance pas assez nette
 
