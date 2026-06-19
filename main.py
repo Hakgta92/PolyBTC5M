@@ -4252,7 +4252,11 @@ async def job_ob_signal_asset(context, asset):
         log.debug(f"OB signal {asset} market: {ex}"); return
 
     # Lancer/rafraîchir le WS carnet pour l'asset si pas déjà actif sur ce token (SANS return: on lit tout de suite si déjà frais)
-    if asset == "ETH":
+    if asset == "BTC":
+        if asset_up_ob and st.ob_asset_id != asset_up_ob:
+            if hasattr(st,"clob_ws_task") and st.clob_ws_task and not st.clob_ws_task.done(): st.clob_ws_task.cancel()
+            st.clob_ws_task = asyncio.create_task(ws_clob_loop(asset_up_ob))
+    elif asset == "ETH":
         if asset_up_ob and st.eth_ob_asset_id != asset_up_ob:
             if st.eth_clob_ws_task and not st.eth_clob_ws_task.done(): st.eth_clob_ws_task.cancel()
             st.eth_clob_ws_task = asyncio.create_task(ws_clob_loop_asset(asset_up_ob,"ETH"))
