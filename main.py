@@ -4658,11 +4658,20 @@ async def job_haiku_analysis(context):
         btc_t = [t for t in real_trades if t.get("asset","BTC")=="BTC"]
         eth_t = [t for t in real_trades if t.get("asset")=="ETH"]
         sol_t = [t for t in real_trades if t.get("asset")=="SOL"]
+        # ✅ v12.9 — WR par stratégie (dont OB) pour que Sonnet compare le WR OB réel au 73% théorique
+        ob_t = [t for t in real_trades if t.get("source")=="ob_signal"]
+        lag_t = [t for t in real_trades if t.get("source") not in ("momentum","meanrev","confluence","ob_signal")]
+        strat_line = ""
+        if ob_t:
+            wr_ob_real = sum(1 for t in ob_t if t.get('result')=='WIN')/len(ob_t)*100
+            strat_line += f"\n- 📖 OB Signal: {len(ob_t)} trades | WR:{wr_ob_real:.0f}% (à comparer au 73% théorique du slot recorder — si nettement <, look-ahead)"
+        if lag_t:
+            strat_line += f"\n- Oracle lag: {len(lag_t)} trades | WR:{sum(1 for t in lag_t if t.get('result')=='WIN')/len(lag_t)*100:.0f}%"
         trade_summary = f"""
 Trades réels ({len(real_trades)} total | WR:{wr:.0f}% | PnL:{pnl:+.2f}$):
 - BTC: {len(btc_t)} trades | WR:{sum(1 for t in btc_t if t.get('result')=='WIN')/max(1,len(btc_t))*100:.0f}%
 - ETH: {len(eth_t)} trades | WR:{sum(1 for t in eth_t if t.get('result')=='WIN')/max(1,len(eth_t))*100:.0f}%
-- SOL: {len(sol_t)} trades | WR:{sum(1 for t in sol_t if t.get('result')=='WIN')/max(1,len(sol_t))*100:.0f}%"""
+- SOL: {len(sol_t)} trades | WR:{sum(1 for t in sol_t if t.get('result')=='WIN')/max(1,len(sol_t))*100:.0f}%{strat_line}"""
 
     # ── Session et contexte marché ──
     import datetime
@@ -4897,7 +4906,8 @@ async def cmd_learn(update,context):
         mom_trades = [t for t in real if t.get("source")=="momentum"]
         meanrev_trades = [t for t in real if t.get("source")=="meanrev"]
         confluence_trades = [t for t in real if t.get("source")=="confluence"]
-        lag_trades = [t for t in real if t.get("source") not in ("momentum","meanrev","confluence")]
+        ob_trades = [t for t in real if t.get("source")=="ob_signal"]
+        lag_trades = [t for t in real if t.get("source") not in ("momentum","meanrev","confluence","ob_signal")]
         if mom_trades:
             w_m=sum(1 for t in mom_trades if t.get("result")=="WIN")
             pnl_m=sum(t.get("pnl",0) for t in mom_trades)
@@ -4914,6 +4924,17 @@ async def cmd_learn(update,context):
             c_mom=[t for t in confluence_trades if "confluence-momentum" in t.get("reasoning","")]
             if c_mr or c_mom:
                 lines.append(f"     └ MR:{len(c_mr)} (poids {_tds_adaptive_weight('meanrev'):.2f}) | MOM:{len(c_mom)} (poids {_tds_adaptive_weight('momentum'):.2f})")
+        # ✅ v12.9 — trades réels stratégie OB SIGNAL (comparer le WR au 73% théorique pour détecter le look-ahead)
+        if ob_trades:
+            w_ob=sum(1 for t in ob_trades if t.get("result")=="WIN")
+            pnl_ob=sum(t.get("pnl",0) for t in ob_trades)
+            wr_ob=w_ob/len(ob_trades)*100
+            verdict_ob=""
+            if len(ob_trades)>=10:
+                if wr_ob>=65: verdict_ob=" 🟢 tient le 73%"
+                elif wr_ob>=55: verdict_ob=" 🟡 sous le 73% (signal + faible à l'entrée)"
+                else: verdict_ob=" 🔴 look-ahead probable, resserrer/désactiver"
+            lines.append(f"  📖 OB Signal: {len(ob_trades)} trades WR:`{wr_ob:.0f}%` PnL:`{pnl_ob:+.2f}$`{verdict_ob}")
         # ✅ v12.9 — Résumé agrégé régime squeeze/expansion (BTC+ETH+SOL+XRP cumulés, pas de spam /passes)
         total_regime = st.meanrev_regime_squeeze_count + st.meanrev_regime_expansion_count
         if total_regime > 0:
