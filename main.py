@@ -4241,22 +4241,40 @@ async def job_ob_signal_asset(context, asset):
             or getattr(st, cfg["tds_slot"], 0) == cur_slot or getattr(st, oracle_slot_attr, 0) == cur_slot):
         return
 
-    # Lire l'OB imbalance de l'asset
-    ob_map = {"BTC": getattr(st,"ob_imbalance",0), "ETH": getattr(st,"eth_ob_imbalance",0),
-              "SOL": getattr(st,"sol_ob_imbalance",0), "XRP": getattr(st,"xrp_ob_imbalance",0)}
-    ob = ob_map.get(asset, 0)
-    if abs(ob) < OB_SIGNAL_THRESHOLD: return  # imbalance pas assez nette
-
-    direction = "UP" if ob > 0 else "DOWN"
-
-    # Récupérer le marché + token
+    # ✅ v12.9 — OB sur BTC/SOL/ETH: récupérer le marché et s'assurer que le WS carnet de l'asset tourne
+    # (sinon l'imbalance reste périmé/à 0). XRP exclu (pas de WS carnet supporté).
+    if asset == "XRP": return
     try:
         market = await poly.get_market_by_slug(f"{cfg['slug']}-{cur_slot}")
         if not market: return
+        asset_up_ob = market.get("token_up","")
+    except Exception as ex:
+        log.debug(f"OB signal {asset} market: {ex}"); return
+
+    # Lancer/rafraîchir le WS carnet pour l'asset si pas déjà actif sur ce token (SANS return: on lit tout de suite si déjà frais)
+    if asset == "ETH":
+        if asset_up_ob and st.eth_ob_asset_id != asset_up_ob:
+            if st.eth_clob_ws_task and not st.eth_clob_ws_task.done(): st.eth_clob_ws_task.cancel()
+            st.eth_clob_ws_task = asyncio.create_task(ws_clob_loop_asset(asset_up_ob,"ETH"))
+    elif asset == "SOL":
+        if asset_up_ob and st.sol_ob_asset_id != asset_up_ob:
+            if st.sol_clob_ws_task and not st.sol_clob_ws_task.done(): st.sol_clob_ws_task.cancel()
+            st.sol_clob_ws_task = asyncio.create_task(ws_clob_loop_asset(asset_up_ob,"SOL"))
+
+    # Lire l'OB imbalance + vérifier sa fraîcheur (< 30s)
+    ob_data = {"BTC": (getattr(st,"ob_imbalance",0), getattr(st,"ob_ts",0)),
+               "ETH": (getattr(st,"eth_ob_imbalance",0), getattr(st,"eth_ob_ts",0)),
+               "SOL": (getattr(st,"sol_ob_imbalance",0), getattr(st,"sol_ob_ts",0))}
+    ob, ob_ts = ob_data.get(asset, (0,0))
+    if now - ob_ts > 30: return  # carnet périmé, on attend des données fraîches
+    if abs(ob) < OB_SIGNAL_THRESHOLD: return  # imbalance pas assez nette
+
+    direction = "UP" if ob > 0 else "DOWN"
+    try:
         token_id = market["token_up"] if direction=="UP" else market["token_down"]
         token_price = await poly.get_token_price(token_id)
     except Exception as ex:
-        log.debug(f"OB signal {asset} market: {ex}"); return
+        log.debug(f"OB signal {asset} token: {ex}"); return
 
     if token_price < OB_SIGNAL_TOKEN_MIN or token_price > OB_SIGNAL_TOKEN_MAX:
         log_skip(f"{asset} [OB]: token {token_price:.2f}$ hors plage {OB_SIGNAL_TOKEN_MIN}-{OB_SIGNAL_TOKEN_MAX}$", direction,
@@ -5133,7 +5151,7 @@ async def cmd_run(update,context):
         f"🌑 SHADOW DOWN (log-only): mesure les DOWN ratés en marché baissier (gap+/delta- persistant). 0 trade réel — voir /passes et /learn\n"
         f"📊 /slots: journal de TOUS les slots résolus (UP/DOWN réel + conditions) — indépendant du trading, pour analyse prédictive\n"
         f"🌊 /flow: order flow temps réel (derniers trades Polymarket des 4 cryptos, détecte le smart money)\n"
-        f"📖 OB SIGNAL (NOUVEAU, réel): trade dans le sens du carnet si |imbalance|≥{OB_SIGNAL_THRESHOLD} | T-90→T-30s | tok {OB_SIGNAL_TOKEN_MIN}-{OB_SIGNAL_TOKEN_MAX}$ | basé sur slot recorder (OB acheteur 73% UP). ⚠️ non validé, mise mini\n"
+        f"📖 OB SIGNAL (NOUVEAU, réel): trade dans le sens du carnet si |imbalance|≥{OB_SIGNAL_THRESHOLD} | BTC/ETH/SOL (pas XRP) | T-90→T-30s | tok {OB_SIGNAL_TOKEN_MIN}-{OB_SIGNAL_TOKEN_MAX}$ | basé sur slot recorder (OB acheteur 73% UP). ⚠️ non validé, mise mini\n"
         f"  gap BTC/XRP≥2.5bps | ETH/SOL≥2.0bps | delta≥{int(ORACLE_ENTRY_DELTA*10000)}bps | Token≤{ORACLE_TOKEN_MAX}$(BTC)/0.95$(ETH/XRP/SOL) | EV≥{int(ORACLE_EDGE_MIN_BTC*100)}%(BTC)/{int(ORACLE_EDGE_MIN_ALT*100)}%(ETH/SOL/XRP)\n"
         f"BR:`{st.bankroll:.2f}$` | ROI:`{roi()}`\n"
         f"📊 `{ob_txt}` | 💸 `{liq_txt}`\n"
@@ -5596,7 +5614,8 @@ async def _show_passes_page(update, context, page=1):
     _resolve_pending_passes()
 
     PAGE = 12
-    all_passes = list(reversed(st.pass_reasons))
+    # ✅ v12.9 (18/06) — masquer les skips confluence dans /passes (trop nombreux, peu informatifs). La stratégie tourne toujours.
+    all_passes = list(reversed([p for p in st.pass_reasons if p.get("source") != "confluence" and not p.get("filter","").startswith("conf_")]))
     total = len(all_passes)
     total_pages = max(1, (total + PAGE - 1) // PAGE)
     page = min(max(1, page), total_pages)
