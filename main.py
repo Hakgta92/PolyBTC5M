@@ -146,6 +146,16 @@ ORACLE_EDGE_MIN     = 0.15  # v12.4  # EV minimum — 15% (momentum/meanrev/conf
 # les ev-skips ETH/SOL historiques sont 0W/7L (que des pertes dans cette zone). XRP non mesuré.
 # Surveillance OBLIGATOIRE: si les 1ers trades ETH/SOL/XRP à EV 10-15% perdent, remonter à 15%.
 ORACLE_EDGE_MIN_ALT = 0.10
+# ✅ v12.9 (18/06) — STRATÉGIE OB SIGNAL (demande user, basée sur slot recorder: OB acheteur→73% UP n=237,
+# OB vendeur→88% DOWN n=156, sur marché neutre). Trade dans le sens du carnet quand l'imbalance est nette.
+# ⚠️ NON VALIDÉ en exécution réelle (le 73% est mesuré à la résolution, possible look-ahead). Mise mini, surveillance.
+OB_SIGNAL_ENABLED   = True
+OB_SIGNAL_THRESHOLD = 0.15   # |imbalance| minimum pour trader (correspond aux 237 cas mesurés à 73%)
+OB_SIGNAL_TOKEN_MIN = 0.40   # éviter les tokens déjà trop pricés ou trop incertains
+OB_SIGNAL_TOKEN_MAX = 0.75
+OB_SIGNAL_WIN_START = 90      # fenêtre T-90s→T-30s (zone où le pricing se forme selon le tracker timing)
+OB_SIGNAL_WIN_END   = 30
+OB_SIGNAL_EV_MIN     = 0.03  # EV min dédié OB (bas car signal mesuré à 73% = edge réel; un seuil élevé bloquerait tout trade)
 # ✅ v12.9 (18/06) — EV minimum SPÉCIFIQUE BTC oracle lag abaissé à 8% (Sonnet: ev-skips BTC 8W/2L=80%,
 # l'EV semblait sous-estimé par le token élevé au dénominateur). UNIQUEMENT BTC oracle lag — ETH/SOL/XRP
 # restent à 15% car leurs ev-skips sont 0W/7L (baisser = acheter des pertes). Surveillance rapprochée:
@@ -1654,6 +1664,8 @@ class State:
         self.meanrev_regime_squeeze_count=0; self.meanrev_regime_expansion_count=0  # v12.9 — résumé agrégé pour /learn
         # v12.9 — 4ème stratégie CONFLUENCE (/conf): oracle bias × régime/setup × bruit
         self.tds_last_slot=0; self.tds_last_slot_eth=0; self.tds_last_slot_sol=0; self.tds_last_slot_xrp=0
+        # ✅ v12.9 — verrou slot stratégie OB signal (par asset)
+        self.ob_last_slot={}  # {asset: cur_slot dernier trade OB}
         # ✅ v12.9 — SLOT RECORDER (/slots): journal de TOUS les slots résolus avec conditions + résultat réel UP/DOWN.
         # Indépendant du trading. Résolution = oracle Chainlink (close vs open), règle officielle Polymarket vérifiée.
         self.slot_records=[]    # dicts: {asset,slot,open,close,result,gap,delta,rsi,macd,dual,regime,session,ts}
@@ -4210,6 +4222,76 @@ def _tds_adaptive_weight(setup_type):
     return min(1.5, max(0.5, wr / 0.5))
 
 
+async def job_ob_signal_asset(context, asset):
+    """✅ v12.9 (18/06) — STRATÉGIE OB SIGNAL: trade dans le sens du carnet quand l'imbalance est nette.
+    Basée sur les données du slot recorder (OB acheteur→73% UP, OB vendeur→88% DOWN sur marché neutre, n>150).
+    Fenêtre T-90s→T-30s. Mise minimale. Respecte le verrou slot (1 trade/slot/asset toutes stratégies confondues).
+    ⚠️ NON validé en exécution réelle — le 73% est mesuré à la résolution (look-ahead possible). Surveillance étroite."""
+    if not OB_SIGNAL_ENABLED or not st.running or st.killed: return
+    now = time.time()
+    cur_slot = int(now // 300) * 300
+    slot_remaining = cur_slot + 300 - now
+    if not (OB_SIGNAL_WIN_END <= slot_remaining <= OB_SIGNAL_WIN_START): return
+
+    # Verrou slot: 1 seul trade par slot par asset, toutes stratégies confondues
+    cfg = _asset_state_attrs(asset)
+    oracle_slot_attr = "last_trade_slot" if asset=="BTC" else f"{asset.lower()}_last_trade_slot"
+    if st.ob_last_slot.get(asset) == cur_slot: return
+    if (getattr(st, cfg["mom_slot"], 0) == cur_slot or getattr(st, cfg["mr_slot"], 0) == cur_slot
+            or getattr(st, cfg["tds_slot"], 0) == cur_slot or getattr(st, oracle_slot_attr, 0) == cur_slot):
+        return
+
+    # Lire l'OB imbalance de l'asset
+    ob_map = {"BTC": getattr(st,"ob_imbalance",0), "ETH": getattr(st,"eth_ob_imbalance",0),
+              "SOL": getattr(st,"sol_ob_imbalance",0), "XRP": getattr(st,"xrp_ob_imbalance",0)}
+    ob = ob_map.get(asset, 0)
+    if abs(ob) < OB_SIGNAL_THRESHOLD: return  # imbalance pas assez nette
+
+    direction = "UP" if ob > 0 else "DOWN"
+
+    # Récupérer le marché + token
+    try:
+        market = await poly.get_market_by_slug(f"{cfg['slug']}-{cur_slot}")
+        if not market: return
+        token_id = market["token_up"] if direction=="UP" else market["token_down"]
+        token_price = await poly.get_token_price(token_id)
+    except Exception as ex:
+        log.debug(f"OB signal {asset} market: {ex}"); return
+
+    if token_price < OB_SIGNAL_TOKEN_MIN or token_price > OB_SIGNAL_TOKEN_MAX:
+        log_skip(f"{asset} [OB]: token {token_price:.2f}$ hors plage {OB_SIGNAL_TOKEN_MIN}-{OB_SIGNAL_TOKEN_MAX}$", direction,
+                 features={"ob":ob,"filter":"ob_token","asset":asset,"token":token_price}); return
+
+    # Proba estimée: basée sur la force de l'imbalance (calibré sur les 73%/88% observés, capé prudemment)
+    p_conf = min(0.72, 0.55 + abs(ob) * 0.30)
+    payout = round(1/token_price, 2) if token_price > 0 else 2.0
+    fee = taker_fee_per_share(token_price)
+    ev = p_conf * (payout - 1) - (1 - p_conf) - fee
+    if ev < OB_SIGNAL_EV_MIN:
+        log_skip(f"{asset} [OB]: EV {ev*100:+.1f}%<{OB_SIGNAL_EV_MIN*100:.0f}% (OB={ob:+.2f})", direction,
+                 features={"ob":ob,"filter":"ob_ev","asset":asset,"token":token_price,"ev":ev}); return
+
+    amount = kelly_bet(st.bankroll, p_conf, payout, token_price)
+    if amount < MIN_BET_USD: return
+
+    sess = session_ctx().get("session","?")
+    reasoning = f"📖 OB SIGNAL {asset} {direction} | imbalance={ob:+.2f} tok={token_price:.2f}$ EV={ev*100:+.1f}% T-{int(slot_remaining)}s"
+    st.current_market = market
+    ok = await place_bet(context, direction, amount, p_conf, reasoning, p_conf, sess,
+                         token_price if direction=="UP" else 1-token_price,
+                         token_price if direction=="DOWN" else 1-token_price,
+                         cur_slot+300, source="ob_signal")
+    if ok:
+        st.ob_last_slot[asset] = cur_slot
+        log.info(f"📖 OB SIGNAL TRADE {asset} {direction} {amount:.2f}$ (OB={ob:+.2f})")
+
+
+async def job_ob_signal_btc(context):  await job_ob_signal_asset(context, "BTC")
+async def job_ob_signal_eth(context):  await job_ob_signal_asset(context, "ETH")
+async def job_ob_signal_sol(context):  await job_ob_signal_asset(context, "SOL")
+async def job_ob_signal_xrp(context):  await job_ob_signal_asset(context, "XRP")
+
+
 async def job_confluence_asset(context, asset):
     """v12.9 — 4ème stratégie CONFLUENCE (/conf). Combine:
     A) Biais oracle (gap spot vs oracle, direction + magnitude)
@@ -4688,6 +4770,7 @@ CONTEXTE IMPORTANT:
 - 🌑 SHADOW DOWN (filter=shadow_down): signaux DOWN "fantômes" en mode LOG-ONLY (aucun trade réel). Ils capturent le cas gap+/delta- persistant (marché baissier, oracle figé au-dessus du spot tombant) SANS chute brutale — un cas que les 4 stratégies ne tradent jamais actuellement. Question clé à trancher: ces DOWN auraient-ils GAGNÉ? Si shadow_down montre un WR≥58% sur n≥30 hors d'une seule session, c'est un EDGE réel à activer. Si WR≤48%, c'est un piège (mean-reversion: le spot rebondit au lieu de continuer à tomber) → garder désactivé. ATTENTION: ne te laisse pas piéger par un WR élevé issu d'une seule session 100% baissière (cf. règle anti-biais ci-dessous).
 - 🔀 DUAL MODEL (champ "dual" dans les features = UP/DOWN/None): inspiré des papiers CNN-LSTM qui entraînent des modèles UP et DOWN séparés. On calcule up_score et down_score indépendamment (RSI, EMA9/21, MACD, momentum 3min) au lieu d'un score symétrique. dual = la direction qui domine (marge ≥1.0). MODE MESURE uniquement: ne change AUCUNE décision pour l'instant. Si tu vois que "dual" prédit la direction gagnante nettement mieux que les votes actuels (≥58% sur n≥30), signale-le comme piste d'activation. MACD vient d'être ajouté aux votes TA (top-feature ML avec RSI) — son impact se mesure dans ta_vote.
 - 🎯 MICROPRICE (champ "micro") & 🌊 OFI (champ "ofi"): microstructure du carnet Polymarket, MODE MESURE. Le microprice (Stoikov) est le mid pondéré par l'imbalance top-of-book — la littérature (arxiv 2026) le donne meilleur prédicteur que l'imbalance brute, SURTOUT sur gros ticks comme Polymarket. micro>0 penche UP, <0 penche DOWN. L'OFI (Order Flow Imbalance) mesure la variation NETTE du top-of-book entre deux ticks (flux dynamique, pas photo statique). Question: micro et OFI prédisent-ils mieux que l'OB imbalance simple (déjà à ~62% UP côté acheteur)? Si micro↑→UP ou OFI+→UP dépassent nettement 55% sur n≥100 ET sur plusieurs sessions, ce sont des candidats d'activation. ATTENTION au biais directionnel de session (un signal qui "marche" en marché baissier peut être un artefact — cf. dual=DOWN qui s'est effondré de 68% à 50% en passant baissier→haussier).
+- 📖 STRATÉGIE OB SIGNAL (source="ob_signal", trades RÉELS depuis 18/06): trade dans le sens du carnet quand |imbalance|≥0.15, fenêtre T-90→T-30s, token 0.40-0.75$, mise minimale. Basée sur le slot recorder (OB acheteur→73% UP, vendeur→88% DOWN, n>150 en marché neutre). ⚠️ NON validée en exécution réelle: le 73% est mesuré à la RÉSOLUTION, pas à l'entrée (risque de look-ahead). Surveille ces trades de près: si leur WR réel est nettement < au 73% mesuré, c'est que le signal à l'entrée est plus faible qu'à la résolution (look-ahead confirmé) → recommande de désactiver ou resserrer le seuil. Compare le WR réel ob_signal au 73% théorique.
 
 ⚠️ RÈGLE ANTI-BIAIS OBLIGATOIRE:
 Si une session représente ≥60% des données (ex: nuit calme ASIA_EARLY ou forte tendance directionnelle),
@@ -4991,6 +5074,11 @@ async def cmd_run(update,context):
     context.job_queue.run_repeating(job_confluence_eth,interval=2,first=42)
     context.job_queue.run_repeating(job_confluence_sol,interval=2,first=44)
     context.job_queue.run_repeating(job_confluence_xrp,interval=2,first=46)
+    # ✅ v12.9 — STRATÉGIE OB SIGNAL (trade dans le sens du carnet, fenêtre T-90→T-30)
+    context.job_queue.run_repeating(job_ob_signal_btc,interval=3,first=48)
+    context.job_queue.run_repeating(job_ob_signal_eth,interval=3,first=49)
+    context.job_queue.run_repeating(job_ob_signal_sol,interval=3,first=50)
+    context.job_queue.run_repeating(job_ob_signal_xrp,interval=3,first=51)
     context.job_queue.run_repeating(job_resolve_passes,interval=30,first=35)
     # ✅ v12.9 — SLOT RECORDER: enregistrement principal à la bascule (ws_oracle_loop) + ce job en filet de sécurité
     context.job_queue.run_repeating(job_slot_recorder,interval=30,first=50)
@@ -5023,6 +5111,7 @@ async def cmd_run(update,context):
         f"🌑 SHADOW DOWN (log-only): mesure les DOWN ratés en marché baissier (gap+/delta- persistant). 0 trade réel — voir /passes et /learn\n"
         f"📊 /slots: journal de TOUS les slots résolus (UP/DOWN réel + conditions) — indépendant du trading, pour analyse prédictive\n"
         f"🌊 /flow: order flow temps réel (derniers trades Polymarket des 4 cryptos, détecte le smart money)\n"
+        f"📖 OB SIGNAL (NOUVEAU, réel): trade dans le sens du carnet si |imbalance|≥{OB_SIGNAL_THRESHOLD} | T-90→T-30s | tok {OB_SIGNAL_TOKEN_MIN}-{OB_SIGNAL_TOKEN_MAX}$ | basé sur slot recorder (OB acheteur 73% UP). ⚠️ non validé, mise mini\n"
         f"  gap BTC/XRP≥2.5bps | ETH/SOL≥2.0bps | delta≥{int(ORACLE_ENTRY_DELTA*10000)}bps | Token≤{ORACLE_TOKEN_MAX}$(BTC)/0.95$(ETH/XRP/SOL) | EV≥{int(ORACLE_EDGE_MIN_BTC*100)}%(BTC)/{int(ORACLE_EDGE_MIN_ALT*100)}%(ETH/SOL/XRP)\n"
         f"BR:`{st.bankroll:.2f}$` | ROI:`{roi()}`\n"
         f"📊 `{ob_txt}` | 💸 `{liq_txt}`\n"
