@@ -120,6 +120,9 @@ STAGED_FRACTIONS    = [0.6, 0.4]   # 60% à la 1re entrée, 40% à la 2e si sign
 # Maker order (presque gratuit: tout est limite sur Polymarket de toute façon)
 USE_MAKER_ORDERS    = True   # Ordre limite maker = zéro frais + rebate 25%
 MAKER_UNDERCUT      = 0.02   # ✅ v10.25 — 2¢ sous le prix (meilleure chance d'être maker)
+# ✅ #1 — Exécution fill-aware: on confirme le fill RÉEL au lieu de supposer l'ordre rempli
+FILL_WAIT_S         = 3.0    # grâce laissée au maker GTC pour être rempli avant annulation
+FILL_TAKER_WAIT_S   = 1.5    # délai de vérif du fill après bascule taker (croise le spread)
 # Calibration sigma (auto-correction de VOL_SAFETY après N trades)
 CALIB_MIN_TRADES    = 30     # Trades mini avant d'auto-calibrer
 # Kill-switch drawdown
@@ -868,6 +871,35 @@ class PolyClient:
                 return float(bal) > 0
         except Exception as e:
             log.warning(f"order_filled: {e}")
+        return False
+
+    async def get_position_size(self, token_id):
+        """✅ #1 — Solde réel du token conditionnel (shares détenues). Renvoie None si non
+        vérifiable (client v1 ou erreur) → permet de confirmer un fill réel au lieu de
+        SUPPOSER qu'un ordre maker posé est rempli. Comparé à une baseline avant l'ordre."""
+        if not self.ready or getattr(self, "client_version", "v1") != "v2": return None
+        try:
+            from py_clob_client_v2 import BalanceAllowanceParams
+            from py_clob_client_v2.clob_types import AssetType
+            resp = self.client.get_balance_allowance(
+                BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id))
+            if resp:
+                bal = resp.get("balance", resp.get("amount", 0))
+                return float(bal)
+        except Exception as e:
+            log.warning(f"get_position_size: {e}")
+        return None
+
+    async def cancel_order(self, order_id):
+        """✅ #1 — Annule un ordre (le reliquat non rempli d'un GTC maker). Best-effort."""
+        if not self.ready or not self.client or not order_id: return False
+        for meth, arg in (("cancel", order_id), ("cancel_order", order_id), ("cancel_orders", [order_id])):
+            try:
+                fn = getattr(self.client, meth, None)
+                if fn:
+                    fn(arg); return True
+            except Exception as e:
+                log.warning(f"cancel_order ({meth}): {e}")
         return False
 
     async def sell_position(self, token_id, shares, opposite_token_id=None, current_price=0.5):
@@ -2747,6 +2779,52 @@ def edge_scorecard(include_paper_if_few=True):
     lines.append("_t≥2 = edge réel (95%). Coupe les 🔴. Scale les ✅. Attends n≥20-30 pour les ⚠️._")
     return "\n".join(lines)
 
+def slot_edge_analysis(asset=None, min_n=30):
+    """✅ #2 — Mine le journal slot_records (features → résultat UP/DOWN RÉEL, jusqu'à 5000 slots).
+    Pour chaque signal, mesure sa PRÉCISION DIRECTIONNELLE: parmi les slots où le signal pointe
+    UP ou DOWN, combien de fois le résultat réel a suivi. Compare à 50% (pile/face) avec la borne
+    basse Wilson 95%. Backtest gratuit, SANS risquer de capital → dit quels signaux gardent un edge.
+    ✅ = edge prouvé (Wilson>52%), 🔴 = anti-signal (acc<48%, exploitable inversé), ⚪ = bruit."""
+    recs = [r for r in st.slot_records if r.get("result") in ("UP","DOWN")]
+    if asset: recs = [r for r in recs if r.get("asset") == asset]
+    if not recs:
+        return "Aucun slot résolu enregistré (reviens dans 10-15 min)."
+    n_all = len(recs)
+    up_rate = sum(1 for r in recs if r["result"] == "UP") / n_all
+
+    def sig_ob(r):    v=r.get("ob",0);    return "UP" if v>0.15 else ("DOWN" if v<-0.15 else None)
+    def sig_ofi(r):   v=r.get("ofi",0);   return "UP" if v>0 else ("DOWN" if v<0 else None)
+    def sig_micro(r): v=r.get("micro",0); return "UP" if v>0.002 else ("DOWN" if v<-0.002 else None)
+    def sig_delta(r): v=r.get("delta",0); return "UP" if v>0 else ("DOWN" if v<0 else None)
+    def sig_macd(r):  v=r.get("macd",0);  return "UP" if v>0 else ("DOWN" if v<0 else None)
+    def sig_rsi(r):   v=r.get("rsi",50);  return "UP" if v>55 else ("DOWN" if v<45 else None)
+    def sig_dual(r):  d=r.get("dual");    return d if d in ("UP","DOWN") else None
+    def sig_ob_ofi(r):
+        a,b = sig_ob(r), sig_ofi(r)
+        return a if (a and a==b) else None  # OB et OFI d'accord uniquement
+    signals = [("OB |>0.15|",sig_ob),("OFI signe",sig_ofi),("Microprice",sig_micro),
+               ("Δ oracle",sig_delta),("MACD signe",sig_macd),("RSI 55/45",sig_rsi),
+               ("Dual model",sig_dual),("OB+OFI accord",sig_ob_ofi)]
+
+    lines = [f"🔬 *SLOT EDGE* {asset or 'TOUS'} — n={n_all}, base UP `{up_rate*100:.0f}%`",
+             "━━━━━━━━━━━━━━", "_précision directionnelle vs 50% (pile/face)_"]
+    scored = []
+    for name, fn in signals:
+        fired = [(fn(r), r["result"]) for r in recs]
+        fired = [(p, res) for p, res in fired if p is not None]
+        nn = len(fired)
+        if nn < min_n:
+            scored.append((0.5, f"⚪ {name}: n={nn} (insuffisant)")); continue
+        hits = sum(1 for p, res in fired if p == res)
+        acc = hits / nn
+        wlo = _wilson_lower(hits, nn)
+        flag = "✅" if wlo > 0.52 else ("🔴" if acc < 0.48 else "⚪")
+        scored.append((acc, f"{flag} {name}: `{acc*100:.0f}%` (min `{wlo*100:.0f}%`) n={nn} `{(acc-0.5)*100:+.0f}pt`"))
+    for _, txt in sorted(scored, key=lambda x: -x[0]):
+        lines.append(txt)
+    lines.append("\n_✅ edge prouvé · 🔴 anti-signal (inverse-le) · ⚪ bruit. Construis tes filtres sur les ✅._")
+    return "\n".join(lines)
+
 def realized_vol():
     """Volatilité réalisée (% par √seconde) sur les ~60 dernières secondes WS"""
     pts = list(st.ws_prices)
@@ -2901,9 +2979,29 @@ async def place_bet(context, direction, amount, conf, reasoning, conf_score, ses
                 log_skip(f"Prix token bougé avant ordre ({entry_tp:.2f}$)", direction); st.asset_trade_slot[asset] = 0; return False
             if source=="snipe" and (entry_tp < SNIPE_TOKEN_MIN-0.05 or entry_tp > SNIPE_TOKEN_MAX+0.03):
                 log_skip(f"SNIPE: prix token bougé ({entry_tp:.2f}$)", direction); st.asset_trade_slot[asset] = 0; return False
+            # ✅ #1 — Baseline du solde AVANT l'ordre, pour confirmer un fill réel (vs supposer rempli)
+            bal0 = await poly.get_position_size(token_used)
             order_id=await poly.place_order(token_used, first_amount, entry_tp, "BUY")  # ✅ maker/limite
             if not order_id:
                 await send(context.bot,"⚠️ *Ordre Polymarket refusé — réessai prochain slot*"); st.asset_trade_slot[asset] = 0; return False
+            # ✅ #1 — Vérification du fill (le GTC maker à -2¢ peut rester POSÉ sans être exécuté).
+            # bal0 is None = client v1, fill non vérifiable → on garde l'ancien comportement (supposer rempli).
+            if bal0 is not None:
+                await asyncio.sleep(FILL_WAIT_S)
+                await poly.cancel_order(order_id)  # annule le reliquat non rempli du maker
+                bal1 = await poly.get_position_size(token_used)
+                filled = (bal1 is not None and bal1 > bal0)
+                if not filled:
+                    # Maker non rempli → croiser le spread en taker (EV inclut déjà les frais taker)
+                    log.info(f"{asset}: maker non rempli, bascule taker")
+                    order_id = await poly.place_market_order(token_used, first_amount, "BUY")
+                    if order_id:
+                        await asyncio.sleep(FILL_TAKER_WAIT_S)
+                        bal2 = await poly.get_position_size(token_used)
+                        filled = (bal2 is not None and bal2 > bal0)
+                if not filled:
+                    log_skip(f"{asset}: ordre non rempli (maker+taker) — pas de position fantôme", direction)
+                    st.asset_trade_slot[asset] = 0; return False
             st.active_order_id=order_id; st.active_token_id=token_used
             st.entry_token_price=entry_tp; st.shares_bought=round(first_amount/entry_tp,4) if entry_tp>0 else 0
             st.token_price_peak=1.0; st.trailing_active=False
@@ -6603,6 +6701,14 @@ async def cmd_edge(update,context):
     if not auth(update): return
     await update.message.reply_text(edge_scorecard(), parse_mode="Markdown")
 
+async def cmd_slotedge(update,context):
+    """✅ #2 — Pouvoir prédictif réel des signaux, miné depuis slot_records.
+    Usage: /slotedge [BTC|ETH|SOL|XRP]"""
+    if not auth(update): return
+    arg = (context.args[0].upper() if getattr(context,"args",None) else None)
+    asset = arg if arg in ("BTC","ETH","SOL","XRP") else None
+    await update.message.reply_text(slot_edge_analysis(asset), parse_mode="Markdown")
+
 async def cmd_revive(update,context):
     """✅ v10.23 — Réarme le kill-switch"""
     if not auth(update): return
@@ -6660,7 +6766,7 @@ def main():
         ("balance",cmd_balance),("paper",cmd_paper),("cooldown",cmd_cooldown),("reset",cmd_reset),("resetskips",cmd_resetskips),
         ("setbalance",cmd_setbalance),("backup",cmd_backup),("recap",cmd_recap),("dashboard",cmd_dashboard),
         ("history",cmd_history),("turbo",cmd_turbo),("sell",cmd_sell),("sellcheck",cmd_sellcheck),("fair",cmd_fair),
-        ("backtest",cmd_backtest),("oracle",cmd_oracle),("momentum",cmd_momentum),("meanrev",cmd_mean_reversion),("regime",cmd_regime),("conf",cmd_confluence),("slots",cmd_slots),("flow",cmd_flow),("sessionstats",cmd_sessionstats),("calib",cmd_calib),("edge",cmd_edge),("learn",cmd_learn),("revive",cmd_revive),("autotune",cmd_autotune)]:
+        ("backtest",cmd_backtest),("oracle",cmd_oracle),("momentum",cmd_momentum),("meanrev",cmd_mean_reversion),("regime",cmd_regime),("conf",cmd_confluence),("slots",cmd_slots),("flow",cmd_flow),("sessionstats",cmd_sessionstats),("calib",cmd_calib),("edge",cmd_edge),("slotedge",cmd_slotedge),("learn",cmd_learn),("revive",cmd_revive),("autotune",cmd_autotune)]:
         app.add_handler(CommandHandler(name,handler))
     app.add_handler(CallbackQueryHandler(cb))
     log.info(f"🧠 PolyBot v{BOT_VERSION} démarré")
