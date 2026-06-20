@@ -2686,6 +2686,67 @@ def calibration_report(min_per_bucket=5):
     txt += "\n\n*Par stratégie:*\n" + ("\n".join(src_lines) or "_(n/a)_")
     return resolved, txt
 
+def _wilson_lower(wins, n, z=1.96):
+    """Borne basse de l'IC 95% (Wilson) sur un taux de réussite — robuste sur petits échantillons."""
+    if n == 0: return 0.0
+    p = wins / n
+    denom = 1 + z*z/n
+    centre = p + z*z/(2*n)
+    margin = z * ((p*(1-p) + z*z/(4*n)) / n) ** 0.5
+    return max(0.0, (centre - margin) / denom)
+
+def edge_scorecard(include_paper_if_few=True):
+    """✅ Scorecard d'edge: pour CHAQUE stratégie (source) et l'ensemble, mesure la rentabilité
+    RÉELLE depuis le journal de trades — pas les heuristiques, les résultats.
+    - PnL total + PnL moyen/trade
+    - t-stat sur le PnL/trade (mean / (std/√n)) → significativité statistique
+    - WR + borne basse Wilson 95%
+    Verdict: ✅ rentable significatif | 🟡 positif non significatif | 🔴 perdant | ⚠️ n insuffisant.
+    C'est l'outil de décision: ne garder QUE les stratégies prouvées +EV."""
+    real = [t for t in st.trades if t.get("result") in ("WIN","LOSS") and not t.get("paper")]
+    mode = "RÉEL"
+    if len(real) < 10 and include_paper_if_few:
+        real = [t for t in st.trades if t.get("result") in ("WIN","LOSS")]
+        mode = "RÉEL+PAPER (peu de réel)"
+    if not real:
+        return "Aucun trade résolu à analyser."
+
+    def stats(grp):
+        n = len(grp)
+        wins = sum(1 for t in grp if t["result"]=="WIN")
+        pnls = [float(t.get("pnl",0) or 0) for t in grp]
+        staked = sum(float(t.get("amount",0) or 0) for t in grp) or 1e-9
+        total = sum(pnls)
+        mean = total / n
+        var = sum((x-mean)**2 for x in pnls) / (n-1) if n > 1 else 0.0
+        std = var ** 0.5
+        tstat = (mean / (std / (n**0.5))) if std > 0 else 0.0
+        wr = wins / n
+        wlo = _wilson_lower(wins, n)
+        roi = total / staked * 100
+        if n < 20:           verdict = "⚠️ n<20"
+        elif total <= 0:     verdict = "🔴 perdant"
+        elif tstat >= 2.0:   verdict = "✅ rentable (signif.)"
+        else:                verdict = "🟡 positif (non signif.)"
+        return n, wr, wlo, total, mean, roi, tstat, verdict
+
+    by_src = {}
+    for t in real:
+        by_src.setdefault(t.get("source","?"), []).append(t)
+
+    lines = [f"📊 *EDGE SCORECARD* ({mode})", "━━━━━━━━━━━━━━"]
+    n,wr,wlo,total,mean,roi,tstat,verdict = stats(real)
+    lines.append(f"*GLOBAL* n={n} | PnL `{total:+.2f}$` | ROI `{roi:+.1f}%`")
+    lines.append(f"  WR `{wr*100:.0f}%` (min `{wlo*100:.0f}%`) | t=`{tstat:.1f}` | {verdict}")
+    lines.append("")
+    for src, grp in sorted(by_src.items(), key=lambda kv: -sum(float(t.get('pnl',0) or 0) for t in kv[1])):
+        n,wr,wlo,total,mean,roi,tstat,verdict = stats(grp)
+        lines.append(f"*{src}* n={n} | PnL `{total:+.2f}$` `{mean:+.2f}/t` | ROI `{roi:+.1f}%`")
+        lines.append(f"  WR `{wr*100:.0f}%` (min `{wlo*100:.0f}%`) | t=`{tstat:.1f}` | {verdict}")
+    lines.append("")
+    lines.append("_t≥2 = edge réel (95%). Coupe les 🔴. Scale les ✅. Attends n≥20-30 pour les ⚠️._")
+    return "\n".join(lines)
+
 def realized_vol():
     """Volatilité réalisée (% par √seconde) sur les ~60 dernières secondes WS"""
     pts = list(st.ws_prices)
@@ -6537,6 +6598,11 @@ async def cmd_calib(update,context):
         f"_×N = facteur correctif suggéré (WR réel / proba prédite)_",
         parse_mode="Markdown")
 
+async def cmd_edge(update,context):
+    """✅ Scorecard d'edge par stratégie (rentabilité réelle + significativité)."""
+    if not auth(update): return
+    await update.message.reply_text(edge_scorecard(), parse_mode="Markdown")
+
 async def cmd_revive(update,context):
     """✅ v10.23 — Réarme le kill-switch"""
     if not auth(update): return
@@ -6594,7 +6660,7 @@ def main():
         ("balance",cmd_balance),("paper",cmd_paper),("cooldown",cmd_cooldown),("reset",cmd_reset),("resetskips",cmd_resetskips),
         ("setbalance",cmd_setbalance),("backup",cmd_backup),("recap",cmd_recap),("dashboard",cmd_dashboard),
         ("history",cmd_history),("turbo",cmd_turbo),("sell",cmd_sell),("sellcheck",cmd_sellcheck),("fair",cmd_fair),
-        ("backtest",cmd_backtest),("oracle",cmd_oracle),("momentum",cmd_momentum),("meanrev",cmd_mean_reversion),("regime",cmd_regime),("conf",cmd_confluence),("slots",cmd_slots),("flow",cmd_flow),("sessionstats",cmd_sessionstats),("calib",cmd_calib),("learn",cmd_learn),("revive",cmd_revive),("autotune",cmd_autotune)]:
+        ("backtest",cmd_backtest),("oracle",cmd_oracle),("momentum",cmd_momentum),("meanrev",cmd_mean_reversion),("regime",cmd_regime),("conf",cmd_confluence),("slots",cmd_slots),("flow",cmd_flow),("sessionstats",cmd_sessionstats),("calib",cmd_calib),("edge",cmd_edge),("learn",cmd_learn),("revive",cmd_revive),("autotune",cmd_autotune)]:
         app.add_handler(CommandHandler(name,handler))
     app.add_handler(CallbackQueryHandler(cb))
     log.info(f"🧠 PolyBot v{BOT_VERSION} démarré")
