@@ -904,17 +904,46 @@ class PolyClient:
             log.warning(f"get_position_size: {e}")
         return None
 
+    async def get_position_size_polled(self, token_id, baseline, tries=3, delay=0.6):
+        """✅ (anti-doublon 20/06) — Lit le solde du token avec RETRY pour défaire le LAG du solde
+        CLOB (un fill peut n'apparaître dans le solde qu'après 1-2s). Renvoie le solde dès qu'il
+        dépasse baseline (fill confirmé, sortie immédiate), sinon le dernier solde lu après `tries`.
+        Évite les faux "no-fill" qui déclenchaient un 2e ordre taker en double sur le même slot."""
+        last = None
+        for i in range(max(1, tries)):
+            b = await self.get_position_size(token_id)
+            if b is not None:
+                last = b
+                if b > (baseline or 0) + 1e-9:
+                    return b
+            if i < tries - 1:
+                await asyncio.sleep(delay)
+        return last
+
     async def cancel_order(self, order_id):
-        """✅ #1 — Annule un ordre (le reliquat non rempli d'un GTC maker). Best-effort."""
-        if not self.ready or not self.client or not order_id: return False
+        """✅ #1 — Annule un ordre (le reliquat non rempli d'un GTC maker). Best-effort.
+        Renvoie un dict {ok, already_filled, resp}: `already_filled`/`ok=False` indiquent que le
+        maker n'a PAS pu être annulé (probablement déjà matché) → place_bet évite alors le taker
+        pour ne pas doubler la position sur le même slot."""
+        if not self.ready or not self.client or not order_id:
+            return {"ok": False, "already_filled": False, "resp": None}
         for meth, arg in (("cancel", order_id), ("cancel_order", order_id), ("cancel_orders", [order_id])):
             try:
                 fn = getattr(self.client, meth, None)
                 if fn:
-                    fn(arg); return True
+                    resp = fn(arg)
+                    already = False
+                    try:
+                        if isinstance(resp, dict):
+                            nc = resp.get("not_canceled") or resp.get("notCanceled")
+                            if nc and (str(order_id) in (nc if isinstance(nc,(dict,list,set)) else [nc])):
+                                already = True
+                    except Exception:
+                        pass
+                    return {"ok": True, "already_filled": already, "resp": resp}
             except Exception as e:
                 log.warning(f"cancel_order ({meth}): {e}")
-        return False
+        return {"ok": False, "already_filled": False, "resp": None}
 
     async def sell_position(self, token_id, shares, opposite_token_id=None, current_price=0.5):
         """
@@ -3198,20 +3227,34 @@ async def place_bet(context, direction, amount, conf, reasoning, conf_score, ses
             # ✅ #1 — Vérification du fill (le GTC maker à -2¢ peut rester POSÉ sans être exécuté).
             if bal0 is not None:
                 await asyncio.sleep(FILL_WAIT_S)
-                await poly.cancel_order(order_id)  # annule le reliquat non rempli du maker
-                bal1 = await poly.get_position_size(token_used)
-                filled = (bal1 is not None and bal1 > bal0)
-                fill_type = "maker" if filled else "none"
-                if filled: real_shares = round(bal1 - bal0, 4)
-                if not filled:
-                    # Maker non rempli → croiser le spread en taker (EV inclut déjà les frais taker)
-                    log.info(f"{asset}: maker non rempli, bascule taker")
+                cancel_info = await poly.cancel_order(order_id)  # annule le reliquat non rempli du maker
+                # ✅ ANTI-DOUBLON (20/06): le solde CLOB est EN RETARD → on POLL avec retry au lieu d'1 seule
+                # lecture, sinon un maker déjà rempli passe pour "non rempli" et on place un taker EN DOUBLE.
+                bal1 = await poly.get_position_size_polled(token_used, bal0)
+                maker_filled = (bal1 is not None and bal1 > bal0)
+                # Si le maker n'a PAS pu être annulé (déjà matché / erreur d'annulation), il est
+                # PROBABLEMENT rempli: on n'envoie SURTOUT pas de taker (sinon position doublée).
+                cancel_uncertain = (not cancel_info.get("ok")) or cancel_info.get("already_filled")
+                filled = maker_filled
+                fill_type = "maker" if maker_filled else "none"
+                if maker_filled: real_shares = round(bal1 - bal0, 4)
+                if not maker_filled and not cancel_uncertain:
+                    # Maker proprement annulé ET non rempli → croiser le spread en taker (EV inclut les frais taker)
+                    log.info(f"{asset}: maker annulé non rempli, bascule taker")
                     order_id = await poly.place_market_order(token_used, first_amount, "BUY")
                     if order_id:
                         await asyncio.sleep(FILL_TAKER_WAIT_S)
-                        bal2 = await poly.get_position_size(token_used)
+                        bal2 = await poly.get_position_size_polled(token_used, bal0)
                         filled = (bal2 is not None and bal2 > bal0)
                         if filled: fill_type = "taker"; real_shares = round(bal2 - bal0, 4)
+                elif not maker_filled and cancel_uncertain:
+                    # Annulation incertaine → maker peut-être rempli mais solde en retard. PAS de taker.
+                    # Dernière vérif solde un peu plus longue avant de conclure.
+                    bal1b = await poly.get_position_size_polled(token_used, bal0, tries=4, delay=0.8)
+                    if bal1b is not None and bal1b > bal0:
+                        filled = True; fill_type = "maker"; real_shares = round(bal1b - bal0, 4)
+                    else:
+                        log.warning(f"{asset}: maker non annulable et fill non confirmé — pas de taker (anti-doublon)")
                 if not filled:
                     st.exec_stats["nofill"] = st.exec_stats.get("nofill",0) + 1
                     # ⚠️ ANTI-DOUBLON (demande user 20/06: 1 SEUL bet/slot/crypto).
@@ -5928,38 +5971,22 @@ async def cmd_signal(update,context):
         f"₿`${i5.get('price',0):,.2f}` | F&G:`{st.fg['value']}` | `{sess['session']}`\n\n"
         f"💭 _{d['reasoning']}_",parse_mode="Markdown")
 
-    # ✅ v10.14d — Si Claude dit trade=True, placer l'ordre directement depuis /signal
+    # ✅ v10.14d — Si Claude dit trade=True, placer l'ordre depuis /signal
+    # ✅ (anti-doublon 20/06): passe par place_bet (au lieu d'un place_market_order direct) pour
+    # respecter le verrou asset_trade_slot (1 bet/slot/crypto) + la vérif de fill. Sinon un /signal
+    # manuel pouvait doubler une position BTC déjà ouverte par une stratégie auto dans le même slot.
     if d.get("trade") and d.get("dir") and not st.bet and not st.paper_mode and st.current_market:
         amount = d.get("size", 0)
         if amount >= MIN_BET_USD and st.bankroll >= amount:
-            market_end = 0
-            try:
-                ed = st.current_market.get("end_date", "")
-                if ed:
-                    from datetime import timezone
-                    dt = datetime.fromisoformat(ed.replace("Z", "+00:00"))
-                    market_end = dt.timestamp()
-            except: pass
-            if market_end > 0 and (market_end - time.time()) < 60:
-                await update.message.reply_text("⏰ Slot expire trop tôt — ordre annulé")
-                return
-            token_used = st.current_market["token_up"] if d["dir"]=="UP" else st.current_market["token_down"]
-            # ✅ v10.22 — Refetch du prix juste avant l'ordre (Claude a pris 10-25s)
-            entry_tp = await poly.get_token_price(token_used)
-            if entry_tp <= 0: entry_tp = tu if d["dir"]=="UP" else td
-            order_id = await poly.place_market_order(token_used, amount, "BUY")
-            if order_id:
-                st.bet = {"dir":d["dir"],"amount":amount,"conf":d["conf"],"entry":st.price,
-                    "reasoning":d["reasoning"],"ts":int(time.time()),"score":cs["score"],"session":sess["session"]}
-                st.active_order_id = order_id; st.active_token_id = token_used
-                st.entry_token_price = entry_tp; st.shares_bought = round(amount/entry_tp,4) if entry_tp>0 else 0
-                st.token_price_peak = 1.0; st.trailing_active = False; st.bet_expiry = market_end
+            market_end = st.current_market.get("end_date", "")
+            ok = await place_bet(context, d["dir"], amount, d["conf"], d["reasoning"], cs, sess,
+                                 tu, td, market_end, source="signal", asset="BTC")
+            if ok:
                 await update.message.reply_text(
                     f"🎯 *Ordre placé depuis /signal !*\n"
-                    f"*{d['dir']}* `{amount:.2f}$` | Token:`{entry_tp:.3f}$`\n"
-                    f"ID:`{order_id}`",parse_mode="Markdown")
+                    f"*{d['dir']}* `{amount:.2f}$` | Token:`{st.entry_token_price:.3f}$`",parse_mode="Markdown")
             else:
-                await update.message.reply_text("⚠️ Ordre refusé depuis /signal")
+                await update.message.reply_text("⚠️ Ordre non placé (slot BTC déjà tradé, non rempli, ou refusé)")
 
 async def cmd_ai(update,context):
     if not auth(update): return
