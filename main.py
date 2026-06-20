@@ -218,6 +218,20 @@ logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logg
     handlers=[logging.FileHandler("polybot_v10.log"), logging.StreamHandler()])
 log = logging.getLogger(__name__)
 
+# ✅ /lasterrors (demande user 20/06) — buffer mémoire des WARNING/ERROR, interrogeable depuis Telegram
+# sans avoir besoin des logs Railway. Capture automatiquement tout log.warning/log.error du bot.
+from collections import deque as _deque
+_RECENT_ERRORS = _deque(maxlen=50)
+class _MemErrorHandler(logging.Handler):
+    def emit(self, record):
+        try:
+            if record.levelno >= logging.WARNING:
+                _RECENT_ERRORS.append((time.time(), record.levelname, record.getMessage()))
+        except Exception:
+            pass
+_mem_err_handler = _MemErrorHandler(level=logging.WARNING)
+logging.getLogger().addHandler(_mem_err_handler)
+
 def auth(update):
     """Vérifie que l'utilisateur est autorisé."""
     uid = update.effective_user.id if update.effective_user else 0
@@ -3200,8 +3214,17 @@ async def place_bet(context, direction, amount, conf, reasoning, conf_score, ses
                         if filled: fill_type = "taker"; real_shares = round(bal2 - bal0, 4)
                 if not filled:
                     st.exec_stats["nofill"] = st.exec_stats.get("nofill",0) + 1
-                    log_skip(f"{asset}: ordre non rempli (maker+taker) — pas de position fantôme", direction)
-                    st.asset_trade_slot[asset] = 0; return False
+                    # ⚠️ ANTI-DOUBLON (demande user 20/06: 1 SEUL bet/slot/crypto).
+                    # Le solde peut être EN RETARD: maker rempli puis lag, ou FAK taker accepté/exécuté
+                    # alors que get_position_size renvoie encore l'ancien solde → faux "no-fill".
+                    # Si on relâchait le verrou ici (asset_trade_slot=0), une autre stratégie du MÊME
+                    # crypto re-rentrerait dans le même slot et on se retrouvait avec 2-4 positions
+                    # réelles en double (sans notif, car ce chemin renvoie False). Dès qu'un ordre a
+                    # atteint l'exchange, on GARDE le verrou pour tout le slot. job_reconcile alerte
+                    # si une position réelle non suivie existe vraiment.
+                    log.warning(f"{asset}: no-fill rapporté — verrou slot CONSERVÉ (anti-doublon, fill possible non vu)")
+                    log_skip(f"{asset}: ordre non rempli rapporté (verrou slot gardé anti-doublon)", direction)
+                    return False
                 st.exec_stats[fill_type] = st.exec_stats.get(fill_type,0) + 1
             setattr(st, f"active_order_id{sfx}", order_id); setattr(st, f"active_token_id{sfx}", token_used)
             # ✅ Prix d'entrée RÉEL = montant dépensé / shares réellement reçues (solde avant/après),
@@ -6152,6 +6175,29 @@ async def cmd_paper(update,context):
     st.backup()
 
 
+async def cmd_lasterrors(update,context):
+    """✅ (demande user 20/06) — Affiche les derniers WARNING/ERROR du bot (buffer mémoire),
+    pour diagnostiquer sans avoir besoin des logs Railway. Usage: /lasterrors [N] (défaut 15)."""
+    if not auth(update): return
+    n = 15
+    if context.args:
+        try: n = max(1, min(50, int(context.args[0])))
+        except: pass
+    if not _RECENT_ERRORS:
+        await update.message.reply_text("✅ Aucun warning/erreur enregistré depuis le démarrage."); return
+    items = list(_RECENT_ERRORS)[-n:][::-1]
+    lines = [f"⚠️ *{len(items)} DERNIÈRES ERREURS/WARNINGS*\n━━━━━━━━━━━━━━"]
+    for ts, lvl, msg in items:
+        t = datetime.fromtimestamp(ts).strftime("%d/%m %H:%M:%S")
+        e = "🔴" if lvl == "ERROR" or lvl == "CRITICAL" else "🟡"
+        lines.append(f"{e} `{t}` {msg[:160]}")
+    text = "\n".join(lines)
+    try:
+        await update.message.reply_text(text, parse_mode="Markdown")
+    except Exception:
+        await update.message.reply_text(text.replace("*","").replace("`",""))
+
+
 async def cmd_cooldown(update,context):
     if not auth(update): return
     st.cooldown_until=0; st.consec=0; st.daily_pause_until=0
@@ -7058,7 +7104,7 @@ def main():
         ("history",cmd_history),("turbo",cmd_turbo),("sell",cmd_sell),("sellcheck",cmd_sellcheck),("fair",cmd_fair),
         ("backtest",cmd_backtest),("oracle",cmd_oracle),("momentum",cmd_momentum),("meanrev",cmd_mean_reversion),("regime",cmd_regime),("conf",cmd_confluence),("slots",cmd_slots),("flow",cmd_flow),("sessionstats",cmd_sessionstats),("calib",cmd_calib),("edge",cmd_edge),("slotedge",cmd_slotedge),
         ("exec",cmd_exec),("zones",cmd_zones),("risk",cmd_risk),("matrix",cmd_matrix),("slotcombo",cmd_slotcombo),
-        ("learn",cmd_learn),("revive",cmd_revive),("autotune",cmd_autotune)]:
+        ("learn",cmd_learn),("revive",cmd_revive),("autotune",cmd_autotune),("lasterrors",cmd_lasterrors)]:
         app.add_handler(CommandHandler(name,handler))
     app.add_handler(CallbackQueryHandler(cb))
     log.info(f"🧠 PolyBot v{BOT_VERSION} démarré")
