@@ -1733,6 +1733,7 @@ class State:
         # peu importe la stratégie). Posé dans place_bet AVANT l'achat (race-safe), libéré si l'achat échoue.
         self.asset_trade_slot={}  # {asset: cur_slot dernier trade toutes stratégies confondues}
         self.bet_in_flight=False  # ✅ True pendant l'exécution de place_bet (anti-race single-position inter-asset)
+        self.exec_stats={"maker":0,"taker":0,"nofill":0}  # ✅ qualité d'exécution (compteurs cumulés)
         # ✅ v12.9 — SLOT RECORDER (/slots): journal de TOUS les slots résolus avec conditions + résultat réel UP/DOWN.
         # Indépendant du trading. Résolution = oracle Chainlink (close vs open), règle officielle Polymarket vérifiée.
         self.slot_records=[]    # dicts: {asset,slot,open,close,result,gap,delta,rsi,macd,dual,regime,session,ts}
@@ -2012,7 +2013,9 @@ async def job_check_expiry(context):
                 "conf":bet["conf"],"result":result_txt,"entry":bet["entry"],"exit":st.price,
                 "reasoning":"Résolution auto slot expiré","paper":False,"ts":int(now),
                 "score":bet.get("score",0),"fg_value":st.fg.get("value",50),
-                "session":bet.get("session","?"),"aligned_15h1h":True,"source":bet.get("source","?")})
+                "session":bet.get("session","?"),"aligned_15h1h":True,"source":bet.get("source","?"),
+                "asset":bet.get("asset","?"),"entry_token":bet.get("entry_token",0),"t_remaining":bet.get("t_remaining",0),
+                "fill_type":bet.get("fill_type","?"),"fee_est":bet.get("fee_est",0)})
             st.bet=None; st.active_token_id=None; st.active_order_id=None
             st.shares_bought=0; st.entry_token_price=0
             st.token_price_peak=0; st.trailing_active=False; st.bet_expiry=0
@@ -2088,7 +2091,10 @@ async def job_take_profit(context):
                         "entry": bet["entry"], "exit": st.price, "reasoning": sell_reason,
                         "paper": False, "ts": int(time.time()), "score": bet.get("score", 0),
                         "fg_value": st.fg.get("value", 50), "aligned_15h1h": True,
-                        "session": bet.get("session", "?"), "source": bet.get("source", "?")})
+                        "session": bet.get("session", "?"), "source": bet.get("source", "?"),
+                        "asset": bet.get("asset","?"), "entry_token": bet.get("entry_token",0),
+                        "t_remaining": bet.get("t_remaining",0), "fill_type": bet.get("fill_type","?"),
+                        "fee_est": bet.get("fee_est",0)})
                     st.bet = None; st.active_token_id = None; st.active_order_id = None
                     st.shares_bought = 0; st.entry_token_price = 0
                     st.token_price_peak = 0; st.trailing_active = False; st.bet_expiry = 0
@@ -2825,6 +2831,167 @@ def slot_edge_analysis(asset=None, min_n=30):
     lines.append("\n_✅ edge prouvé · 🔴 anti-signal (inverse-le) · ⚪ bruit. Construis tes filtres sur les ✅._")
     return "\n".join(lines)
 
+def exec_report():
+    """✅ #1 — Qualité d'exécution: répartition maker/taker/non-rempli (compteurs cumulés) +
+    fuite de frais (frais estimés payés vs PnL brut). Dit si le fill-aware capte le rebate maker
+    ou paie le taker, et quelle part de l'edge part en frais."""
+    es = getattr(st, "exec_stats", {}) or {}
+    mk, tk, nf = es.get("maker",0), es.get("taker",0), es.get("nofill",0)
+    tot_orders = mk + tk + nf
+    real = [t for t in st.trades if t.get("result") in ("WIN","LOSS") and not t.get("paper")]
+    gross = sum(float(t.get("pnl",0) or 0) for t in real)
+    fees = sum(float(t.get("fee_est",0) or 0) for t in real)
+    by_fill = {}
+    for t in real:
+        by_fill.setdefault(t.get("fill_type","?"), []).append(t)
+    lines = ["⚙️ *EXÉCUTION & FRAIS*", "━━━━━━━━━━━━━━"]
+    if tot_orders:
+        lines.append(f"Ordres: `{tot_orders}` | maker `{mk}` ({mk/tot_orders*100:.0f}%) · "
+                     f"taker `{tk}` ({tk/tot_orders*100:.0f}%) · non-rempli `{nf}` ({nf/tot_orders*100:.0f}%)")
+        lines.append(f"_maker = gratuit+rebate · taker = frais pleins · non-rempli = fantôme évité_")
+    else:
+        lines.append("_Aucune exécution réelle vérifiée encore (mode réel + client v2 requis)._")
+    lines.append("")
+    if real:
+        net = gross - fees
+        leak = (fees / abs(gross) * 100) if gross else 0
+        lines.append(f"PnL brut `{gross:+.2f}$` − frais est. `{fees:.2f}$` = net `{net:+.2f}$`")
+        lines.append(f"Fuite de frais: `{leak:.0f}%` du PnL brut")
+        lines.append("\n*WR par type de fill:*")
+        for ft, grp in sorted(by_fill.items(), key=lambda kv:-len(kv[1])):
+            n=len(grp); wr=sum(1 for t in grp if t["result"]=="WIN")/n*100
+            pnl=sum(float(t.get('pnl',0) or 0) for t in grp)
+            lines.append(f"  `{ft}` n={n} WR `{wr:.0f}%` PnL `{pnl:+.2f}$`")
+    else:
+        lines.append("_Pas de trade réel résolu pour mesurer la fuite de frais._")
+    return "\n".join(lines)
+
+def _bucket_stats(trades, key, edges, fmt_lbl):
+    """Helper: WR/PnL/EV par bucket d'une valeur numérique du trade."""
+    out=[]
+    for lo, hi in edges:
+        grp=[t for t in trades if lo <= float(t.get(key,0) or 0) < hi]
+        if not grp: continue
+        n=len(grp); wr=sum(1 for t in grp if t["result"]=="WIN")/n*100
+        pnl=sum(float(t.get('pnl',0) or 0) for t in grp)
+        staked=sum(float(t.get('amount',0) or 0) for t in grp) or 1e-9
+        roi=pnl/staked*100
+        flag="✅" if pnl>0 and n>=10 else ("🔴" if pnl<0 and n>=10 else "⚪")
+        out.append(f"{flag} `{fmt_lbl(lo,hi)}` n={n} WR `{wr:.0f}%` PnL `{pnl:+.2f}$` ROI `{roi:+.0f}%`")
+    return out
+
+def zones_report():
+    """✅ #3 — Zones rentables: WR/PnL/ROI par PRIX D'ENTRÉE du token et par TIMING d'entrée
+    (T-Xs restant). Révèle où tu gagnes vraiment → resserre la fenêtre/le prix sur les zones +EV."""
+    real = [t for t in st.trades if t.get("result") in ("WIN","LOSS") and not t.get("paper")]
+    if len(real) < 5:
+        real = [t for t in st.trades if t.get("result") in ("WIN","LOSS")]
+        tag = " (réel+paper)"
+    else:
+        tag = ""
+    if not real:
+        return "Aucun trade résolu à analyser."
+    price_edges=[(0.40,0.50),(0.50,0.55),(0.55,0.60),(0.60,0.65),(0.65,0.70),(0.70,0.80),(0.80,0.96)]
+    time_edges=[(0,15),(15,30),(30,45),(45,60),(60,90),(90,150),(150,300)]
+    lines=[f"🎯 *ZONES RENTABLES*{tag}", "━━━━━━━━━━━━━━", "*Par prix d'entrée du token:*"]
+    pl=_bucket_stats(real,"entry_token",price_edges,lambda lo,hi:f"{lo:.2f}-{hi:.2f}$")
+    lines += pl or ["_pas de données prix_"]
+    lines.append("\n*Par timing d'entrée (T-Xs restant):*")
+    tl=_bucket_stats(real,"t_remaining",time_edges,lambda lo,hi:f"T-{int(lo)}→{int(hi)}s")
+    lines += tl or ["_pas de données timing_"]
+    lines.append("\n_✅ zone gagnante · 🔴 zone perdante (à éviter). Concentre-toi sur les ✅._")
+    return "\n".join(lines)
+
+def risk_report():
+    """✅ #4 — Risque: courbe d'équité, max drawdown, drawdown actuel, plus longue série de
+    pertes, profit factor, espérance/trade. Pour ne pas se faire effacer sur une mauvaise série."""
+    real = [t for t in st.trades if t.get("result") in ("WIN","LOSS") and not t.get("paper")]
+    if not real:
+        return "Aucun trade réel résolu pour les métriques de risque."
+    pnls=[float(t.get("pnl",0) or 0) for t in real]
+    n=len(pnls); wins=[p for p in pnls if p>0]; losses=[p for p in pnls if p<0]
+    gross_win=sum(wins); gross_loss=abs(sum(losses))
+    pf = gross_win/gross_loss if gross_loss>0 else float('inf')
+    expectancy = sum(pnls)/n
+    # equity curve + max drawdown
+    eq=0.0; peak=0.0; max_dd=0.0; cur_dd=0.0
+    for p in pnls:
+        eq+=p; peak=max(peak,eq); dd=peak-eq; max_dd=max(max_dd,dd)
+    cur_dd = peak-eq
+    # plus longue série de pertes
+    streak=0; max_streak=0
+    for p in pnls:
+        if p<0: streak+=1; max_streak=max(max_streak,streak)
+        else: streak=0
+    pf_txt = "∞" if pf==float('inf') else f"{pf:.2f}"
+    verdict = "✅ sain" if pf>1.3 and expectancy>0 else ("🟡 fragile" if expectancy>0 else "🔴 perdant")
+    return ("🛡 *RISQUE & DRAWDOWN* (réel)\n━━━━━━━━━━━━━━\n"
+            f"Trades `{n}` | Équité cumulée `{eq:+.2f}$`\n"
+            f"Profit factor `{pf_txt}` | Espérance `{expectancy:+.2f}$/t` | {verdict}\n"
+            f"Max drawdown `{max_dd:.2f}$` | DD actuel `{cur_dd:.2f}$`\n"
+            f"Plus longue série de pertes `{max_streak}`\n"
+            f"Gains bruts `{gross_win:.2f}$` | Pertes brutes `{gross_loss:.2f}$`\n\n"
+            "_PF>1.3 + espérance>0 = durable. DD actuel élevé = prudence._")
+
+def strategy_matrix():
+    """✅ #5 — Matrice ASSET × STRATÉGIE: PnL et WR par croisement → repère les cases qui
+    gagnent (ex: oracle_lag sur BTC) et celles qui perdent (à désactiver)."""
+    real = [t for t in st.trades if t.get("result") in ("WIN","LOSS") and not t.get("paper")]
+    if not real:
+        return "Aucun trade réel résolu pour la matrice."
+    assets=["BTC","ETH","SOL","XRP"]
+    srcs=sorted({t.get("source","?") for t in real})
+    lines=["🧮 *MATRICE ASSET × STRATÉGIE* (PnL réel)","━━━━━━━━━━━━━━","_case = PnL$ (n)_"]
+    header="`strat\\ast` " + " ".join(f"`{a[:3]}`" for a in assets)
+    lines.append(header)
+    for s in srcs:
+        cells=[]
+        for a in assets:
+            grp=[t for t in real if t.get("source")==s and t.get("asset")==a]
+            if grp:
+                pnl=sum(float(t.get('pnl',0) or 0) for t in grp)
+                mark="🟢" if pnl>0 else ("🔴" if pnl<0 else "⚪")
+                cells.append(f"{mark}{pnl:+.0f}({len(grp)})")
+            else:
+                cells.append("·")
+        lines.append(f"`{s[:9]:<9}` " + " ".join(cells))
+    lines.append("\n_🟢 garde/scale · 🔴 désactive cette case. (n petit = attends plus de data)_")
+    return "\n".join(lines)
+
+def slot_combo_analysis(min_n=25):
+    """✅ #6 — Mineur de COMBOS de signaux sur slot_records: teste les PAIRES de signaux
+    qui s'accordent (ex: OB+OFI, Δoracle+micro) pour trouver les interactions à fort edge —
+    souvent meilleures que chaque signal seul. Backtest gratuit, sans risque."""
+    recs=[r for r in st.slot_records if r.get("result") in ("UP","DOWN")]
+    if not recs:
+        return "Aucun slot enregistré (reviens dans 10-15 min)."
+    def d_ob(r):    v=r.get("ob",0);    return "UP" if v>0.15 else ("DOWN" if v<-0.15 else None)
+    def d_ofi(r):   v=r.get("ofi",0);   return "UP" if v>0 else ("DOWN" if v<0 else None)
+    def d_micro(r): v=r.get("micro",0); return "UP" if v>0.002 else ("DOWN" if v<-0.002 else None)
+    def d_delta(r): v=r.get("delta",0); return "UP" if v>0 else ("DOWN" if v<0 else None)
+    base={"OB":d_ob,"OFI":d_ofi,"micro":d_micro,"Δoracle":d_delta}
+    names=list(base.keys())
+    scored=[]
+    for i in range(len(names)):
+        for j in range(i+1,len(names)):
+            na,nb=names[i],names[j]; fa,fb=base[na],base[nb]
+            fired=[]
+            for r in recs:
+                a,b=fa(r),fb(r)
+                if a and a==b: fired.append((a,r["result"]))  # les 2 signaux d'accord
+            nn=len(fired)
+            if nn<min_n: continue
+            hits=sum(1 for p,res in fired if p==res)
+            acc=hits/nn; wlo=_wilson_lower(hits,nn)
+            scored.append((acc, f"{'✅' if wlo>0.54 else ('🔴' if acc<0.46 else '⚪')} {na}+{nb}: `{acc*100:.0f}%` (min `{wlo*100:.0f}%`) n={nn}"))
+    lines=["🧬 *COMBOS DE SIGNAUX* (slot_records)","━━━━━━━━━━━━━━","_les 2 signaux d'accord → précision directionnelle_"]
+    if scored:
+        for _,txt in sorted(scored,key=lambda x:-x[0]): lines.append(txt)
+    else:
+        lines.append("_Pas assez de slots où des paires s'accordent (attends plus de data)._")
+    lines.append("\n_✅ combo à fort edge → filtre prioritaire. 🔴 = à fuir/inverser._")
+    return "\n".join(lines)
+
 def realized_vol():
     """Volatilité réalisée (% par √seconde) sur les ~60 dernières secondes WS"""
     pts = list(st.ws_prices)
@@ -2927,6 +3094,8 @@ async def resolve_paper_bet(context):
         "reasoning":bet.get("reasoning",""),"paper":True,"ts":int(time.time()),
         "score":bet.get("score",0),"fg_value":st.fg.get("value",50),
         "session":bet.get("session","?"),"source":bet.get("source","?"),
+        "asset":bet.get("asset","?"),"entry_token":bet.get("entry_token",0),"t_remaining":bet.get("t_remaining",0),
+        "fill_type":bet.get("fill_type","?"),"fee_est":bet.get("fee_est",0),
         "aligned_15h1h":i15_n.get("ema_bull")==i1h_n.get("ema_bull") if i15_n and i1h_n else True})
     st.bet=None; st.token_price_peak=0; st.trailing_active=False; st.bet_expiry=0
     if not won and st.consec>=CONSERVATIVE_AFTER_LOSSES:
@@ -2944,6 +3113,13 @@ async def place_bet(context, direction, amount, conf, reasoning, conf_score, ses
     Rappel source: sur Polymarket tout est un ordre LIMITE de toute façon.
     """
     cur_slot = int(time.time()//300)*300
+    # Normalise market_end en timestamp numérique: plusieurs stratégies passent une string ISO
+    # (market.get("end_date")) → sinon `market_end > 0` crashe en mode réel (TypeError str/int).
+    if isinstance(market_end, str):
+        try: market_end = datetime.fromisoformat(market_end.replace("Z","+00:00")).timestamp()
+        except Exception: market_end = 0.0
+    elif not isinstance(market_end, (int, float)):
+        market_end = 0.0
     if st.bet is not None:
         return False
     if getattr(st, "bet_in_flight", False):  # ✅ achat déjà en cours (single position) — bloque la race inter-asset
@@ -2984,13 +3160,14 @@ async def place_bet(context, direction, amount, conf, reasoning, conf_score, ses
             order_id=await poly.place_order(token_used, first_amount, entry_tp, "BUY")  # ✅ maker/limite
             if not order_id:
                 await send(context.bot,"⚠️ *Ordre Polymarket refusé — réessai prochain slot*"); st.asset_trade_slot[asset] = 0; return False
+            fill_type = "assumed"  # v1/non vérifiable: on suppose rempli (ancien comportement)
             # ✅ #1 — Vérification du fill (le GTC maker à -2¢ peut rester POSÉ sans être exécuté).
-            # bal0 is None = client v1, fill non vérifiable → on garde l'ancien comportement (supposer rempli).
             if bal0 is not None:
                 await asyncio.sleep(FILL_WAIT_S)
                 await poly.cancel_order(order_id)  # annule le reliquat non rempli du maker
                 bal1 = await poly.get_position_size(token_used)
                 filled = (bal1 is not None and bal1 > bal0)
+                fill_type = "maker" if filled else "none"
                 if not filled:
                     # Maker non rempli → croiser le spread en taker (EV inclut déjà les frais taker)
                     log.info(f"{asset}: maker non rempli, bascule taker")
@@ -2999,9 +3176,14 @@ async def place_bet(context, direction, amount, conf, reasoning, conf_score, ses
                         await asyncio.sleep(FILL_TAKER_WAIT_S)
                         bal2 = await poly.get_position_size(token_used)
                         filled = (bal2 is not None and bal2 > bal0)
+                        if filled: fill_type = "taker"
                 if not filled:
+                    st.exec_stats["nofill"] = st.exec_stats.get("nofill",0) + 1
                     log_skip(f"{asset}: ordre non rempli (maker+taker) — pas de position fantôme", direction)
                     st.asset_trade_slot[asset] = 0; return False
+                st.exec_stats[fill_type] = st.exec_stats.get(fill_type,0) + 1
+            # frais estimés: ~0 en maker (rebate), taker_fee_per_share sinon
+            fee_est = 0.0 if fill_type=="maker" else round(taker_fee_per_share(entry_tp) * (first_amount/entry_tp if entry_tp>0 else 0), 3)
             st.active_order_id=order_id; st.active_token_id=token_used
             st.entry_token_price=entry_tp; st.shares_bought=round(first_amount/entry_tp,4) if entry_tp>0 else 0
             st.token_price_peak=1.0; st.trailing_active=False
@@ -3010,9 +3192,14 @@ async def place_bet(context, direction, amount, conf, reasoning, conf_score, ses
             entry_tp = tpu if direction=="UP" else tpd
             st.entry_token_price=entry_tp; st.shares_bought=round(first_amount/entry_tp,4) if entry_tp>0 else 0
             st.bet_expiry=int(time.time()//300)*300+300
+            fill_type = "paper"; fee_est = 0.0
+        # t restant dans le slot au moment de l'entrée (pour l'analyse de timing /zones)
+        t_remaining = round(max(0.0, (market_end - time.time()) if market_end and market_end>0 else (cur_slot+300 - time.time())), 1)
         st.bet={"dir":direction,"amount":first_amount,"conf":conf,"entry":consensus_price() if consensus_price()>0 else st.price,
                 "reasoning":reasoning,"ts":int(time.time()),"score":conf_score.get("score",0),"session":sess["session"],
-                "staged_remaining":staged_remaining,"staged_done":staged_remaining<=0,"source":source}
+                "staged_remaining":staged_remaining,"staged_done":staged_remaining<=0,"source":source,
+                "asset":asset,"entry_token":round(entry_tp,4),"t_remaining":t_remaining,
+                "fill_type":fill_type,"fee_est":fee_est}
         if asset == "BTC":
             st.last_trade_slot = cur_slot  # ✅ dédup BTC (job_tick/momentum/meanrev/oracle BTC s'y réfèrent)
         return True
@@ -5980,7 +6167,9 @@ async def cmd_sell(update,context):
             "entry":bet["entry"],"exit":st.price,"reasoning":"Vente manuelle /sell",
             "paper":False,"ts":int(time.time()),"score":bet.get("score",0),
             "fg_value":st.fg.get("value",50),"session":bet.get("session","?"),
-            "source":bet.get("source","?"),"aligned_15h1h":True})
+            "source":bet.get("source","?"),"aligned_15h1h":True,
+            "asset":bet.get("asset","?"),"entry_token":bet.get("entry_token",0),"t_remaining":bet.get("t_remaining",0),
+            "fill_type":bet.get("fill_type","?"),"fee_est":bet.get("fee_est",0)})
         st.bet=None; st.active_token_id=None; st.active_order_id=None
         st.shares_bought=0; st.entry_token_price=0
         st.token_price_peak=0; st.trailing_active=False; st.bet_expiry=0
@@ -6709,6 +6898,31 @@ async def cmd_slotedge(update,context):
     asset = arg if arg in ("BTC","ETH","SOL","XRP") else None
     await update.message.reply_text(slot_edge_analysis(asset), parse_mode="Markdown")
 
+async def cmd_exec(update,context):
+    """✅ #1 — Qualité d'exécution (maker/taker/non-rempli) + fuite de frais."""
+    if not auth(update): return
+    await update.message.reply_text(exec_report(), parse_mode="Markdown")
+
+async def cmd_zones(update,context):
+    """✅ #3 — Zones rentables: WR/PnL par prix d'entrée et par timing."""
+    if not auth(update): return
+    await update.message.reply_text(zones_report(), parse_mode="Markdown")
+
+async def cmd_risk(update,context):
+    """✅ #4 — Risque: drawdown, profit factor, séries de pertes, espérance."""
+    if not auth(update): return
+    await update.message.reply_text(risk_report(), parse_mode="Markdown")
+
+async def cmd_matrix(update,context):
+    """✅ #5 — Matrice asset × stratégie (PnL réel par croisement)."""
+    if not auth(update): return
+    await update.message.reply_text(strategy_matrix(), parse_mode="Markdown")
+
+async def cmd_slotcombo(update,context):
+    """✅ #6 — Combos de signaux (paires) minés depuis slot_records."""
+    if not auth(update): return
+    await update.message.reply_text(slot_combo_analysis(), parse_mode="Markdown")
+
 async def cmd_revive(update,context):
     """✅ v10.23 — Réarme le kill-switch"""
     if not auth(update): return
@@ -6766,7 +6980,9 @@ def main():
         ("balance",cmd_balance),("paper",cmd_paper),("cooldown",cmd_cooldown),("reset",cmd_reset),("resetskips",cmd_resetskips),
         ("setbalance",cmd_setbalance),("backup",cmd_backup),("recap",cmd_recap),("dashboard",cmd_dashboard),
         ("history",cmd_history),("turbo",cmd_turbo),("sell",cmd_sell),("sellcheck",cmd_sellcheck),("fair",cmd_fair),
-        ("backtest",cmd_backtest),("oracle",cmd_oracle),("momentum",cmd_momentum),("meanrev",cmd_mean_reversion),("regime",cmd_regime),("conf",cmd_confluence),("slots",cmd_slots),("flow",cmd_flow),("sessionstats",cmd_sessionstats),("calib",cmd_calib),("edge",cmd_edge),("slotedge",cmd_slotedge),("learn",cmd_learn),("revive",cmd_revive),("autotune",cmd_autotune)]:
+        ("backtest",cmd_backtest),("oracle",cmd_oracle),("momentum",cmd_momentum),("meanrev",cmd_mean_reversion),("regime",cmd_regime),("conf",cmd_confluence),("slots",cmd_slots),("flow",cmd_flow),("sessionstats",cmd_sessionstats),("calib",cmd_calib),("edge",cmd_edge),("slotedge",cmd_slotedge),
+        ("exec",cmd_exec),("zones",cmd_zones),("risk",cmd_risk),("matrix",cmd_matrix),("slotcombo",cmd_slotcombo),
+        ("learn",cmd_learn),("revive",cmd_revive),("autotune",cmd_autotune)]:
         app.add_handler(CommandHandler(name,handler))
     app.add_handler(CallbackQueryHandler(cb))
     log.info(f"🧠 PolyBot v{BOT_VERSION} démarré")
