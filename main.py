@@ -2789,6 +2789,14 @@ async def place_bet(context, direction, amount, conf, reasoning, conf_score, ses
     ENTRÉE ÉTAGÉE (la 2e tranche est gérée dans st.bet["staged_remaining"]).
     Rappel source: sur Polymarket tout est un ordre LIMITE de toute façon.
     """
+    cur_slot = int(time.time()//300)*300
+    if st.bet is not None:
+        return False
+    if st.last_trade_slot == cur_slot:
+        return False
+    if not isinstance(conf_score, dict):
+        conf_score = {"score":0,"signals":[]}
+    st.last_trade_slot = cur_slot  # ✅ verrou anti-double-achat (posé avant tout achat)
     order_id=None; token_used=None; entry_tp=0.5
     # ✅ v10.23 — Entrée étagée: on place d'abord STAGED_FRACTIONS[0] du montant
     staged_remaining = 0.0
@@ -2803,17 +2811,18 @@ async def place_bet(context, direction, amount, conf, reasoning, conf_score, ses
         token_used=st.current_market["token_up"] if direction=="UP" else st.current_market["token_down"]
         if market_end > 0 and (market_end - time.time()) < 15:
             log_skip(f"Slot expire dans {market_end-time.time():.0f}s — ordre annulé", direction)
+            st.last_trade_slot = 0
             return False
         # ✅ REFETCH prix juste avant l'ordre
         fresh_tp = await poly.get_token_price(token_used)
         entry_tp = fresh_tp if fresh_tp > 0 else (tpu if direction=="UP" else tpd)
         if source=="tick" and (entry_tp < 0.35 or entry_tp > 0.92):
-            log_skip(f"Prix token bougé avant ordre ({entry_tp:.2f}$)", direction); return False
+            log_skip(f"Prix token bougé avant ordre ({entry_tp:.2f}$)", direction); st.last_trade_slot = 0; return False
         if source=="snipe" and (entry_tp < SNIPE_TOKEN_MIN-0.05 or entry_tp > SNIPE_TOKEN_MAX+0.03):
-            log_skip(f"SNIPE: prix token bougé ({entry_tp:.2f}$)", direction); return False
+            log_skip(f"SNIPE: prix token bougé ({entry_tp:.2f}$)", direction); st.last_trade_slot = 0; return False
         order_id=await poly.place_order(token_used, first_amount, entry_tp, "BUY")  # ✅ maker/limite
         if not order_id:
-            await send(context.bot,"⚠️ *Ordre Polymarket refusé — réessai prochain slot*"); return False
+            await send(context.bot,"⚠️ *Ordre Polymarket refusé — réessai prochain slot*"); st.last_trade_slot = 0; return False
         st.active_order_id=order_id; st.active_token_id=token_used
         st.entry_token_price=entry_tp; st.shares_bought=round(first_amount/entry_tp,4) if entry_tp>0 else 0
         st.token_price_peak=1.0; st.trailing_active=False
@@ -4302,13 +4311,14 @@ async def job_ob_signal_asset(context, asset):
     sess = session_ctx().get("session","?")
     reasoning = f"📖 OB SIGNAL {asset} {direction} | imbalance={ob:+.2f} tok={token_price:.2f}$ EV={ev*100:+.1f}% T-{int(slot_remaining)}s"
     st.current_market = market
-    ok = await place_bet(context, direction, amount, p_conf, reasoning, p_conf, sess,
+    ok = await place_bet(context, direction, amount, p_conf, reasoning, {"score":0,"signals":[]}, sess,
                          token_price if direction=="UP" else 1-token_price,
                          token_price if direction=="DOWN" else 1-token_price,
                          cur_slot+300, source="ob_signal")
     if ok:
         st.ob_last_slot[asset] = cur_slot
         log.info(f"📖 OB SIGNAL TRADE {asset} {direction} {amount:.2f}$ (OB={ob:+.2f})")
+        await send(context.bot, f"📖 *OB SIGNAL* {asset} `{direction}` `{amount:.2f}$` @`{token_price:.2f}$` | imbalance=`{ob:+.2f}` EV=`{ev*100:+.1f}%`")
 
 
 async def job_ob_signal_btc(context):  await job_ob_signal_asset(context, "BTC")
