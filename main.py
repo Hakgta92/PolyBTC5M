@@ -1666,6 +1666,10 @@ class State:
         self.tds_last_slot=0; self.tds_last_slot_eth=0; self.tds_last_slot_sol=0; self.tds_last_slot_xrp=0
         # ✅ v12.9 — verrou slot stratégie OB signal (par asset)
         self.ob_last_slot={}  # {asset: cur_slot dernier trade OB}
+        # ✅ verrou slot PAR CRYPTO partagé par TOUTES les stratégies (1 seul trade/slot/crypto,
+        # peu importe la stratégie). Posé dans place_bet AVANT l'achat (race-safe), libéré si l'achat échoue.
+        self.asset_trade_slot={}  # {asset: cur_slot dernier trade toutes stratégies confondues}
+        self.bet_in_flight=False  # ✅ True pendant l'exécution de place_bet (anti-race single-position inter-asset)
         # ✅ v12.9 — SLOT RECORDER (/slots): journal de TOUS les slots résolus avec conditions + résultat réel UP/DOWN.
         # Indépendant du trading. Résolution = oracle Chainlink (close vs open), règle officielle Polymarket vérifiée.
         self.slot_records=[]    # dicts: {asset,slot,open,close,result,gap,delta,rsi,macd,dual,regime,session,ts}
@@ -2783,50 +2787,67 @@ async def resolve_paper_bet(context):
     await send(context.bot,f"{'✅' if won else '❌'} *Trade clôturé* [📄]\n`{bet['dir']}` `${bet['entry']:,.0f}`→`${st.price:,.0f}`\nPnL:`{'+' if gross>=0 else ''}{gross:.2f}$` BR:`{st.bankroll:.2f}` ROI:`{roi()}`{cd_msg}")
     st.backup()
 
-async def place_bet(context, direction, amount, conf, reasoning, conf_score, sess, tpu, tpd, market_end, source="tick"):
+async def place_bet(context, direction, amount, conf, reasoning, conf_score, sess, tpu, tpd, market_end, source="tick", asset="BTC"):
     """
     ✅ v10.23 — Placement centralisé: REFETCH prix + MAKER order (undercut) +
     ENTRÉE ÉTAGÉE (la 2e tranche est gérée dans st.bet["staged_remaining"]).
     Rappel source: sur Polymarket tout est un ordre LIMITE de toute façon.
     """
-    order_id=None; token_used=None; entry_tp=0.5
-    # ✅ v10.23 — Entrée étagée: on place d'abord STAGED_FRACTIONS[0] du montant
-    staged_remaining = 0.0
-    first_amount = amount
-    if STAGED_ENTRY and amount >= MIN_BET_USD*2 and source in ("tick","snipe"):
-        first_amount = round(max(MIN_BET_USD, amount*STAGED_FRACTIONS[0]),2)
-        staged_remaining = round(amount-first_amount,2)
-        if staged_remaining < MIN_BET_USD:  # le reste serait sous le minimum → on met tout d'un coup
-            first_amount = amount; staged_remaining = 0.0
+    cur_slot = int(time.time()//300)*300
+    if st.bet is not None:
+        return False
+    if getattr(st, "bet_in_flight", False):  # ✅ achat déjà en cours (single position) — bloque la race inter-asset
+        return False
+    if st.asset_trade_slot.get(asset) == cur_slot:  # ✅ verrou PAR CRYPTO (toutes stratégies confondues)
+        return False
+    if not isinstance(conf_score, dict):
+        conf_score = {"score":0,"signals":[]}
+    # Verrous posés AVANT tout await (race-safe): in-flight global + slot par crypto
+    st.bet_in_flight = True
+    st.asset_trade_slot[asset] = cur_slot
+    try:
+        order_id=None; token_used=None; entry_tp=0.5
+        # ✅ v10.23 — Entrée étagée: on place d'abord STAGED_FRACTIONS[0] du montant
+        staged_remaining = 0.0
+        first_amount = amount
+        if STAGED_ENTRY and amount >= MIN_BET_USD*2 and source in ("tick","snipe"):
+            first_amount = round(max(MIN_BET_USD, amount*STAGED_FRACTIONS[0]),2)
+            staged_remaining = round(amount-first_amount,2)
+            if staged_remaining < MIN_BET_USD:  # le reste serait sous le minimum → on met tout d'un coup
+                first_amount = amount; staged_remaining = 0.0
 
-    if not st.paper_mode and st.current_market:
-        token_used=st.current_market["token_up"] if direction=="UP" else st.current_market["token_down"]
-        if market_end > 0 and (market_end - time.time()) < 15:
-            log_skip(f"Slot expire dans {market_end-time.time():.0f}s — ordre annulé", direction)
-            return False
-        # ✅ REFETCH prix juste avant l'ordre
-        fresh_tp = await poly.get_token_price(token_used)
-        entry_tp = fresh_tp if fresh_tp > 0 else (tpu if direction=="UP" else tpd)
-        if source=="tick" and (entry_tp < 0.35 or entry_tp > 0.92):
-            log_skip(f"Prix token bougé avant ordre ({entry_tp:.2f}$)", direction); return False
-        if source=="snipe" and (entry_tp < SNIPE_TOKEN_MIN-0.05 or entry_tp > SNIPE_TOKEN_MAX+0.03):
-            log_skip(f"SNIPE: prix token bougé ({entry_tp:.2f}$)", direction); return False
-        order_id=await poly.place_order(token_used, first_amount, entry_tp, "BUY")  # ✅ maker/limite
-        if not order_id:
-            await send(context.bot,"⚠️ *Ordre Polymarket refusé — réessai prochain slot*"); return False
-        st.active_order_id=order_id; st.active_token_id=token_used
-        st.entry_token_price=entry_tp; st.shares_bought=round(first_amount/entry_tp,4) if entry_tp>0 else 0
-        st.token_price_peak=1.0; st.trailing_active=False
-        st.bet_expiry=market_end if market_end>0 else (int(time.time()//300)*300+300)
-    else:
-        entry_tp = tpu if direction=="UP" else tpd
-        st.entry_token_price=entry_tp; st.shares_bought=round(first_amount/entry_tp,4) if entry_tp>0 else 0
-        st.bet_expiry=int(time.time()//300)*300+300
-    st.bet={"dir":direction,"amount":first_amount,"conf":conf,"entry":consensus_price() if consensus_price()>0 else st.price,
-            "reasoning":reasoning,"ts":int(time.time()),"score":conf_score.get("score",0),"session":sess["session"],
-            "staged_remaining":staged_remaining,"staged_done":staged_remaining<=0,"source":source}
-    st.last_trade_slot = int(time.time()//300)*300  # ✅ dédup
-    return True
+        if not st.paper_mode and st.current_market:
+            token_used=st.current_market["token_up"] if direction=="UP" else st.current_market["token_down"]
+            if market_end > 0 and (market_end - time.time()) < 15:
+                log_skip(f"Slot expire dans {market_end-time.time():.0f}s — ordre annulé", direction)
+                st.asset_trade_slot[asset] = 0
+                return False
+            # ✅ REFETCH prix juste avant l'ordre
+            fresh_tp = await poly.get_token_price(token_used)
+            entry_tp = fresh_tp if fresh_tp > 0 else (tpu if direction=="UP" else tpd)
+            if source=="tick" and (entry_tp < 0.35 or entry_tp > 0.92):
+                log_skip(f"Prix token bougé avant ordre ({entry_tp:.2f}$)", direction); st.asset_trade_slot[asset] = 0; return False
+            if source=="snipe" and (entry_tp < SNIPE_TOKEN_MIN-0.05 or entry_tp > SNIPE_TOKEN_MAX+0.03):
+                log_skip(f"SNIPE: prix token bougé ({entry_tp:.2f}$)", direction); st.asset_trade_slot[asset] = 0; return False
+            order_id=await poly.place_order(token_used, first_amount, entry_tp, "BUY")  # ✅ maker/limite
+            if not order_id:
+                await send(context.bot,"⚠️ *Ordre Polymarket refusé — réessai prochain slot*"); st.asset_trade_slot[asset] = 0; return False
+            st.active_order_id=order_id; st.active_token_id=token_used
+            st.entry_token_price=entry_tp; st.shares_bought=round(first_amount/entry_tp,4) if entry_tp>0 else 0
+            st.token_price_peak=1.0; st.trailing_active=False
+            st.bet_expiry=market_end if market_end>0 else (int(time.time()//300)*300+300)
+        else:
+            entry_tp = tpu if direction=="UP" else tpd
+            st.entry_token_price=entry_tp; st.shares_bought=round(first_amount/entry_tp,4) if entry_tp>0 else 0
+            st.bet_expiry=int(time.time()//300)*300+300
+        st.bet={"dir":direction,"amount":first_amount,"conf":conf,"entry":consensus_price() if consensus_price()>0 else st.price,
+                "reasoning":reasoning,"ts":int(time.time()),"score":conf_score.get("score",0),"session":sess["session"],
+                "staged_remaining":staged_remaining,"staged_done":staged_remaining<=0,"source":source}
+        if asset == "BTC":
+            st.last_trade_slot = cur_slot  # ✅ dédup BTC (job_tick/momentum/meanrev/oracle BTC s'y réfèrent)
+        return True
+    finally:
+        st.bet_in_flight = False  # ✅ libère TOUJOURS le verrou in-flight (succès, échec ou exception)
 
 async def job_staged_entry(context):
     """✅ v10.23 — Place la 2e tranche si le signal tient toujours (oracle/delta cohérents)"""
@@ -3104,7 +3125,7 @@ async def job_tick(context):
     if amount < MIN_BET_USD:
         log_skip(f"Mise calculée {amount:.2f}$<{MIN_BET_USD}$ minimum absolu", direction); return
     if st.bankroll<amount: return
-    ok = await place_bet(context, direction, amount, dec["conf"], dec["reasoning"], conf_score, sess, tpu, tpd, market_end, source="tick")
+    ok = await place_bet(context, direction, amount, dec["conf"], dec["reasoning"], conf_score, sess, tpu, tpd, market_end, source="tick", asset="BTC")
     if not ok: return
     mode="💰 RÉEL" if not st.paper_mode else "📄 paper"
     risk_e={"LOW":"🟢","MEDIUM":"🟡","HIGH":"🔴"}.get(dec["risk"],"🟡")
@@ -3450,7 +3471,7 @@ async def job_oracle_lag(context):
     reasoning = (f"⚡ORACLE LAG BTC {direction} | gap={spot_oracle_gap:+.3f}% delta={oracle_delta:+.3f}% "
                  f"OB={st.ob_imbalance:+.2f} votes={dir_votes}/5 | tok={token_price:.3f}$ EV={ev*100:+.1f}% T-{int(slot_remaining)}s")
 
-    ok = await place_bet(context, direction, amount, round(p_oracle,2), reasoning, conf_score, sess, tpu, tpd, market_end, source="snipe")
+    ok = await place_bet(context, direction, amount, round(p_oracle,2), reasoning, conf_score, sess, tpu, tpd, market_end, source="snipe", asset="BTC")
     if not ok: return
 
     st.last_trade_slot = cur_slot
@@ -3641,7 +3662,8 @@ async def job_oracle_lag_asset(context, asset:str):
     tpu=market["token_up"]; tpd=market["token_down"]
     market_end=market.get("end_date",""); sess=session_ctx(); conf_score={"score":0,"signals":[]}
     reasoning=f"ORACLE LAG {symbol} {direction} | gap={spot_oracle_gap:+.3f}% delta={oracle_delta:+.3f}% TA={ta_score} votes={dir_votes}/5 | tok={token_price:.3f}$ EV={ev*100:+.1f}% T-{int(slot_remaining)}s"
-    ok=await place_bet(context,direction,amount,round(p_oracle,2),reasoning,conf_score,sess,tpu,tpd,market_end,source="snipe")
+    st.current_market=market  # ✅ place_bet route l'ordre réel via st.current_market — doit pointer le marché de l'asset
+    ok=await place_bet(context,direction,amount,round(p_oracle,2),reasoning,conf_score,sess,tpu,tpd,market_end,source="snipe",asset=asset)
     if not ok: return
     if asset=="ETH": st.eth_last_trade_slot=cur_slot
     elif asset=="SOL": st.sol_last_trade_slot=cur_slot
@@ -3829,7 +3851,8 @@ async def job_momentum_btc(context):
     conf_score = {"score":0,"signals":[]}
     reasoning = f"⚡MOMENTUM BTC {direction} | ret60s={ret_60s:+.3f}% ret30s={ret_30s:+.3f}% ret3s={ret_3s:+.3f}% trend10m={trend_10m:+.3f}% | tok={token_price:.2f}$ EV={ev*100:+.1f}% T-{int(slot_remaining)}s"
 
-    ok = await place_bet(context, direction, amount, round(p_mom,2), reasoning, conf_score, sess, tpu, tpd, market_end, source="momentum")
+    st.current_market = market  # ✅ place_bet route l'ordre réel via st.current_market
+    ok = await place_bet(context, direction, amount, round(p_mom,2), reasoning, conf_score, sess, tpu, tpd, market_end, source="momentum", asset="BTC")
     if not ok: return
 
     st.momentum_last_slot = cur_slot
@@ -3942,7 +3965,8 @@ async def job_momentum_asset(context, asset):
     reasoning = (f"⚡MOMENTUM {asset} {direction} | ret60s={ret_60s:+.3f}% ret30s={ret_30s:+.3f}% ret3s={ret_3s:+.3f}% "
                  f"trend10m={trend_10m:+.3f}% | tok={token_price:.2f}$ EV={ev*100:+.1f}% T-{int(slot_remaining)}s")
 
-    ok = await place_bet(context, direction, amount, round(p_mom,2), reasoning, conf_score, sess, tpu, tpd, market_end, source="momentum")
+    st.current_market = market  # ✅ place_bet route l'ordre réel via st.current_market — doit pointer le marché de l'asset
+    ok = await place_bet(context, direction, amount, round(p_mom,2), reasoning, conf_score, sess, tpu, tpd, market_end, source="momentum", asset=asset)
     if not ok: return
 
     setattr(st, cfg["mom_slot"], cur_slot)
@@ -4076,7 +4100,8 @@ async def job_mean_reversion_btc(context):
     reasoning = (f"🔄MEAN-REV BTC {direction} | bandwidth={bandwidth:+.3f}% overext={overext:+.3f}% "
                  f"ret3s={ret_3s:+.3f}% | tok={token_price:.2f}$ EV={ev*100:+.1f}% T-{int(slot_remaining)}s")
 
-    ok = await place_bet(context, direction, amount, round(p_rev,2), reasoning, conf_score, sess, tpu, tpd, market_end, source="meanrev")
+    st.current_market = market  # ✅ place_bet route l'ordre réel via st.current_market
+    ok = await place_bet(context, direction, amount, round(p_rev,2), reasoning, conf_score, sess, tpu, tpd, market_end, source="meanrev", asset="BTC")
     if not ok: return
 
     st.meanrev_last_slot = cur_slot
@@ -4184,7 +4209,8 @@ async def job_mean_reversion_asset(context, asset):
     reasoning = (f"🔄MEAN-REV {asset} {direction} | bandwidth={bandwidth:+.3f}% overext={overext:+.3f}% "
                  f"ret3s={ret_3s:+.3f}% | tok={token_price:.2f}$ EV={ev*100:+.1f}% T-{int(slot_remaining)}s")
 
-    ok = await place_bet(context, direction, amount, round(p_rev,2), reasoning, conf_score, sess, tpu, tpd, market_end, source="meanrev")
+    st.current_market = market  # ✅ place_bet route l'ordre réel via st.current_market — doit pointer le marché de l'asset
+    ok = await place_bet(context, direction, amount, round(p_rev,2), reasoning, conf_score, sess, tpu, tpd, market_end, source="meanrev", asset=asset)
     if not ok: return
 
     setattr(st, cfg["mr_slot"], cur_slot)
@@ -4299,16 +4325,17 @@ async def job_ob_signal_asset(context, asset):
     amount = kelly_bet(st.bankroll, p_conf, payout, token_price)
     if amount < MIN_BET_USD: return
 
-    sess = session_ctx().get("session","?")
+    sess = session_ctx()  # ✅ place_bet attend le dict complet (fait sess["session"]) — pas la string
     reasoning = f"📖 OB SIGNAL {asset} {direction} | imbalance={ob:+.2f} tok={token_price:.2f}$ EV={ev*100:+.1f}% T-{int(slot_remaining)}s"
     st.current_market = market
-    ok = await place_bet(context, direction, amount, p_conf, reasoning, p_conf, sess,
+    ok = await place_bet(context, direction, amount, p_conf, reasoning, {"score":0,"signals":[]}, sess,
                          token_price if direction=="UP" else 1-token_price,
                          token_price if direction=="DOWN" else 1-token_price,
-                         cur_slot+300, source="ob_signal")
+                         cur_slot+300, source="ob_signal", asset=asset)
     if ok:
         st.ob_last_slot[asset] = cur_slot
         log.info(f"📖 OB SIGNAL TRADE {asset} {direction} {amount:.2f}$ (OB={ob:+.2f})")
+        await send(context.bot, f"📖 *OB SIGNAL* {asset} `{direction}` `{amount:.2f}$` @`{token_price:.2f}$` | imbalance=`{ob:+.2f}` EV=`{ev*100:+.1f}%`")
 
 
 async def job_ob_signal_btc(context):  await job_ob_signal_asset(context, "BTC")
@@ -4447,7 +4474,8 @@ async def job_confluence_asset(context, asset):
                  f"(oracle={oracle_score:.2f} setup={setup_score:.2f} noise={noise_penalty:.1f}) | "
                  f"gap={gap_pct:+.3f}% BW={bandwidth:.3f}% | tok={token_price:.2f}$ EV={ev*100:+.1f}% T-{int(slot_remaining)}s")
 
-    ok = await place_bet(context, direction, amount, round(p_conf,2), reasoning, conf_score, sess, tpu, tpd, market_end, source="confluence")
+    st.current_market = market  # ✅ place_bet route l'ordre réel via st.current_market — doit pointer le marché de l'asset
+    ok = await place_bet(context, direction, amount, round(p_conf,2), reasoning, conf_score, sess, tpu, tpd, market_end, source="confluence", asset=asset)
     if not ok: return
 
     setattr(st, cfg["tds_slot"], cur_slot)
