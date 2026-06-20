@@ -1930,25 +1930,25 @@ def register_trade_result(won):
             st.killed=True; st.running=False
 
 async def send(bot,text,parse_mode="Markdown"):
-    # ✅ Robuste: gère le rate-limit Telegram (RetryAfter) + repli texte brut si le Markdown casse.
-    # Évite les messages perdus quand plusieurs notifs partent coup sur coup (multi-crypto).
+    # ✅ Robuste: gère le rate-limit Telegram (RetryAfter) + repli texte brut si le Markdown casse
+    # + retry sur TOUTE exception (pas seulement RetryAfter — un simple blip réseau/timeout ne
+    # doit jamais faire disparaître silencieusement une notif de trade RÉEL déjà exécuté).
+    plain = text.replace("*","").replace("`","").replace("_","")
     for attempt in range(3):
         try:
             await bot.send_message(chat_id=ALLOWED_UID,text=text,parse_mode=parse_mode); return True
         except Exception as e:
             ra = getattr(e, "retry_after", None)
-            if ra and attempt < 2:
-                try: await asyncio.sleep(float(ra)+0.5); continue
-                except: pass
-            log.error(f"Send: {e}")
+            log.error(f"Send (markdown, essai {attempt+1}/3): {e}")
             try:
-                await bot.send_message(chat_id=ALLOWED_UID,text=text.replace("*","").replace("`","").replace("_","")); return True
+                await bot.send_message(chat_id=ALLOWED_UID,text=plain); return True
             except Exception as e2:
-                ra2 = getattr(e2, "retry_after", None)
-                if ra2 and attempt < 2:
-                    try: await asyncio.sleep(float(ra2)+0.5); continue
-                    except: pass
-                return False
+                log.error(f"Send (texte brut, essai {attempt+1}/3): {e2}")
+                ra = ra or getattr(e2, "retry_after", None)
+            if attempt < 2:
+                try: await asyncio.sleep(float(ra)+0.5 if ra else 1.5*(attempt+1))
+                except: pass
+    log.error("Send: notif perdue après 3 tentatives (markdown + texte brut)")
     return False
 
 async def reply_md(update, text):
