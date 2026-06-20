@@ -3148,6 +3148,7 @@ async def place_bet(context, direction, amount, conf, reasoning, conf_score, ses
             if not order_id:
                 await send(context.bot,"⚠️ *Ordre Polymarket refusé — réessai prochain slot*"); st.asset_trade_slot[asset] = 0; return False
             fill_type = "assumed"  # v1/non vérifiable: on suppose rempli (ancien comportement)
+            real_shares = None  # ✅ shares RÉELLEMENT reçues (mesurées via le solde), pas supposées
             # ✅ #1 — Vérification du fill (le GTC maker à -2¢ peut rester POSÉ sans être exécuté).
             if bal0 is not None:
                 await asyncio.sleep(FILL_WAIT_S)
@@ -3155,6 +3156,7 @@ async def place_bet(context, direction, amount, conf, reasoning, conf_score, ses
                 bal1 = await poly.get_position_size(token_used)
                 filled = (bal1 is not None and bal1 > bal0)
                 fill_type = "maker" if filled else "none"
+                if filled: real_shares = round(bal1 - bal0, 4)
                 if not filled:
                     # Maker non rempli → croiser le spread en taker (EV inclut déjà les frais taker)
                     log.info(f"{asset}: maker non rempli, bascule taker")
@@ -3163,16 +3165,24 @@ async def place_bet(context, direction, amount, conf, reasoning, conf_score, ses
                         await asyncio.sleep(FILL_TAKER_WAIT_S)
                         bal2 = await poly.get_position_size(token_used)
                         filled = (bal2 is not None and bal2 > bal0)
-                        if filled: fill_type = "taker"
+                        if filled: fill_type = "taker"; real_shares = round(bal2 - bal0, 4)
                 if not filled:
                     st.exec_stats["nofill"] = st.exec_stats.get("nofill",0) + 1
                     log_skip(f"{asset}: ordre non rempli (maker+taker) — pas de position fantôme", direction)
                     st.asset_trade_slot[asset] = 0; return False
                 st.exec_stats[fill_type] = st.exec_stats.get(fill_type,0) + 1
-            # frais estimés: ~0 en maker (rebate), taker_fee_per_share sinon
-            fee_est = 0.0 if fill_type=="maker" else round(taker_fee_per_share(entry_tp) * (first_amount/entry_tp if entry_tp>0 else 0), 3)
             st.active_order_id=order_id; st.active_token_id=token_used
-            st.entry_token_price=entry_tp; st.shares_bought=round(first_amount/entry_tp,4) if entry_tp>0 else 0
+            # ✅ Prix d'entrée RÉEL = montant dépensé / shares réellement reçues (solde avant/après),
+            # PAS le prix de référence pré-ordre (entry_tp) qui diffère du prix réel rempli en cas de
+            # bascule taker (slippage interne à place_market_order) ou de fill partiel du maker.
+            # Source du bug "prix du bet sur Telegram ≠ prix réel" et des gains mal calculés à la résolution.
+            if real_shares and real_shares > 0:
+                st.shares_bought = real_shares
+                st.entry_token_price = round(first_amount/real_shares, 4)
+            else:
+                st.entry_token_price=entry_tp; st.shares_bought=round(first_amount/entry_tp,4) if entry_tp>0 else 0
+            # frais estimés: ~0 en maker (rebate), taker_fee_per_share sinon — basé sur le prix réel
+            fee_est = 0.0 if fill_type=="maker" else round(taker_fee_per_share(st.entry_token_price) * st.shares_bought, 3)
             st.token_price_peak=1.0; st.trailing_active=False
             st.bet_expiry=market_end if market_end>0 else (int(time.time()//300)*300+300)
         else:
