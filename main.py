@@ -115,7 +115,7 @@ STOP_LOSS_MULT     = 0.01   # v12.4 désactivé  # Vendre si token tombe sous 45
 ORACLE_LAG_MIN_PCT  = 0.03   # Divergence oracle vs orderbook mini pour signaler un lag exploitable
 ORACLE_FRESH_S      = 3.0    # Tick Chainlink considéré frais si <3s
 # Entrée étagée
-STAGED_ENTRY        = True   # Splitter la mise en 2 tranches
+STAGED_ENTRY        = False  # ❌ DÉSACTIVÉ (demande user 20/06): 1 seul bet/tranche par slot/crypto (pas de 2e tranche)
 STAGED_FRACTIONS    = [0.6, 0.4]   # 60% à la 1re entrée, 40% à la 2e si signal tient
 # Maker order (presque gratuit: tout est limite sur Polymarket de toute façon)
 USE_MAKER_ORDERS    = True   # Ordre limite maker = zéro frais + rebate 25%
@@ -1920,11 +1920,36 @@ def register_trade_result(won):
             st.killed=True; st.running=False
 
 async def send(bot,text,parse_mode="Markdown"):
-    try: await bot.send_message(chat_id=ALLOWED_UID,text=text,parse_mode=parse_mode); return True
+    # ✅ Robuste: gère le rate-limit Telegram (RetryAfter) + repli texte brut si le Markdown casse.
+    # Évite les messages perdus quand plusieurs notifs partent coup sur coup (multi-crypto).
+    for attempt in range(3):
+        try:
+            await bot.send_message(chat_id=ALLOWED_UID,text=text,parse_mode=parse_mode); return True
+        except Exception as e:
+            ra = getattr(e, "retry_after", None)
+            if ra and attempt < 2:
+                try: await asyncio.sleep(float(ra)+0.5); continue
+                except: pass
+            log.error(f"Send: {e}")
+            try:
+                await bot.send_message(chat_id=ALLOWED_UID,text=text.replace("*","").replace("`","").replace("_","")); return True
+            except Exception as e2:
+                ra2 = getattr(e2, "retry_after", None)
+                if ra2 and attempt < 2:
+                    try: await asyncio.sleep(float(ra2)+0.5); continue
+                    except: pass
+                return False
+    return False
+
+async def reply_md(update, text):
+    """Réponse Markdown avec repli auto en texte brut si le parsing échoue → évite les commandes
+    'muettes' (ex: /calib) quand un caractère casse le Markdown Telegram."""
+    try:
+        await update.message.reply_text(text, parse_mode="Markdown"); return
     except Exception as e:
-        log.error(f"Send: {e}")
-        try: await bot.send_message(chat_id=ALLOWED_UID,text=text.replace("*","").replace("`","").replace("_","")); return True
-        except: return False
+        log.error(f"reply_md: {e}")
+        try: await update.message.reply_text(text.replace("*","").replace("`","").replace("_",""))
+        except Exception as e2: log.error(f"reply_md plain: {e2}")
 
 # ─── JOBS ──────────────────────────────────────────────────────────────────
 async def job_backup(context):
@@ -1992,20 +2017,41 @@ async def job_check_expiry(context):
                 f"`{st.bet['dir']}` | Token:`{current_price:.3f}$` | x`{gain_mult:.2f}`\n"
                 f"BTC:`${st.price:,.2f}`")
 
-        # ✅ Clôture automatique 60s après expiration
+        # ✅ Clôture automatique 60s après expiration.
+        # Résultat = VRAIE résolution (slot recorder: close vs open oracle = règle Polymarket),
+        # PAS le signe du solde (qui lag à cause du settlement → faux WIN/LOSS + faux BR).
         if remaining < -60:
-            log.info("Slot expiré depuis >60s — clôture automatique")
-            clob_bal = await fetch_clob_balance()
             bet = st.bet
-            if clob_bal and clob_bal > 0:
-                prev_bal = st.bankroll
-                gross = round(clob_bal - prev_bal, 2)
-                won = gross >= 0
-                st.bankroll = clob_bal
+            bet_asset = bet.get("asset","BTC")
+            bet_slot = (int(bet.get("ts", now))//300)*300
+            # 1) Outcome RÉEL via le slot recorder
+            rec = next((r for r in reversed(st.slot_records)
+                        if r.get("asset")==bet_asset and r.get("slot")==bet_slot
+                        and r.get("result") in ("UP","DOWN")), None)
+            won = (rec["result"] == bet["dir"]) if rec else None
+            # 2) Fallback: prix du token résolu (gagnant→~1$, perdant→~0$)
+            if won is None and st.active_token_id:
+                res_price = await poly.get_token_price(st.active_token_id)
+                if res_price >= 0.6: won = True
+                elif 0 < res_price <= 0.4: won = False
+            # 3) Toujours ambigu → on réessaie au prochain cycle, sauf délai max (~3min) dépassé
+            if won is None:
+                if remaining > -180: return
+                won = False
+            log.info(f"Slot résolu {bet_asset} {bet['dir']} → {'WIN' if won else 'LOSS'} (recorder={'oui' if rec else 'non'})")
+            # Montant déterministe depuis les shares (position pleine, plus de vente anticipée)
+            shares = st.shares_bought or 0; entry = st.entry_token_price or 0
+            cost = round(shares*entry, 2) if entry>0 else bet.get("amount",0)
+            est_gross = round((shares - cost) if won else -cost, 2)
+            # BR: solde réel si le payout a été crédité (solde bougé) ET cohérent avec le résultat; sinon estimation
+            clob_bal = await fetch_clob_balance()
+            if (clob_bal and clob_bal > 0 and abs(clob_bal - st.bankroll) >= 0.01
+                    and not (won and clob_bal < st.bankroll) and not ((not won) and clob_bal > st.bankroll)):
+                gross = round(clob_bal - st.bankroll, 2); st.bankroll = clob_bal
             else:
-                gross = 0.0; won = False
+                gross = est_gross; st.bankroll = max(0.0, round(st.bankroll + est_gross, 2))
             st.pnl += gross
-            register_trade_result(won)  # ✅ v10.22 — streaks + conservateur aussi en réel
+            register_trade_result(won)  # ✅ streaks + conservateur aussi en réel
             result_txt = "WIN" if won else "LOSS"
             if not won and st.consec >= CONSERVATIVE_AFTER_LOSSES:
                 await send(context.bot, f"⚠️ *Mode conservateur activé 2h* — {st.consec} pertes consécutives")
@@ -2014,101 +2060,23 @@ async def job_check_expiry(context):
                 "reasoning":"Résolution auto slot expiré","paper":False,"ts":int(now),
                 "score":bet.get("score",0),"fg_value":st.fg.get("value",50),
                 "session":bet.get("session","?"),"aligned_15h1h":True,"source":bet.get("source","?"),
-                "asset":bet.get("asset","?"),"entry_token":bet.get("entry_token",0),"t_remaining":bet.get("t_remaining",0),
+                "asset":bet_asset,"entry_token":bet.get("entry_token",0),"t_remaining":bet.get("t_remaining",0),
                 "fill_type":bet.get("fill_type","?"),"fee_est":bet.get("fee_est",0)})
             st.bet=None; st.active_token_id=None; st.active_order_id=None
             st.shares_bought=0; st.entry_token_price=0
             st.token_price_peak=0; st.trailing_active=False; st.bet_expiry=0
             emoji="✅" if won else "❌"
             await send(context.bot,
-                f"{emoji} *Trade résolu* (slot expiré)\n"
+                f"{emoji} *Trade résolu {bet_asset}* (slot)\n"
                 f"`{bet['dir']}` | PnL:`{fmt(gross)}$`\n"
                 f"BR:`{st.bankroll:.2f}$` | ROI:`{roi()}`")
             st.backup()
 
 async def job_take_profit(context):
-    """✅ v10.16 — Vente anticipée si x2/x3/x4 avant résolution du slot"""
-    if not st.bet or not st.active_token_id or st.paper_mode: return
-    try:
-        current_price = await poly.get_token_price(st.active_token_id)
-        if current_price <= 0 or st.entry_token_price <= 0: return
-
-        gain_mult = current_price / st.entry_token_price
-
-        if gain_mult > st.token_price_peak:
-            st.token_price_peak = gain_mult
-            if gain_mult >= TRAILING_PEAK_MULT and not st.trailing_active:
-                st.trailing_active = True
-                await send(context.bot,
-                    f"🎯 *Trailing stop activé* x`{gain_mult:.2f}`\n"
-                    f"Vente auto si retombe sous x`{TRAILING_STOP_MULT:.1f}`")
-
-        sell_reason = None
-        sell_pct = 0
-        # ✅ B1 — Paliers de take-profit "à exécution unique": tp_tier = plus haut palier déjà vendu
-        # (0=aucun, 1=x2, 2=x3, 3=x4). Sans ce marqueur, job_take_profit (toutes les 15s) revendait
-        # un % du restant à CHAQUE tick tant que gain≥x2 → la position était liquidée à x2 au lieu de
-        # courir vers x3/x4. Chaque palier ne se déclenche désormais qu'une seule fois.
-        tp_tier = st.bet.get("tp_tier", 0)
-        new_tier = tp_tier
-
-        # ✅ v10.24 — STOP LOSS (désactivé par défaut: STOP_LOSS_MULT=0.01)
-        if gain_mult < STOP_LOSS_MULT:
-            sell_reason = f"🛑 Stop loss x{gain_mult:.2f} (<{STOP_LOSS_MULT})"; sell_pct = 100
-        elif current_price >= 0.95:
-            sell_reason = f"✅ Résolution imminente (token={current_price:.2f}$)"; sell_pct = 100
-        elif gain_mult >= 4.0 and tp_tier < 3:
-            sell_reason = f"🚀 x{gain_mult:.1f} — Take profit x4 (solde)"; sell_pct = 100; new_tier = 3
-        elif gain_mult >= 3.0 and tp_tier < 2:
-            sell_reason = f"💰 x{gain_mult:.1f} — Take profit x3 (palier 2)"; sell_pct = 50; new_tier = 2
-        elif gain_mult >= 2.0 and tp_tier < 1:
-            sell_reason = f"💰 x{gain_mult:.1f} — Take profit x2 (palier 1)"; sell_pct = 40; new_tier = 1
-        elif st.trailing_active and st.token_price_peak > 0:
-            trail_threshold = max(TRAILING_STOP_MULT, st.token_price_peak * 0.87)
-            if gain_mult < trail_threshold:
-                sell_reason = f"Trailing stop (peak x{st.token_price_peak:.2f}→x{gain_mult:.2f})"; sell_pct = 100
-
-        if sell_reason:
-            shares_to_sell = round(st.shares_bought * sell_pct / 100, 4)
-            opp_token = None
-            if st.current_market:
-                opp_token = st.current_market.get("token_up") if st.bet.get("dir")=="DOWN" else st.current_market.get("token_down")
-            result = await poly.sell_position(st.active_token_id, shares_to_sell, opp_token, current_price)
-            if result:
-                gross = round((current_price - st.entry_token_price) * shares_to_sell, 2)
-                clob_bal = await fetch_clob_balance()
-                if clob_bal and clob_bal > 0:
-                    st.bankroll = clob_bal
-                else:
-                    st.bankroll = max(0.0, st.bankroll + gross)
-                st.pnl += gross
-                bet = st.bet
-
-                if sell_pct == 100:
-                    register_trade_result(True)
-                    st.trades.append({"dir": bet["dir"], "amount": bet["amount"],
-                        "pnl": round(gross, 4), "conf": bet["conf"], "result": "WIN",
-                        "entry": bet["entry"], "exit": st.price, "reasoning": sell_reason,
-                        "paper": False, "ts": int(time.time()), "score": bet.get("score", 0),
-                        "fg_value": st.fg.get("value", 50), "aligned_15h1h": True,
-                        "session": bet.get("session", "?"), "source": bet.get("source", "?"),
-                        "asset": bet.get("asset","?"), "entry_token": bet.get("entry_token",0),
-                        "t_remaining": bet.get("t_remaining",0), "fill_type": bet.get("fill_type","?"),
-                        "fee_est": bet.get("fee_est",0)})
-                    st.bet = None; st.active_token_id = None; st.active_order_id = None
-                    st.shares_bought = 0; st.entry_token_price = 0
-                    st.token_price_peak = 0; st.trailing_active = False; st.bet_expiry = 0
-                else:
-                    st.shares_bought = round(st.shares_bought - shares_to_sell, 4)
-                    st.bet["tp_tier"] = new_tier  # ✅ B1 — marque le palier vendu (anti re-vente à chaque tick)
-                    st.trailing_active = True
-
-                await send(context.bot,
-                    f"🎯 *VENTE {sell_pct}%* — {sell_reason}\n"
-                    f"`{bet['dir']}` | `+{gross:.2f} USDC`\n"
-                    f"BR:`{st.bankroll:.2f}` | ROI:`{roi()}`")
-                st.backup()
-    except Exception as e: log.error(f"job_take_profit: {e}")
+    """❌ DÉSACTIVÉ (demande user 20/06): plus AUCUNE vente anticipée (ni TP x2/x3/x4, ni stop, ni
+    trailing). On laisse TOUJOURS la position aller jusqu'à la résolution du slot (job_check_expiry).
+    No-op conservé pour ne pas toucher au scheduler."""
+    return
 
 # ═══════════ ✅ v10.21 — WEBSOCKET BINANCE + FAIR VALUE (modèle Brownien) ═══════════
 async def ws_binance_loop():
@@ -2648,6 +2616,25 @@ def consensus_price():
     prices.sort()
     n=len(prices)
     return prices[n//2] if n%2 else (prices[n//2-1]+prices[n//2])/2
+
+def oracle_direction(asset):
+    """✅ Direction 'oracle lag' d'un asset (gap spot↔oracle + delta oracle↔open du slot), ou None
+    si neutre. Sert à exiger que l'OB signal soit DANS LE SENS de l'oracle (confirmation croisée).
+    Même logique que job_oracle_lag mais lecture seule — ne déclenche aucun trade oracle."""
+    a = (asset or "BTC").upper()
+    if a == "BTC":
+        spot = consensus_price() or st.ws_price; oracle = st.oracle_price; slot_open = st.oracle_slot_open
+    else:
+        pfx = a.lower()
+        spot = getattr(st, f"{pfx}_price", 0); oracle = getattr(st, f"{pfx}_oracle_price", 0)
+        slot_open = getattr(st, f"{pfx}_oracle_slot_open", 0)
+    if spot <= 0 or oracle <= 0 or slot_open <= 0:
+        return None
+    gap = (spot - oracle) / oracle * 100
+    delta = (oracle - slot_open) / slot_open * 100
+    gap_dir = "UP" if gap >= 0.025 else ("DOWN" if gap <= -0.025 else None)
+    delta_dir = "UP" if delta >= ORACLE_ENTRY_DELTA else ("DOWN" if delta <= -ORACLE_ENTRY_DELTA else None)
+    return gap_dir or delta_dir
 
 def compute_oracle_lag():
     """
@@ -4675,6 +4662,11 @@ async def job_ob_signal_asset(context, asset):
     if abs(ob) < OB_SIGNAL_THRESHOLD: return  # imbalance pas assez nette
 
     direction = "UP" if ob > 0 else "DOWN"
+    # ✅ Confirmation croisée: l'OB ne trade QUE si l'oracle lag pointe le MÊME sens (OB UP ⇒ oracle UP).
+    odir = oracle_direction(asset)
+    if odir != direction:
+        log_skip(f"{asset} [OB]: OB={direction} mais oracle={odir or 'neutre'} — pas d'accord, skip", direction,
+                 features={"ob":ob,"filter":"ob_oracle_disagree","asset":asset,"oracle_dir":odir or "none","source":"ob_signal"}); return
     try:
         token_id = market["token_up"] if direction=="UP" else market["token_down"]
         token_price = await poly.get_token_price(token_id)
@@ -6875,20 +6867,23 @@ async def cmd_oracle(update,context):
 async def cmd_calib(update,context):
     """✅ v10.23 — État de la calibration sigma"""
     if not auth(update): return
-    factor, desc = calibrate_sigma()
-    _, report = calibration_report()
-    await update.message.reply_text(
-        f"🎚 *CALIBRATION σ*\n━━━━━━━━━━━━━━\n"
-        f"Facteur actuel:`×{st.calib_factor:.2f}` | VOL_SAFETY effectif:`{VOL_SAFETY*st.calib_factor:.2f}`\n"
-        f"{desc}\n\n"
-        f"📊 *Proba prédite vs WR réel* (trades réels)\n{report}\n\n"
-        f"_×N = facteur correctif suggéré (WR réel / proba prédite)_",
-        parse_mode="Markdown")
+    try:
+        factor, desc = calibrate_sigma()
+        _, report = calibration_report()
+        msg = (f"🎚 *CALIBRATION σ*\n━━━━━━━━━━━━━━\n"
+               f"Facteur actuel:`×{st.calib_factor:.2f}` | VOL_SAFETY effectif:`{VOL_SAFETY*st.calib_factor:.2f}`\n"
+               f"{desc}\n\n"
+               f"📊 *Proba prédite vs WR réel* (trades réels)\n{report}\n\n"
+               f"_×N = facteur correctif suggéré (WR réel / proba prédite)_")
+    except Exception as e:
+        log.error(f"cmd_calib: {e}")
+        msg = f"⚠️ /calib erreur: {e}"
+    await reply_md(update, msg)
 
 async def cmd_edge(update,context):
     """✅ Scorecard d'edge par stratégie (rentabilité réelle + significativité)."""
     if not auth(update): return
-    await update.message.reply_text(edge_scorecard(), parse_mode="Markdown")
+    await reply_md(update, edge_scorecard())
 
 async def cmd_slotedge(update,context):
     """✅ #2 — Pouvoir prédictif réel des signaux, miné depuis slot_records.
@@ -6896,32 +6891,32 @@ async def cmd_slotedge(update,context):
     if not auth(update): return
     arg = (context.args[0].upper() if getattr(context,"args",None) else None)
     asset = arg if arg in ("BTC","ETH","SOL","XRP") else None
-    await update.message.reply_text(slot_edge_analysis(asset), parse_mode="Markdown")
+    await reply_md(update, slot_edge_analysis(asset))
 
 async def cmd_exec(update,context):
     """✅ #1 — Qualité d'exécution (maker/taker/non-rempli) + fuite de frais."""
     if not auth(update): return
-    await update.message.reply_text(exec_report(), parse_mode="Markdown")
+    await reply_md(update, exec_report())
 
 async def cmd_zones(update,context):
     """✅ #3 — Zones rentables: WR/PnL par prix d'entrée et par timing."""
     if not auth(update): return
-    await update.message.reply_text(zones_report(), parse_mode="Markdown")
+    await reply_md(update, zones_report())
 
 async def cmd_risk(update,context):
     """✅ #4 — Risque: drawdown, profit factor, séries de pertes, espérance."""
     if not auth(update): return
-    await update.message.reply_text(risk_report(), parse_mode="Markdown")
+    await reply_md(update, risk_report())
 
 async def cmd_matrix(update,context):
     """✅ #5 — Matrice asset × stratégie (PnL réel par croisement)."""
     if not auth(update): return
-    await update.message.reply_text(strategy_matrix(), parse_mode="Markdown")
+    await reply_md(update, strategy_matrix())
 
 async def cmd_slotcombo(update,context):
     """✅ #6 — Combos de signaux (paires) minés depuis slot_records."""
     if not auth(update): return
-    await update.message.reply_text(slot_combo_analysis(), parse_mode="Markdown")
+    await reply_md(update, slot_combo_analysis())
 
 async def cmd_revive(update,context):
     """✅ v10.23 — Réarme le kill-switch"""
