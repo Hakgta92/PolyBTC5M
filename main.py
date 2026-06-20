@@ -1449,26 +1449,29 @@ async def job_reconcile(context):
     positions = await fetch_onchain_positions()
     if positions is None: return  # API indispo → on ne conclut rien
     real_open = len(positions) > 0
-    if real_open and not st.bet:
+    tracked = (1 if st.bet else 0) + (1 if st.bet2 else 0)
+    if real_open and len(positions) > tracked:
         lines = "\n".join(f"• `{p.get('asset','?')[:10]}…` {float(p.get('size',0)):.1f} sh @`{float(p.get('avgPrice',0)):.3f}$`"
                           for p in positions[:5])
-        # Mémorise le token pour que /sell et job_take_profit puissent au moins agir dessus
-        st.active_token_id = positions[0].get("asset") or st.active_token_id
-        st.entry_token_price = float(positions[0].get("avgPrice", 0) or 0) or st.entry_token_price
-        st.shares_bought = float(positions[0].get("size", 0) or 0) or st.shares_bought
+        # Mémorise le token (slot normal en priorité, sinon réservé) pour que /sell et /sellcheck puissent au moins agir dessus
+        sfx = "" if not st.bet else ("2" if not st.bet2 else "")
+        setattr(st, f"active_token_id{sfx}", positions[0].get("asset") or getattr(st, f"active_token_id{sfx}"))
+        setattr(st, f"entry_token_price{sfx}", float(positions[0].get("avgPrice", 0) or 0) or getattr(st, f"entry_token_price{sfx}"))
+        setattr(st, f"shares_bought{sfx}", float(positions[0].get("size", 0) or 0) or getattr(st, f"shares_bought{sfx}"))
         await send(context.bot,
             f"⚠️ *RÉCONCILIATION* — position(s) réelle(s) NON suivie(s):\n{lines}\n\n"
-            f"_Le bot se croyait flat (st.bet vide). Token mémorisé pour `/sell`/`/sellcheck`. "
+            f"_Le bot suit {tracked} position(s), {len(positions)} détectée(s) on-chain. Token mémorisé pour `/sell`/`/sellcheck`. "
             f"Vérifie et solde manuellement si besoin._")
-        log.warning(f"Réconciliation: {len(positions)} position(s) réelle(s) non suivie(s)")
-    elif st.bet and not real_open:
+        log.warning(f"Réconciliation: {len(positions)} position(s) réelle(s), {tracked} suivie(s)")
+    elif tracked and not real_open:
         await send(context.bot,
-            "⚠️ *RÉCONCILIATION* — `st.bet` présent mais AUCUNE position réelle on-chain "
+            "⚠️ *RÉCONCILIATION* — position(s) locale(s) présente(s) mais AUCUNE position réelle on-chain "
             "(déjà résolue/vendue). Nettoyage de l'état local.")
-        log.warning("Réconciliation: st.bet fantôme nettoyé (pas de position on-chain)")
-        st.bet=None; st.active_token_id=None; st.active_order_id=None
-        st.shares_bought=0; st.entry_token_price=0; st.token_price_peak=0
-        st.trailing_active=False; st.bet_expiry=0
+        log.warning("Réconciliation: position(s) fantôme(s) nettoyée(s) (pas de position on-chain)")
+        for sfx in ("", "2"):
+            setattr(st, f"bet{sfx}", None); setattr(st, f"active_token_id{sfx}", None); setattr(st, f"active_order_id{sfx}", None)
+            setattr(st, f"shares_bought{sfx}", 0); setattr(st, f"entry_token_price{sfx}", 0); setattr(st, f"bet_expiry{sfx}", 0)
+        st.token_price_peak=0; st.trailing_active=False
 
 async def fetch_price():
     sources=[("Kraken","https://api.kraken.com/0/public/Ticker?pair=XBTUSD",lambda d:float(d["result"]["XXBTZUSD"]["c"][0])),
@@ -1733,6 +1736,13 @@ class State:
         # peu importe la stratégie). Posé dans place_bet AVANT l'achat (race-safe), libéré si l'achat échoue.
         self.asset_trade_slot={}  # {asset: cur_slot dernier trade toutes stratégies confondues}
         self.bet_in_flight=False  # ✅ True pendant l'exécution de place_bet (anti-race single-position inter-asset)
+        # ✅ Slot RÉSERVÉ pour BTC oracle lag (demande user 20/06): BTC oracle pouvait ne jamais trader
+        # car bloqué par le verrou global st.bet dès qu'une AUTRE strat/asset avait une position ouverte.
+        # bet2/* est une 2e position parallèle dédiée exclusivement à job_oracle_lag (BTC) — max 2 positions
+        # simultanées au total (1 normale + 1 réservée BTC oracle). Même verrou asset_trade_slot["BTC"]
+        # partagé donc toujours 1 seul trade BTC par slot, mais BTC oracle n'attend plus son tour.
+        self.bet2=None; self.active_order_id2=None; self.active_token_id2=None
+        self.entry_token_price2=0.0; self.shares_bought2=0.0; self.bet_expiry2=0
         self.exec_stats={"maker":0,"taker":0,"nofill":0}  # ✅ qualité d'exécution (compteurs cumulés)
         # ✅ v12.9 — SLOT RECORDER (/slots): journal de TOUS les slots résolus avec conditions + résultat réel UP/DOWN.
         # Indépendant du trading. Résolution = oracle Chainlink (close vs open), règle officielle Polymarket vérifiée.
@@ -2002,75 +2012,92 @@ async def job_daily_recap(context):
         f"Meilleure session: `{best_sess}`\n\n"
         f"_Bot continue demain — bonne nuit 🌙_")
 
-async def job_check_expiry(context):
-    """✅ v10.18b — Alerte + clôture automatique quand slot expiré"""
-    if not st.bet or st.paper_mode: return
+async def _resolve_expired_bet(context, reserved=False):
+    """✅ Clôture (alerte T-1min + résolution auto) d'une position expirée. Factorisé pour gérer
+    à la fois st.bet (position normale) et st.bet2 (slot RÉSERVÉ BTC oracle, demande user 20/06)."""
+    sfx = "2" if reserved else ""
+    bet = getattr(st, f"bet{sfx}")
+    if not bet: return
     now = time.time()
+    bet_expiry = getattr(st, f"bet_expiry{sfx}")
+    if bet_expiry <= 0: return
+    remaining = bet_expiry - now
+    active_token_id = getattr(st, f"active_token_id{sfx}")
+    entry_token_price = getattr(st, f"entry_token_price{sfx}")
+    tag = " 🔓réservé" if reserved else ""
 
-    if st.bet_expiry > 0:
-        remaining = st.bet_expiry - now
-        if 50 <= remaining <= 70:
-            current_price = await poly.get_token_price(st.active_token_id) if st.active_token_id else 0
-            gain_mult = current_price/st.entry_token_price if st.entry_token_price>0 and current_price>0 else 0
-            await send(context.bot,
-                f"⏰ *Position expire dans ~1min*\n"
-                f"`{st.bet['dir']}` | Token:`{current_price:.3f}$` | x`{gain_mult:.2f}`\n"
-                f"BTC:`${st.price:,.2f}`")
+    if 50 <= remaining <= 70:
+        current_price = await poly.get_token_price(active_token_id) if active_token_id else 0
+        gain_mult = current_price/entry_token_price if entry_token_price>0 and current_price>0 else 0
+        await send(context.bot,
+            f"⏰ *Position expire dans ~1min*{tag}\n"
+            f"`{bet['dir']}` | Token:`{current_price:.3f}$` | x`{gain_mult:.2f}`\n"
+            f"BTC:`${st.price:,.2f}`")
+        return
+    # ✅ Clôture automatique 60s après expiration.
+    # Résultat = VRAIE résolution (slot recorder: close vs open oracle = règle Polymarket),
+    # PAS le signe du solde (qui lag à cause du settlement → faux WIN/LOSS + faux BR).
+    if remaining >= -60: return
 
-        # ✅ Clôture automatique 60s après expiration.
-        # Résultat = VRAIE résolution (slot recorder: close vs open oracle = règle Polymarket),
-        # PAS le signe du solde (qui lag à cause du settlement → faux WIN/LOSS + faux BR).
-        if remaining < -60:
-            bet = st.bet
-            bet_asset = bet.get("asset","BTC")
-            bet_slot = (int(bet.get("ts", now))//300)*300
-            # 1) Outcome RÉEL via le slot recorder
-            rec = next((r for r in reversed(st.slot_records)
-                        if r.get("asset")==bet_asset and r.get("slot")==bet_slot
-                        and r.get("result") in ("UP","DOWN")), None)
-            won = (rec["result"] == bet["dir"]) if rec else None
-            # 2) Fallback: prix du token résolu (gagnant→~1$, perdant→~0$)
-            if won is None and st.active_token_id:
-                res_price = await poly.get_token_price(st.active_token_id)
-                if res_price >= 0.6: won = True
-                elif 0 < res_price <= 0.4: won = False
-            # 3) Toujours ambigu → on réessaie au prochain cycle, sauf délai max (~3min) dépassé
-            if won is None:
-                if remaining > -180: return
-                won = False
-            log.info(f"Slot résolu {bet_asset} {bet['dir']} → {'WIN' if won else 'LOSS'} (recorder={'oui' if rec else 'non'})")
-            # Montant déterministe depuis les shares (position pleine, plus de vente anticipée)
-            shares = st.shares_bought or 0; entry = st.entry_token_price or 0
-            cost = round(shares*entry, 2) if entry>0 else bet.get("amount",0)
-            est_gross = round((shares - cost) if won else -cost, 2)
-            # BR: solde réel si le payout a été crédité (solde bougé) ET cohérent avec le résultat; sinon estimation
-            clob_bal = await fetch_clob_balance()
-            if (clob_bal and clob_bal > 0 and abs(clob_bal - st.bankroll) >= 0.01
-                    and not (won and clob_bal < st.bankroll) and not ((not won) and clob_bal > st.bankroll)):
-                gross = round(clob_bal - st.bankroll, 2); st.bankroll = clob_bal
-            else:
-                gross = est_gross; st.bankroll = max(0.0, round(st.bankroll + est_gross, 2))
-            st.pnl += gross
-            register_trade_result(won)  # ✅ streaks + conservateur aussi en réel
-            result_txt = "WIN" if won else "LOSS"
-            if not won and st.consec >= CONSERVATIVE_AFTER_LOSSES:
-                await send(context.bot, f"⚠️ *Mode conservateur activé 2h* — {st.consec} pertes consécutives")
-            st.trades.append({"dir":bet["dir"],"amount":bet["amount"],"pnl":round(gross,4),
-                "conf":bet["conf"],"result":result_txt,"entry":bet["entry"],"exit":st.price,
-                "reasoning":"Résolution auto slot expiré","paper":False,"ts":int(now),
-                "score":bet.get("score",0),"fg_value":st.fg.get("value",50),
-                "session":bet.get("session","?"),"aligned_15h1h":True,"source":bet.get("source","?"),
-                "asset":bet_asset,"entry_token":bet.get("entry_token",0),"t_remaining":bet.get("t_remaining",0),
-                "fill_type":bet.get("fill_type","?"),"fee_est":bet.get("fee_est",0)})
-            st.bet=None; st.active_token_id=None; st.active_order_id=None
-            st.shares_bought=0; st.entry_token_price=0
-            st.token_price_peak=0; st.trailing_active=False; st.bet_expiry=0
-            emoji="✅" if won else "❌"
-            await send(context.bot,
-                f"{emoji} *Trade résolu {bet_asset}* (slot)\n"
-                f"`{bet['dir']}` | PnL:`{fmt(gross)}$`\n"
-                f"BR:`{st.bankroll:.2f}$` | ROI:`{roi()}`")
-            st.backup()
+    bet_asset = bet.get("asset","BTC")
+    bet_slot = (int(bet.get("ts", now))//300)*300
+    # 1) Outcome RÉEL via le slot recorder
+    rec = next((r for r in reversed(st.slot_records)
+                if r.get("asset")==bet_asset and r.get("slot")==bet_slot
+                and r.get("result") in ("UP","DOWN")), None)
+    won = (rec["result"] == bet["dir"]) if rec else None
+    # 2) Fallback: prix du token résolu (gagnant→~1$, perdant→~0$)
+    if won is None and active_token_id:
+        res_price = await poly.get_token_price(active_token_id)
+        if res_price >= 0.6: won = True
+        elif 0 < res_price <= 0.4: won = False
+    # 3) Toujours ambigu → on réessaie au prochain cycle, sauf délai max (~3min) dépassé
+    if won is None:
+        if remaining > -180: return
+        won = False
+    log.info(f"Slot résolu {bet_asset} {bet['dir']} → {'WIN' if won else 'LOSS'} (recorder={'oui' if rec else 'non'}{'/réservé' if reserved else ''})")
+    # Montant déterministe depuis les shares (position pleine, plus de vente anticipée)
+    shares = getattr(st, f"shares_bought{sfx}") or 0; entry = entry_token_price or 0
+    cost = round(shares*entry, 2) if entry>0 else bet.get("amount",0)
+    est_gross = round((shares - cost) if won else -cost, 2)
+    # BR: solde réel si le payout a été crédité ET cohérent avec le résultat — UNIQUEMENT si aucune
+    # AUTRE position n'est ouverte en parallèle (sinon le solde reflète les 2 et on mal-attribuerait
+    # le gain de l'une à l'autre). Avec 2 positions simultanées possibles, on retombe sur l'estimation
+    # déterministe par shares (fiable depuis le fix prix d'entrée/shares réels).
+    other_bet = st.bet if reserved else st.bet2
+    clob_bal = None if other_bet is not None else await fetch_clob_balance()
+    if (clob_bal and clob_bal > 0 and abs(clob_bal - st.bankroll) >= 0.01
+            and not (won and clob_bal < st.bankroll) and not ((not won) and clob_bal > st.bankroll)):
+        gross = round(clob_bal - st.bankroll, 2); st.bankroll = clob_bal
+    else:
+        gross = est_gross; st.bankroll = max(0.0, round(st.bankroll + est_gross, 2))
+    st.pnl += gross
+    register_trade_result(won)  # ✅ streaks + conservateur aussi en réel
+    result_txt = "WIN" if won else "LOSS"
+    if not won and st.consec >= CONSERVATIVE_AFTER_LOSSES:
+        await send(context.bot, f"⚠️ *Mode conservateur activé 2h* — {st.consec} pertes consécutives")
+    st.trades.append({"dir":bet["dir"],"amount":bet["amount"],"pnl":round(gross,4),
+        "conf":bet["conf"],"result":result_txt,"entry":bet["entry"],"exit":st.price,
+        "reasoning":"Résolution auto slot expiré"+(" (réservé)" if reserved else ""),"paper":False,"ts":int(now),
+        "score":bet.get("score",0),"fg_value":st.fg.get("value",50),
+        "session":bet.get("session","?"),"aligned_15h1h":True,"source":bet.get("source","?"),
+        "asset":bet_asset,"entry_token":bet.get("entry_token",0),"t_remaining":bet.get("t_remaining",0),
+        "fill_type":bet.get("fill_type","?"),"fee_est":bet.get("fee_est",0)})
+    setattr(st, f"bet{sfx}", None); setattr(st, f"active_token_id{sfx}", None); setattr(st, f"active_order_id{sfx}", None)
+    setattr(st, f"shares_bought{sfx}", 0); setattr(st, f"entry_token_price{sfx}", 0); setattr(st, f"bet_expiry{sfx}", 0)
+    if not reserved: st.token_price_peak=0; st.trailing_active=False
+    emoji="✅" if won else "❌"
+    await send(context.bot,
+        f"{emoji} *Trade résolu {bet_asset}*{tag} (slot)\n"
+        f"`{bet['dir']}` | PnL:`{fmt(gross)}$`\n"
+        f"BR:`{st.bankroll:.2f}$` | ROI:`{roi()}`")
+    st.backup()
+
+async def job_check_expiry(context):
+    """✅ v10.18b — Alerte + clôture automatique quand slot expiré (position normale + slot réservé BTC oracle)"""
+    if st.paper_mode: return
+    await _resolve_expired_bet(context, reserved=False)
+    await _resolve_expired_bet(context, reserved=True)
 
 async def job_take_profit(context):
     """❌ DÉSACTIVÉ (demande user 20/06): plus AUCUNE vente anticipée (ni TP x2/x3/x4, ni stop, ni
@@ -3093,12 +3120,17 @@ async def resolve_paper_bet(context):
     await send(context.bot,f"{'✅' if won else '❌'} *Trade clôturé* [📄]\n`{bet['dir']}` `${bet['entry']:,.0f}`→`${st.price:,.0f}`\nPnL:`{'+' if gross>=0 else ''}{gross:.2f}$` BR:`{st.bankroll:.2f}` ROI:`{roi()}`{cd_msg}")
     st.backup()
 
-async def place_bet(context, direction, amount, conf, reasoning, conf_score, sess, tpu, tpd, market_end, source="tick", asset="BTC"):
+async def place_bet(context, direction, amount, conf, reasoning, conf_score, sess, tpu, tpd, market_end, source="tick", asset="BTC", reserved=False):
     """
     ✅ v10.23 — Placement centralisé: REFETCH prix + MAKER order (undercut) +
     ENTRÉE ÉTAGÉE (la 2e tranche est gérée dans st.bet["staged_remaining"]).
     Rappel source: sur Polymarket tout est un ordre LIMITE de toute façon.
+
+    ✅ reserved=True (demande user 20/06): utilise le slot RÉSERVÉ st.bet2/* au lieu de st.bet/*
+    — réservé exclusivement à job_oracle_lag (BTC), pour qu'il ne soit plus bloqué par une position
+    déjà ouverte sur un autre actif/stratégie. Toujours max 1 trade BTC/slot (asset_trade_slot inchangé).
     """
+    sfx = "2" if reserved else ""
     cur_slot = int(time.time()//300)*300
     # Normalise market_end en timestamp numérique: plusieurs stratégies passent une string ISO
     # (market.get("end_date")) → sinon `market_end > 0` crashe en mode réel (TypeError str/int).
@@ -3107,11 +3139,11 @@ async def place_bet(context, direction, amount, conf, reasoning, conf_score, ses
         except Exception: market_end = 0.0
     elif not isinstance(market_end, (int, float)):
         market_end = 0.0
-    if st.bet is not None:
+    if getattr(st, f"bet{sfx}") is not None:
         return False
-    if getattr(st, "bet_in_flight", False):  # ✅ achat déjà en cours (single position) — bloque la race inter-asset
+    if getattr(st, "bet_in_flight", False):  # ✅ achat déjà en cours — sérialise les deux slots (pas de vraie concurrence d'ordres)
         return False
-    if st.asset_trade_slot.get(asset) == cur_slot:  # ✅ verrou PAR CRYPTO (toutes stratégies confondues)
+    if st.asset_trade_slot.get(asset) == cur_slot:  # ✅ verrou PAR CRYPTO (toutes stratégies + les 2 slots confondus)
         return False
     if not isinstance(conf_score, dict):
         conf_score = {"score":0,"signals":[]}
@@ -3171,33 +3203,37 @@ async def place_bet(context, direction, amount, conf, reasoning, conf_score, ses
                     log_skip(f"{asset}: ordre non rempli (maker+taker) — pas de position fantôme", direction)
                     st.asset_trade_slot[asset] = 0; return False
                 st.exec_stats[fill_type] = st.exec_stats.get(fill_type,0) + 1
-            st.active_order_id=order_id; st.active_token_id=token_used
+            setattr(st, f"active_order_id{sfx}", order_id); setattr(st, f"active_token_id{sfx}", token_used)
             # ✅ Prix d'entrée RÉEL = montant dépensé / shares réellement reçues (solde avant/après),
             # PAS le prix de référence pré-ordre (entry_tp) qui diffère du prix réel rempli en cas de
             # bascule taker (slippage interne à place_market_order) ou de fill partiel du maker.
             # Source du bug "prix du bet sur Telegram ≠ prix réel" et des gains mal calculés à la résolution.
             if real_shares and real_shares > 0:
-                st.shares_bought = real_shares
-                st.entry_token_price = round(first_amount/real_shares, 4)
+                entry_token_price_final = round(first_amount/real_shares, 4)
+                shares_bought_final = real_shares
             else:
-                st.entry_token_price=entry_tp; st.shares_bought=round(first_amount/entry_tp,4) if entry_tp>0 else 0
+                entry_token_price_final = entry_tp
+                shares_bought_final = round(first_amount/entry_tp,4) if entry_tp>0 else 0
+            setattr(st, f"entry_token_price{sfx}", entry_token_price_final)
+            setattr(st, f"shares_bought{sfx}", shares_bought_final)
             # frais estimés: ~0 en maker (rebate), taker_fee_per_share sinon — basé sur le prix réel
-            fee_est = 0.0 if fill_type=="maker" else round(taker_fee_per_share(st.entry_token_price) * st.shares_bought, 3)
-            st.token_price_peak=1.0; st.trailing_active=False
-            st.bet_expiry=market_end if market_end>0 else (int(time.time()//300)*300+300)
+            fee_est = 0.0 if fill_type=="maker" else round(taker_fee_per_share(entry_token_price_final) * shares_bought_final, 3)
+            if not reserved: st.token_price_peak=1.0; st.trailing_active=False
+            setattr(st, f"bet_expiry{sfx}", market_end if market_end>0 else (int(time.time()//300)*300+300))
         else:
             entry_tp = tpu if direction=="UP" else tpd
-            st.entry_token_price=entry_tp; st.shares_bought=round(first_amount/entry_tp,4) if entry_tp>0 else 0
-            st.bet_expiry=int(time.time()//300)*300+300
+            setattr(st, f"entry_token_price{sfx}", entry_tp)
+            setattr(st, f"shares_bought{sfx}", round(first_amount/entry_tp,4) if entry_tp>0 else 0)
+            setattr(st, f"bet_expiry{sfx}", int(time.time()//300)*300+300)
             fill_type = "paper"; fee_est = 0.0
         # t restant dans le slot au moment de l'entrée (pour l'analyse de timing /zones)
         t_remaining = round(max(0.0, (market_end - time.time()) if market_end and market_end>0 else (cur_slot+300 - time.time())), 1)
-        st.bet={"dir":direction,"amount":first_amount,"conf":conf,"entry":consensus_price() if consensus_price()>0 else st.price,
+        setattr(st, f"bet{sfx}", {"dir":direction,"amount":first_amount,"conf":conf,"entry":consensus_price() if consensus_price()>0 else st.price,
                 "reasoning":reasoning,"ts":int(time.time()),"score":conf_score.get("score",0),"session":sess["session"],
                 "staged_remaining":staged_remaining,"staged_done":staged_remaining<=0,"source":source,
                 "asset":asset,"entry_token":round(entry_tp,4),"t_remaining":t_remaining,
-                "fill_type":fill_type,"fee_est":fee_est}
-        if asset == "BTC":
+                "fill_type":fill_type,"fee_est":fee_est,"reserved":reserved})
+        if asset == "BTC" and not reserved:
             st.last_trade_slot = cur_slot  # ✅ dédup BTC (job_tick/momentum/meanrev/oracle BTC s'y réfèrent)
         return True
     finally:
@@ -3832,14 +3868,16 @@ async def job_oracle_lag(context):
     reasoning = (f"⚡ORACLE LAG BTC {direction} | gap={spot_oracle_gap:+.3f}% delta={oracle_delta:+.3f}% "
                  f"OB={st.ob_imbalance:+.2f} votes={dir_votes}/5 | tok={token_price:.3f}$ EV={ev*100:+.1f}% T-{int(slot_remaining)}s")
 
-    ok = await place_bet(context, direction, amount, round(p_oracle,2), reasoning, conf_score, sess, tpu, tpd, market_end, source="snipe", asset="BTC")
+    # ✅ reserved=True (demande user 20/06): BTC oracle a son propre slot réservé (st.bet2) pour ne plus
+    # être bloqué quand une position est déjà ouverte sur un autre actif/stratégie.
+    ok = await place_bet(context, direction, amount, round(p_oracle,2), reasoning, conf_score, sess, tpu, tpd, market_end, source="snipe", asset="BTC", reserved=True)
     if not ok: return
 
     st.last_trade_slot = cur_slot
     mode = "💰 RÉEL" if not st.paper_mode else "📄 paper"
-    entry_tp = st.entry_token_price if not st.paper_mode else token_price
+    entry_tp = st.entry_token_price2 if not st.paper_mode else token_price
     await send(context.bot,
-        f"⚡ *ORACLE LAG ₿ BTC* [{mode}]\n━━━━━━━━━━━━━━━\n"
+        f"⚡ *ORACLE LAG ₿ BTC* [{mode}] 🔓réservé\n━━━━━━━━━━━━━━━\n"
         f"*{direction}* | `{amount:.2f}$` | P:`{p_oracle*100:.0f}%` | ⏰T-`{int(slot_remaining)}s`\n"
         f"Δslot:`{oracle_delta:+.3f}%` | Gap:`{spot_oracle_gap:+.3f}%` OB:`{st.ob_imbalance:+.2f}` TA:`{ta_score}` | Votes:`{dir_votes}/5`\n"
         f"Ret 3s:`{ret_3s:+.3f}%` 15s:`{ret_15s:+.3f}%`\n"
@@ -5692,6 +5730,12 @@ async def cmd_status(update,context):
         if st.bet_expiry>0:
             rem=int((st.bet_expiry-time.time())/60)
             bet_info+=f" ⏰{rem}min"
+    if st.bet2:
+        elapsed2=int((time.time()-st.bet2["ts"])/60)
+        bet_info+=f"\n🔓réservé:{st.bet2['dir']} {st.bet2['amount']:.2f}$ ({elapsed2}min)"
+        if st.bet_expiry2>0:
+            rem2=int((st.bet_expiry2-time.time())/60)
+            bet_info+=f" ⏰{rem2}min"
     pause_info=""
     if st.daily_pause_until>time.time():
         remaining=int((st.daily_pause_until-time.time())/60)
@@ -5918,6 +5962,9 @@ async def cmd_trades(update,context):
         elapsed=int((time.time()-st.bet["ts"])/60)
         trail=" 🎯TRAIL" if st.trailing_active else ""
         lines.append(f"\n🔄 *Actif:* `{st.bet['dir']}` `{st.bet['amount']:.2f}$` ({elapsed}min){trail}")
+    if st.bet2:
+        elapsed2=int((time.time()-st.bet2["ts"])/60)
+        lines.append(f"\n🔓 *Actif (réservé BTC oracle):* `{st.bet2['dir']}` `{st.bet2['amount']:.2f}$` ({elapsed2}min)")
     try:
         await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
     except Exception:
@@ -6118,12 +6165,13 @@ async def cmd_reset(update,context):
         if j:
             try: j.schedule_removal()
             except: pass
-    st.bankroll=50.0; st.bankroll_ref=50.0; st.trades=[]; st.bet=None
+    st.bankroll=50.0; st.bankroll_ref=50.0; st.trades=[]; st.bet=None; st.bet2=None
     st.wins=st.losses=st.skipped=st.consec=0; st.pnl=st.streak=st.best_streak=st.worst_streak=0
     st.cooldown_until=0; st.daily_pause_until=0; st.session_start=time.time(); st.pass_reasons=[]
-    st.last_conf_score={}; st.last_mom_score=0; st.active_order_id=None
+    st.last_conf_score={}; st.last_mom_score=0; st.active_order_id=None; st.active_order_id2=None
     st.active_token_id=None; st.shares_bought=0; st.entry_token_price=0
-    st.token_price_peak=0; st.trailing_active=False; st.bet_expiry=0
+    st.active_token_id2=None; st.shares_bought2=0; st.entry_token_price2=0
+    st.token_price_peak=0; st.trailing_active=False; st.bet_expiry=0; st.bet_expiry2=0
     st.win_streak_count=0; st.conservative_until=0; st.turbo_until=0; st.last_fair={}
     st.c1.clear(); st.c5.clear(); st.c15.clear(); st.c1h.clear(); st.c4h.clear()
     for f in [DATA_FILE,BACKUP_FILE]:
@@ -6131,53 +6179,67 @@ async def cmd_reset(update,context):
     await update.message.reply_text("🔄 *Reset complet.*",parse_mode="Markdown")
 
 
+def _pick_bet_sfx(context):
+    """✅ Choisit quelle position cibler (normale ou réservée BTC oracle) pour /sell et /sellcheck.
+    Arg explicite 'reserved'/'2' → slot réservé. Sinon: la normale si elle existe, sinon la réservée."""
+    arg = (context.args[0].lower() if context.args else "")
+    if arg in ("reserved","2","btc2"): return "2"
+    if st.bet is not None: return ""
+    if st.bet2 is not None: return "2"
+    return ""
+
 async def cmd_sell(update,context):
-    """✅ v10.19d — Vente manuelle immédiate de la position active"""
+    """✅ v10.19d — Vente manuelle immédiate de la position active (+ slot réservé BTC oracle via /sell reserved)"""
     if not auth(update): return
-    if not st.bet:
+    sfx = _pick_bet_sfx(context)
+    bet = getattr(st, f"bet{sfx}")
+    if not bet:
         await update.message.reply_text("❌ Aucune position active."); return
     if st.paper_mode:
         await update.message.reply_text("❌ Paper mode — pas de vente réelle."); return
-    if not st.active_token_id:
+    active_token_id = getattr(st, f"active_token_id{sfx}")
+    entry_token_price = getattr(st, f"entry_token_price{sfx}")
+    shares_bought = getattr(st, f"shares_bought{sfx}")
+    if not active_token_id:
         await update.message.reply_text("❌ Pas de token actif."); return
 
-    await update.message.reply_text("⏳ Vente en cours...")
-    current_price = await poly.get_token_price(st.active_token_id)
-    gain_mult = current_price/st.entry_token_price if st.entry_token_price>0 and current_price>0 else 0
+    await update.message.reply_text("⏳ Vente en cours" + (" (slot réservé)" if sfx=="2" else "") + "...")
+    current_price = await poly.get_token_price(active_token_id)
+    gain_mult = current_price/entry_token_price if entry_token_price>0 and current_price>0 else 0
 
     opposite_token = None
     if st.current_market:
-        if st.bet.get("dir") == "DOWN":
+        if bet.get("dir") == "DOWN":
             opposite_token = st.current_market.get("token_up")
         else:
             opposite_token = st.current_market.get("token_down")
-    result = await poly.sell_position(st.active_token_id, st.shares_bought, opposite_token, current_price)
+    result = await poly.sell_position(active_token_id, shares_bought, opposite_token, current_price)
     if result:
-        clob_bal = await fetch_clob_balance()
-        bet = st.bet
+        other_bet = st.bet2 if sfx=="" else st.bet
+        clob_bal = None if other_bet is not None else await fetch_clob_balance()
         if clob_bal and clob_bal > 0:
             gross = round(clob_bal - st.bankroll, 2)
             st.bankroll = clob_bal
         else:
-            gross = round((current_price - st.entry_token_price) * st.shares_bought, 2)
+            gross = round((current_price - entry_token_price) * shares_bought, 2)
             st.bankroll = max(0.0, st.bankroll + gross)
         st.pnl += gross
         won = gross >= 0
         register_trade_result(won)
         st.trades.append({"dir":bet["dir"],"amount":bet["amount"],"pnl":round(gross,4),
             "conf":bet["conf"],"result":"WIN" if won else "LOSS",
-            "entry":bet["entry"],"exit":st.price,"reasoning":"Vente manuelle /sell",
+            "entry":bet["entry"],"exit":st.price,"reasoning":"Vente manuelle /sell"+(" (réservé)" if sfx=="2" else ""),
             "paper":False,"ts":int(time.time()),"score":bet.get("score",0),
             "fg_value":st.fg.get("value",50),"session":bet.get("session","?"),
             "source":bet.get("source","?"),"aligned_15h1h":True,
             "asset":bet.get("asset","?"),"entry_token":bet.get("entry_token",0),"t_remaining":bet.get("t_remaining",0),
             "fill_type":bet.get("fill_type","?"),"fee_est":bet.get("fee_est",0)})
-        st.bet=None; st.active_token_id=None; st.active_order_id=None
-        st.shares_bought=0; st.entry_token_price=0
-        st.token_price_peak=0; st.trailing_active=False; st.bet_expiry=0
+        setattr(st, f"bet{sfx}", None); setattr(st, f"active_token_id{sfx}", None); setattr(st, f"active_order_id{sfx}", None)
+        setattr(st, f"shares_bought{sfx}", 0); setattr(st, f"entry_token_price{sfx}", 0); setattr(st, f"bet_expiry{sfx}", 0)
+        if sfx=="": st.token_price_peak=0; st.trailing_active=False
         emoji = "✅" if won else "❌"
         await update.message.reply_text(
-            f"{emoji} *Vente manuelle*\n"
+            f"{emoji} *Vente manuelle*{' 🔓réservé' if sfx=='2' else ''}\n"
             f"`{bet['dir']}` | x`{gain_mult:.2f}` | PnL:`{fmt(gross)}$`\n"
             f"BR:`{st.bankroll:.2f}$` | ROI:`{roi()}`",
             parse_mode="Markdown")
@@ -6187,25 +6249,34 @@ async def cmd_sell(update,context):
 
 
 async def cmd_sellcheck(update,context):
-    """✅ v10.20d — Affiche le PnL actuel sans vendre"""
+    """✅ v10.20d — Affiche le PnL actuel sans vendre (+ slot réservé BTC oracle via /sellcheck reserved)"""
     if not auth(update): return
-    if not st.bet:
+    if not st.bet and not st.bet2:
         await update.message.reply_text("❌ Aucune position active."); return
-    if not st.active_token_id:
+    sfx = _pick_bet_sfx(context)
+    bet = getattr(st, f"bet{sfx}")
+    active_token_id = getattr(st, f"active_token_id{sfx}")
+    entry_token_price = getattr(st, f"entry_token_price{sfx}")
+    shares_bought = getattr(st, f"shares_bought{sfx}")
+    bet_expiry = getattr(st, f"bet_expiry{sfx}")
+    if not active_token_id:
         await update.message.reply_text("❌ Pas de token actif."); return
-    current_price = await poly.get_token_price(st.active_token_id)
-    if current_price <= 0 or st.entry_token_price <= 0:
+    current_price = await poly.get_token_price(active_token_id)
+    if current_price <= 0 or entry_token_price <= 0:
         await update.message.reply_text("❌ Prix non disponible."); return
-    gain_mult = current_price / st.entry_token_price
-    gross = round((current_price - st.entry_token_price) * st.shares_bought, 2)
+    gain_mult = current_price / entry_token_price
+    gross = round((current_price - entry_token_price) * shares_bought, 2)
     emoji = "✅" if gross >= 0 else "❌"
-    remaining = int((st.bet_expiry - time.time())) if st.bet_expiry > 0 else 0
+    remaining = int((bet_expiry - time.time())) if bet_expiry > 0 else 0
+    other_hint = ""
+    if sfx=="" and st.bet2: other_hint = "\n💡 Position réservée BTC oracle aussi active — `/sellcheck reserved`"
+    elif sfx=="2" and st.bet: other_hint = "\n💡 Position normale aussi active — `/sellcheck`"
     await update.message.reply_text(
-        f"💰 *Position actuelle*\n━━━━━━━━━━━━━━\n"
-        f"{emoji} `{st.bet['dir']}` | x`{gain_mult:.2f}` | PnL:`{fmt(gross)}$`\n"
-        f"Token: `{st.entry_token_price:.3f}$` → `{current_price:.3f}$`\n"
+        f"💰 *Position actuelle*{' 🔓réservé' if sfx=='2' else ''}\n━━━━━━━━━━━━━━\n"
+        f"{emoji} `{bet['dir']}` | x`{gain_mult:.2f}` | PnL:`{fmt(gross)}$`\n"
+        f"Token: `{entry_token_price:.3f}$` → `{current_price:.3f}$`\n"
         f"⏰ Expire dans: `{remaining}s`\n\n"
-        f"Tape `/sell` pour vendre maintenant.",
+        f"Tape `/sell{' reserved' if sfx=='2' else ''}` pour vendre maintenant.{other_hint}",
         parse_mode="Markdown")
 
 
