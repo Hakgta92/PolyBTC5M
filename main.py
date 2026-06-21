@@ -823,11 +823,10 @@ class PolyClient:
                 side_v2 = Side.BUY if side=="BUY" else Side.SELL
                 # Maker: undercut léger (BUY → un peu plus bas; on reste sous l'ask)
                 maker_price=round(max(0.01,min(0.99, ref_price - MAKER_UNDERCUT)),2)
-                # ✅ OrderArgs.size = nombre de PARTS (shares), PAS le montant en $. Conversion: shares = budget$ / prix.
-                # ✅ (21/06) plancher max(5.0,...) SUPPRIMÉ — il forçait 5$ de budget même quand Kelly disait 2.39$
-                # (bug "Mise réelle ≠ réel": le bot dépensait ~5$ en affichant 2.39$, et cassait le sizing 3-4% BR).
-                # MIN_BET_USD (1$) est documenté comme au-dessus du seuil Polymarket; on respecte le montant Kelly.
-                size_val=round(max(MIN_BET_USD,amount_float)/maker_price,2)
+                # ✅ (21/06) size = nombre ENTIER de PARTS, minimum 5 (règle Polymarket: "Size lower than
+                # minimum: 5"). Entier × prix(2 déc) = montant maker à 2 déc → respecte aussi "maker amount
+                # max 2 decimals". budget$/prix arrondi à l'entier, plancher 5 parts.
+                size_val=float(max(5, round(amount_float/maker_price)))
                 # ✅ (anti-doublon 20/06) UNIQUEMENT le maker GTC ici. Le repli taker est géré
                 # EXCLUSIVEMENT par place_bet (avec vérif de fill via le solde). Avant, ce loop
                 # plaçait aussi un FAK taker en interne quand le GTC ne renvoyait pas un succès
@@ -875,9 +874,9 @@ class PolyClient:
                 except:
                     price_val = 0.50
 
-                # ✅ OrderArgs.size = nombre de PARTS (shares), PAS le montant en $. Conversion: shares = budget$ / prix.
-                # ✅ (21/06) plancher max(5.0,...) SUPPRIMÉ (cf. place_order) — forçait 5$ au lieu du montant Kelly.
-                size_val = round(max(MIN_BET_USD, amount_float) / price_val, 2)
+                # ✅ (21/06) size = ENTIER de parts, min 5 (cf. place_order): respecte "Size min 5" ET
+                # "maker amount max 2 decimals" (entier × prix 2 déc = 2 déc).
+                size_val = float(max(5, round(amount_float / price_val)))
 
                 log.info(f"V2 order: token={token_id[:10]} price={price_val} size={size_val}")
 
@@ -3469,18 +3468,18 @@ async def place_bet(context, direction, amount, conf, reasoning, conf_score, ses
                 return False
             st.exec_stats[fill_type] = st.exec_stats.get(fill_type,0) + 1
             setattr(st, f"active_order_id{sfx}", order_id); setattr(st, f"active_token_id{sfx}", token_used)
-            # ✅ Prix d'entrée RÉEL = montant dépensé / shares réellement reçues (solde avant/après),
-            # PAS le prix de référence pré-ordre (entry_tp) qui diffère du prix réel rempli en cas de
-            # bascule taker (slippage interne à place_market_order) ou de fill partiel du maker.
-            # Source du bug "prix du bet sur Telegram ≠ prix réel" et des gains mal calculés à la résolution.
+            # ✅ (21/06) prix d'entrée = prix marché réel (entry_tp). Le budget Kelly ($) peut différer
+            # du coût réel à cause du minimum Polymarket de 5 PARTS → coût réel = parts × prix (et non le
+            # budget Kelly). La mise affichée/enregistrée = parts × prix.
             if real_shares and real_shares > 0:
-                entry_token_price_final = round(first_amount/real_shares, 4)
                 shares_bought_final = real_shares
+                entry_token_price_final = entry_tp if entry_tp>0 else round(first_amount/real_shares, 4)
             else:
                 entry_token_price_final = entry_tp
-                shares_bought_final = round(first_amount/entry_tp,4) if entry_tp>0 else 0
+                shares_bought_final = float(max(5, round(first_amount/entry_tp))) if entry_tp>0 else 0
             setattr(st, f"entry_token_price{sfx}", entry_token_price_final)
             setattr(st, f"shares_bought{sfx}", shares_bought_final)
+            first_amount = round(shares_bought_final * entry_token_price_final, 2)  # mise RÉELLE (parts × prix)
             # frais estimés: ~0 en maker (rebate), taker_fee_per_share sinon — basé sur le prix réel
             fee_est = 0.0 if fill_type=="maker" else round(taker_fee_per_share(entry_token_price_final) * shares_bought_final, 3)
             if asset=="BTC": st.token_price_peak=1.0; st.trailing_active=False
