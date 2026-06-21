@@ -168,8 +168,9 @@ ORACLE_EDGE_MIN_BTC = 0.08
 # #1 Marge de sécurité dépendante du temps: la résolution = oracle_close vs oracle_open, donc le delta
 #    oracle doit dépasser une fraction du mouvement résiduel attendu (σ_oracle·√t_restant) sinon il peut
 #    encore s'inverser avant la clôture. Strict tôt dans le slot, permissif près de T-30s.
-ORACLE_SAFETY_K       = 0.45   # delta requis ≥ K × (σ·√t_restant). 0=désactivé, ↑=plus strict
+ORACLE_SAFETY_K       = 0.12   # delta requis ≥ K × (σ·√t_restant). 0=désactivé, ↑=plus strict. (21/06: 0.45→0.12, sur-bloquait)
 ORACLE_VOL_LOOKBACK   = 60     # fenêtre (s) d'estimation de la volatilité réalisée de l'oracle/spot
+ORACLE_SAFETY_HORIZON = 60     # plafond (s) du temps restant projeté dans √t (évite de surpunir les entrées tôt dans le slot)
 # #3 Persistance du gap (anti-spike): le spot doit être resté du bon côté de l'oracle, pas un pic isolé.
 GAP_PERSIST_LOOKBACK  = 5      # fenêtre (s) de vérification de persistance du gap
 GAP_PERSIST_MIN_FRAC  = 0.70   # fraction min de ticks du bon côté de l'oracle
@@ -414,18 +415,23 @@ def kelly_bet_oracle(bankroll, win_prob, payout_mult, token_price=0.5, votes=0):
 # ═══════════ ✅ (21/06) FIABILISATION oracle_lag — helpers #1/#2/#3 ═══════════
 def oracle_vol_pct(pts, now, lookback=ORACLE_VOL_LOOKBACK):
     """#1 — Volatilité réalisée du prix (spot, proxy de l'oracle qui le suit): écart-type des rendements
-    NORMALISÉS à 1s sur `lookback` secondes, exprimé en %/√s. Renvoie None si données insuffisantes
-    (l'appelant ne bloque alors PAS — pas de filtre à l'aveugle)."""
+    1s, exprimé en %/√s. Renvoie None si données insuffisantes (l'appelant ne bloque alors PAS).
+    ✅ (21/06) ÉCHANTILLONNAGE À 1s: avant on prenait CHAQUE tick aggTrade (plusieurs/seconde) et on
+    divisait par √dt → le bruit de microstructure sous-seconde gonflait σ massivement (×5-10), donc le
+    mouvement projeté écrasait tout petit delta oracle → "marge insuffisante" partout. On agrège
+    désormais 1 prix par seconde (dernier de chaque seconde) avant de calculer les rendements 1s."""
     rows = [(t, p) for t, p in pts if now - t <= lookback and p > 0]
     if len(rows) < 8:
         return None
-    rets = []
-    for i in range(1, len(rows)):
-        dt = rows[i][0] - rows[i-1][0]
-        if dt <= 0 or rows[i-1][1] <= 0:
-            continue
-        r = (rows[i][1] - rows[i-1][1]) / rows[i-1][1]
-        rets.append(r / math.sqrt(dt))  # rendement ramené à 1s
+    # 1 point par seconde entière (le dernier prix vu dans cette seconde)
+    per_sec = {}
+    for t, p in rows:
+        per_sec[int(t)] = p
+    secs = sorted(per_sec)
+    if len(secs) < 6:
+        return None
+    rets = [(per_sec[secs[i]] - per_sec[secs[i-1]]) / per_sec[secs[i-1]]
+            for i in range(1, len(secs)) if per_sec[secs[i-1]] > 0]
     if len(rets) < 5:
         return None
     m = sum(rets) / len(rets)
@@ -435,13 +441,15 @@ def oracle_vol_pct(pts, now, lookback=ORACLE_VOL_LOOKBACK):
 def oracle_safety_ok(pts, oracle_delta_pct, remaining, now):
     """#1 — Marge de sécurité dépendante du temps restant. La résolution = oracle_close vs oracle_open;
     pour que le pari tienne, le delta doit dépasser une fraction du mouvement résiduel attendu
-    (σ·√t_restant). Renvoie (ok, expected_move_pct). ok=True si la vol n'est pas estimable."""
+    (σ·√t_restant). Renvoie (ok, expected_move_pct). ok=True si la vol n'est pas estimable.
+    ✅ (21/06) horizon projeté plafonné à ORACLE_SAFETY_HORIZON pour ne pas surpunir les entrées tôt."""
     if ORACLE_SAFETY_K <= 0:
         return True, 0.0
     sig = oracle_vol_pct(pts, now)
     if sig is None:
         return True, 0.0
-    expected = sig * math.sqrt(max(1.0, remaining))
+    horizon = min(max(1.0, remaining), ORACLE_SAFETY_HORIZON)
+    expected = sig * math.sqrt(horizon)
     return (abs(oracle_delta_pct) >= ORACLE_SAFETY_K * expected), expected
 
 def gap_persistent(pts, oracle_price, gap_dir, now, lookback=GAP_PERSIST_LOOKBACK):
