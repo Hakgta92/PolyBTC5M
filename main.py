@@ -204,8 +204,8 @@ TDS_TOKEN_MAX        = 0.72
 SHADOW_DOWN_ENABLED      = True   # passer à False pour désactiver le shadow logging
 SHADOW_DOWN_GAP_MIN      = 0.005  # gap positif minimum (spot encore au-dessus oracle figé)
 SHADOW_DOWN_DELTA_MIN    = 0.010  # |delta négatif| minimum (oracle descend de façon nette)
-ORACLE_WINDOW_START = 125   # ✅ (21/06) demande user: fenêtre T-125s→T-30s
-ORACLE_WINDOW_END   = 30    # v12.9 — élargi T-5→T-30 (demande user 18/06) — fin plus sûre côté exécution (moins de latence)
+ORACLE_WINDOW_START = 90    # ✅ (21/06) demande user: fenêtre resserrée T-90s→T-20s (était T-125s→T-30s)
+ORACLE_WINDOW_END   = 20    # ✅ (21/06) demande user: fenêtre resserrée T-90s→T-20s (était T-125s→T-30s)
 # ✅ v10.36 — Filtres WR validés par étude live (medium.com/@gwrx2005, mars 2026)
 # Source: filtre 10min → -93% pertes, seuils relevés → -73% fréquence = bien meilleur WR
 ORACLE_DELTA_CONTRA_MAX = 0.03  # Si votes=1/3, delta contre doit être < 0.03% sinon skip
@@ -4135,7 +4135,9 @@ async def job_oracle_lag(context):
     cur_slot = int(now // 300) * 300
     slot_remaining = cur_slot + 300 - now
     # ✅ v12.9 — Régime trendsession: >60% deltaneg → resserrer le DÉBUT (entrer plus tard, plus près de la décision)
-    # Doit rester > ORACLE_WINDOW_END (30) pour garder une fenêtre valide. Ajusté avec l'élargissement T-150s.
+    # Doit rester > ORACLE_WINDOW_END (20). ⚠️ (21/06) avec la fenêtre resserrée T-90s→T-20s, ce floor
+    # max(.,90) == ORACLE_WINDOW_START par défaut → ce régime ne resserre plus rien en pratique (no-op).
+    # Dis-moi si tu veux un floor plus bas (ex: 60) pour que ce mécanisme garde un effet.
     recent_30=[p for p in st.pass_reasons if now-p.get("ts",0)<=1800]
     dn_ratio=sum(1 for p in recent_30 if "delta" in p.get("reason","").lower() and "<0" in p.get("reason",""))/max(len(recent_30),1)
     btc_win_start=max(ORACLE_WINDOW_END+30, 90) if dn_ratio>0.60 else ORACLE_WINDOW_START
@@ -4370,8 +4372,8 @@ async def job_oracle_lag_asset(context, asset:str):
     now = time.time()
     cur_slot = int(now//300)*300
     slot_remaining = cur_slot+300-now
-    win_start = ORACLE_WINDOW_START  # v12.9 — T-45s uniforme BTC/ETH/SOL/XRP
-    if slot_remaining > win_start or slot_remaining < ORACLE_WINDOW_END: return  # v12.9 — END T-5s (demande user 18/06)
+    win_start = ORACLE_WINDOW_START  # ✅ (21/06) T-90s uniforme BTC/ETH/SOL/XRP
+    if slot_remaining > win_start or slot_remaining < ORACLE_WINDOW_END: return  # ✅ (21/06) END T-20s
     if asset=="ETH":
         spot=st.eth_price; spot_ts=st.eth_ts; oracle=st.eth_oracle_price
         oracle_ts=st.eth_oracle_ts; slot_open=st.eth_oracle_slot_open
@@ -5808,10 +5810,10 @@ STRATÉGIE: Le bot exploite le lag entre Chainlink (oracle Polymarket) et le pri
 Il achète le token UP ou DOWN avant que le marché reprices l'oracle.
 
 PARAMÈTRES ACTUELS:
-- BTC: gap≥0.025% | T-150s→T-30s
-- ETH: gap≥0.020% | T-150s→T-30s
-- SOL: gap≥0.020% | T-150s→T-30s
-- XRP: gap≥0.025% | T-150s→T-30s
+- BTC: gap≥0.025% | T-{ORACLE_WINDOW_START}s→T-{ORACLE_WINDOW_END}s
+- ETH: gap≥0.020% | T-{ORACLE_WINDOW_START}s→T-{ORACLE_WINDOW_END}s
+- SOL: gap≥0.020% | T-{ORACLE_WINDOW_START}s→T-{ORACLE_WINDOW_END}s
+- XRP: gap≥0.025% | T-{ORACLE_WINDOW_START}s→T-{ORACLE_WINDOW_END}s
 - MOMENTUM (BTC/ETH/SOL/XRP): ret60s≥0.30% | T-150s→T-60s | tok 0.55$-0.65$ | filtre trend macro 10min (bloque si tendance 10min contraire ≥0.10%, source: étude live ayant réduit pertes -93%→-13% avec ce filtre) | Kelly dédié 1-3% BR (2ème fenêtre indépendante). Extension ETH/SOL/XRP NOUVELLE (17/06) — surveiller si ces assets, documentés plus bruités à court terme, performent moins bien que BTC.
 - MEAN-REVERSION (BTC/ETH/SOL/XRP): Bollinger Bandwidth≤0.12% (régime squeeze) | parie contre un spike (prix hors bandes 2σ) | tok 0.51$-0.70$ | Kelly dédié 1-3% BR (3ème fenêtre, même T-150s→T-60s, régime complémentaire au momentum — squeeze vs expansion). Stratégie NOUVELLE, seuils à calibrer avec données réelles. Extension ETH/SOL/XRP NOUVELLE (17/06).
 - CONFLUENCE (BTC/ETH/SOL/XRP, 4ème stratégie /conf): TDS = oracle_score(gap≥0.025%, fort≥0.060%) × setup_score(mean-rev ou momentum, UNIQUEMENT si aligné avec le biais oracle) × (1-noise_penalty si chop détecté) | seuil TDS≥0.35 | tok 0.52$-0.72$ | Kelly dédié 1-3% BR avec SIZING DYNAMIQUE (confidence 0.7x à TDS=seuil → 1.3x à TDS=1.0, toujours capé 1-3% BR) | même fenêtre T-150s→T-60s. Poids adaptatifs MR/momentum ajustés UNIQUEMENT après ≥20 trades par branche (neutres sinon — anti-overfitting). Stratégie TRÈS NOUVELLE (17/06), tous les seuils sont des points de départ raisonnés à calibrer en priorité avec les premières données réelles.
@@ -5910,7 +5912,7 @@ async def cmd_learn(update,context):
     lines.append(f"📐 *Seuils actuels:*")
     lines.append(f"  delta≥`{ORACLE_ENTRY_DELTA:.3f}%` | gap BTC≥`0.025%` | gap ETH/SOL≥`0.020%` | gap XRP≥`0.025%`")
     lines.append(f"  token:`{ORACLE_TOKEN_MIN:.2f}$`-`{ORACLE_TOKEN_MAX:.2f}$`(BTC) `0.95$`(ETH/XRP/SOL) | EV≥`{ORACLE_EDGE_MIN_BTC*100:.0f}%`(BTC)/`{ORACLE_EDGE_MIN_ALT*100:.0f}%`(ETH/SOL/XRP) | votes≥2(dir)")
-    lines.append(f"  BTC: T-150s→T-30s | ETH: T-150s→T-30s | SOL: T-150s→T-30s | XRP: T-150s→T-30s")
+    lines.append(f"  BTC: T-{ORACLE_WINDOW_START}s→T-{ORACLE_WINDOW_END}s | ETH: T-{ORACLE_WINDOW_START}s→T-{ORACLE_WINDOW_END}s | SOL: T-{ORACLE_WINDOW_START}s→T-{ORACLE_WINDOW_END}s | XRP: T-{ORACLE_WINDOW_START}s→T-{ORACLE_WINDOW_END}s")
 
     # ── Trades réels ──
     real=[t for t in merged_trades if not t.get("paper")]
@@ -6211,7 +6213,7 @@ async def cmd_run(update,context):
     await update.message.reply_text(
         f"🚀 *Bot v{BOT_VERSION} démarré !*\nMode:*{'📄 PAPER' if st.paper_mode else '💰 RÉEL'}*\n"
         f"Session:`{sess['session']}` | Seuils: score≥`{min_score}` mom≥`{min_mom}`\n"
-        f"/oracle BTC T-150→T-30s | ETH T-150→T-30s | SOL T-150→T-30s | XRP T-150→T-30s\n"
+        f"/oracle BTC T-{ORACLE_WINDOW_START}→T-{ORACLE_WINDOW_END}s | ETH T-{ORACLE_WINDOW_START}→T-{ORACLE_WINDOW_END}s | SOL T-{ORACLE_WINDOW_START}→T-{ORACLE_WINDOW_END}s | XRP T-{ORACLE_WINDOW_START}→T-{ORACLE_WINDOW_END}s\n"
         f"/momentum BTC/ETH/SOL/XRP T-150s→T-60s | move≥0.30%/60s | tok 0.55$-0.65$ | filtre trend10m | Kelly 1-3%\n"
         f"/meanrev BTC/ETH/SOL/XRP T-150s→T-60s | squeeze BW≤0.12% | tok 0.51$-0.70$ | Kelly 1-3%\n"
         f"/conf BTC/ETH/SOL/XRP T-150s→T-60s | TDS=oracle×setup×(1-bruit)≥0.35 | tok 0.52$-0.72$ | Kelly 1-3% dynamique\n"
