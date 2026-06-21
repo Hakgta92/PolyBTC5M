@@ -2326,7 +2326,16 @@ async def _resolve_expired_bet(context, asset="BTC"):
         res_price = await poly.get_token_price(active_token_id)
         if res_price >= 0.6: won = True
         elif 0 < res_price <= 0.4: won = False
-    # 3) ✅ (21/06) Fallback FIABLE: mouvement de l'oracle sur le slot (open mémorisé à l'entrée vs prix
+    # ✅ (21/06 fix) GRÂCE avant la reconstruction oracle ci-dessous: ce fallback lit le prix oracle
+    # LIVE (pas le close exact du slot) → si le prix a bougé depuis la vraie clôture, le sens peut
+    # s'inverser par rapport au vrai résultat Polymarket → FAUX LOSS sur de vrais WIN (vu: ETH/XRP
+    # marqués LOSS alors que Polymarket avait déjà redeem les shares gagnantes en cash).
+    # Le slot recorder (méthode #1, fiable, suit EXACTEMENT la règle Polymarket) met seulement
+    # quelques secondes à s'enregistrer après la clôture → on lui laisse 3min avant de tenter ce
+    # fallback bruité, au lieu de sauter dessus immédiatement.
+    if won is None and remaining > -180:
+        return  # réessaie au prochain tick — laisse le slot recorder arriver
+    # 3) Fallback FIABLE: mouvement de l'oracle sur le slot (open mémorisé à l'entrée vs prix
     # oracle actuel ≈ close). Corrige les FAUX LOSS quand le recorder n'a pas encore enregistré le slot
     # ET que le prix token résolu renvoie 0 (marché clos) — cas vu: BTC/SOL gagnants marqués LOSS.
     if won is None:
@@ -4587,10 +4596,13 @@ async def job_oracle_lag_asset(context, asset:str):
     elif asset=="SOL": st.sol_last_trade_slot=cur_slot
     elif asset=="XRP": st.xrp_last_trade_slot=cur_slot
     mode="💰 RÉEL" if not st.paper_mode else "📄 paper"
-    entry_tp=(st.entry_token_price or token_price) if not st.paper_mode else token_price  # ✅ (21/06) fallback prix si entrée réelle=0
+    # ✅ FIX: utilisait st.entry_token_price / st.bet (variables BTC, sans suffixe) au lieu des
+    # versions PAR ASSET → affichait un prix/montant faux (souvent figé sur la dernière valeur BTC)
+    # pour ETH/SOL/XRP. Le suffixe est déjà calculé juste au-dessus via _b.
+    entry_tp=(getattr(st, f"entry_token_price{_possfx(asset)}") or token_price) if not st.paper_mode else token_price  # ✅ (21/06) fallback prix si entrée réelle=0
     # ✅ demande user 21/06: montant RÉELLEMENT placé (1ère tranche si entrée étagée), pas le montant
     # Kelly demandé — st.bet["amount"] est posé par place_bet() avec first_amount (réel envoyé à l'exchange).
-    real_amount = (st.bet or {}).get("amount", amount)
+    real_amount = (_b or {}).get("amount", amount)
     await send(context.bot,
         f"⚡ *ORACLE LAG {emoji} {symbol}* [{mode}]\n━━━━━━━━━━━━━━━\n"
         f"*{direction}* | Mise réelle:`{real_amount:.2f}$` | P:`{p_oracle*100:.0f}%` | ⏰T-`{int(slot_remaining)}s`\n"
