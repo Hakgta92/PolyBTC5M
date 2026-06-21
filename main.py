@@ -1742,6 +1742,9 @@ class State:
         self.window_delta=0.0
         # ✅ v10.21 — WebSocket Binance temps réel
         self.ws_prices=deque(maxlen=300)   # (ts, price) 5 dernières minutes
+        # ✅ jamais alimenté nulle part (comme eth_ws_volumes/sol_ws_volumes) — lu directement
+        # par job_oracle_lag sans init, ce qui crashait (AttributeError) avant cette ligne.
+        self.ws_volumes=deque(maxlen=300)
         self.ws_price=0.0
         self.gap_history=deque(maxlen=60)  # ✅ v11.1 — (ts, gap%) historique du gap spot↔oracle
         self.ws_connected=False
