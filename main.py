@@ -353,6 +353,48 @@ def kelly_bet_secondary(bankroll, win_prob, payout_mult, confidence=1.0):
     log.debug(f"Kelly secondary: kp={kp:.3f} pct={pct*100:.1f}% conf={confidence:.2f} → {result:.2f}$")
     return result
 
+def kelly_bet_oracle(bankroll, win_prob, payout_mult, token_price=0.5, votes=0):
+    """
+    ✅ Kelly DÉDIÉ oracle_lag (demande user 21/06, toutes cryptos BTC/ETH/SOL/XRP) — séparé de
+    kelly_bet() (tiers 5/10/15% BR, partagée avec job_tick/ob_signal). Cible volontairement plus
+    étroite et plus prudente: 3%-4% du bankroll, le curseur dans cette plage étant piloté par la
+    force du setup (EV réelle + nombre de votes pour la direction), pas par des tiers larges.
+    """
+    if win_prob <= 0 or payout_mult <= 1:
+        return 0.0
+    b = payout_mult - 1
+    q = 1 - win_prob
+    kp = (win_prob * b - q) / b
+    if kp <= 0:
+        return 0.0  # Edge négatif → ne pas trader
+
+    liquidity_factor = 1.0
+    if token_price < 0.15 or token_price > 0.92:
+        liquidity_factor = 0.8
+
+    ev_real = win_prob - token_price
+    edge_ratio = min(1.0, max(0.0, ev_real / 0.15))
+    vote_ratio = min(1.0, max(0.0, votes / 6.0))  # dir_votes compte 6 signaux (cf. job_oracle_lag*)
+    strength = max(edge_ratio, vote_ratio)
+    pct = 0.03 + 0.01 * strength  # adaptatif: 3% (edge/votes faibles) → 4% (edge fort, votes 5/5)
+    raw_bet = bankroll * pct * liquidity_factor
+    result = round(min(MAX_BET_USD, max(MIN_BET_USD, raw_bet)), 2)
+    log.debug(f"Kelly oracle: kp={kp:.3f} pct={pct*100:.1f}% strength={strength:.2f} → {result:.2f}$")
+    return result
+
+def compute_vol_vote(volumes, direction, now):
+    """✅ Vote volume (job_oracle_lag, toutes cryptos) — confirme la direction si spike de volume
+    récent (qty des trades aggTrade Binance, cf. ws_*_loop). Avant ce fix les deques *_ws_volumes
+    n'étaient jamais alimentées → ce vote retournait toujours 0 (code mort)."""
+    vols = list(volumes)
+    if len(vols) < 5:
+        return 0
+    vol_5s = sum(q for t, q in vols if now - t <= 5)
+    vol_avg = sum(q for t, q in vols if now - t <= 30) / 6
+    if vol_avg > 0 and vol_5s / vol_avg > 2.0:
+        return 1 if direction == "UP" else -1
+    return 0
+
 # ─── DONNÉES AVANCÉES ──────────────────────────────────────────────────────
 async def fetch_orderbook_imbalance():
     """
@@ -1742,8 +1784,8 @@ class State:
         self.window_delta=0.0
         # ✅ v10.21 — WebSocket Binance temps réel
         self.ws_prices=deque(maxlen=300)   # (ts, price) 5 dernières minutes
-        # ✅ jamais alimenté nulle part (comme eth_ws_volumes/sol_ws_volumes) — lu directement
-        # par job_oracle_lag sans init, ce qui crashait (AttributeError) avant cette ligne.
+        # ✅ (ts, qty) trades aggTrade Binance — alimenté par ws_binance_loop, sert au vol_vote
+        # de job_oracle_lag (était déclaré mais jamais écrit avant ce fix → vol_vote toujours 0).
         self.ws_volumes=deque(maxlen=300)
         self.ws_price=0.0
         self.gap_history=deque(maxlen=60)  # ✅ v11.1 — (ts, gap%) historique du gap spot↔oracle
@@ -1773,7 +1815,7 @@ class State:
         self.oracle_chainlink_ts=0.0
         # ETH
         self.eth_price=0.0; self.eth_ts=0; self.eth_ws_task=None
-        self.eth_ws_prices=deque(); self.eth_ws_volumes=deque()
+        self.eth_ws_prices=deque(); self.eth_ws_volumes=deque(maxlen=300)
         self.eth_oracle_price=0.0; self.eth_oracle_ts=0.0
         self.eth_oracle_slot_open=0.0; self.eth_oracle_slot_ts=0
         self.eth_last_trade_slot=0
@@ -1783,14 +1825,14 @@ class State:
         self.eth_ob_imbalance=0.0; self.eth_ob_ts=0.0; self.eth_ob_asset_id=""; self.eth_clob_ws_task=None
         # SOL
         self.sol_price=0.0; self.sol_ts=0; self.sol_ws_task=None
-        self.sol_ws_prices=deque(); self.sol_ws_volumes=deque()
+        self.sol_ws_prices=deque(); self.sol_ws_volumes=deque(maxlen=300)
         self.sol_oracle_price=0.0; self.sol_oracle_ts=0.0
         self.sol_oracle_slot_open=0.0; self.sol_oracle_slot_ts=0
         self.sol_last_trade_slot=0
         self.sol_ob_imbalance=0.0; self.sol_ob_ts=0.0; self.sol_ob_asset_id=""; self.sol_clob_ws_task=None
         # ✅ v12.8 — XRP
         self.xrp_price=0.0; self.xrp_ts=0; self.xrp_ws_task=None
-        self.xrp_ws_prices=deque()
+        self.xrp_ws_prices=deque(); self.xrp_ws_volumes=deque(maxlen=300)
         self.xrp_oracle_price=0.0; self.xrp_oracle_ts=0.0
         self.xrp_oracle_slot_open=0.0; self.xrp_oracle_slot_ts=0
         self.xrp_last_trade_slot=0
@@ -2159,9 +2201,12 @@ async def _resolve_expired_bet(context, reserved=False):
     setattr(st, f"shares_bought{sfx}", 0); setattr(st, f"entry_token_price{sfx}", 0); setattr(st, f"bet_expiry{sfx}", 0)
     if not reserved: st.token_price_peak=0; st.trailing_active=False
     emoji="✅" if won else "❌"
+    # ✅ demande user 21/06: mise réelle (cost = shares réelles × prix d'entrée réel) + gain réel
+    # (gross, calculé depuis ces mêmes shares/prix réels, ou depuis le solde CLOB quand fiable —
+    # jamais le montant Kelly demandé).
     await send(context.bot,
         f"{emoji} *Trade résolu {bet_asset}*{tag} (slot)\n"
-        f"`{bet['dir']}` | PnL:`{fmt(gross)}$`\n"
+        f"`{bet['dir']}` | Mise réelle:`{fmt(cost)}$` | Gain réel:`{fmt(gross)}$`\n"
         f"BR:`{st.bankroll:.2f}$` | ROI:`{roi()}`")
     st.backup()
 
@@ -2195,6 +2240,9 @@ async def ws_binance_loop():
                                 now = time.time()
                                 st.ws_price = p
                                 st.ws_prices.append((now, p))
+                                # ✅ qty du trade aggTrade Binance — alimente vol_vote (job_oracle_lag),
+                                # jamais peuplé avant ce fix (deque déclarée mais jamais écrite).
+                                st.ws_volumes.append((now, float(d.get("q", 0))))
                                 while st.ws_prices and now - st.ws_prices[0][0] > 120:
                                     st.ws_prices.popleft()
                                 slot_start = int(now // 300) * 300
@@ -2224,6 +2272,7 @@ async def ws_eth_loop():
                                 p = float(d["p"]); now = time.time()
                                 st.eth_price=p; st.eth_ts=now
                                 st.eth_ws_prices.append((now,p))
+                                st.eth_ws_volumes.append((now, float(d.get("q", 0))))
                                 _resolve_pending_passes()
                                 while st.eth_ws_prices and now-st.eth_ws_prices[0][0]>120: st.eth_ws_prices.popleft()
                         elif msg.type in (aiohttp.WSMsgType.CLOSED,aiohttp.WSMsgType.ERROR): break
@@ -2245,6 +2294,7 @@ async def ws_sol_loop():
                                 p = float(d["p"]); now = time.time()
                                 st.sol_price=p; st.sol_ts=now
                                 st.sol_ws_prices.append((now,p))
+                                st.sol_ws_volumes.append((now, float(d.get("q", 0))))
                                 _resolve_pending_passes()
                                 while st.sol_ws_prices and now-st.sol_ws_prices[0][0]>120: st.sol_ws_prices.popleft()
                         elif msg.type in (aiohttp.WSMsgType.CLOSED,aiohttp.WSMsgType.ERROR): break
@@ -2266,6 +2316,7 @@ async def ws_xrp_loop():
                                 p = float(d["p"]); now = time.time()
                                 st.xrp_price=p; st.xrp_ts=now
                                 st.xrp_ws_prices.append((now,p))
+                                st.xrp_ws_volumes.append((now, float(d.get("q", 0))))
                                 _resolve_pending_passes()
                                 while st.xrp_ws_prices and now-st.xrp_ws_prices[0][0]>120:
                                     st.xrp_ws_prices.popleft()
@@ -3894,19 +3945,15 @@ async def job_oracle_lag(context):
         if st.ob_imbalance > 0.15: ob_vote = 1
         elif st.ob_imbalance < -0.15: ob_vote = -1
 
-    # Volume spike
-    vols = list(st.ws_volumes)
-    vol_vote = 0
-    if len(vols) >= 5:
-        vol_5s = sum(q for t,q in vols if now-t<=5)
-        vol_avg = sum(q for t,q in vols if now-t<=30) / 6
-        if vol_avg > 0 and vol_5s / vol_avg > 2.0: vol_vote = 1 if direction=="UP" else -1
+    # ✅ Volume spike — st.ws_volumes désormais alimenté par ws_binance_loop (qty aggTrade), et le vote
+    # est replié dans dir_votes (avant: calculé puis jamais utilisé → code mort).
+    vol_vote = compute_vol_vote(st.ws_volumes, direction, now)
 
     dir_votes = sum([
         1 if direction=="UP" and oracle_delta>0 else (-1 if direction=="DOWN" and oracle_delta<0 else 0),
         1 if direction=="UP" and spot_oracle_gap>0 else (-1 if direction=="DOWN" and spot_oracle_gap<0 else 0),
         1 if direction=="UP" and ret_15s>0 else (-1 if direction=="DOWN" and ret_15s<0 else 0),
-        ob_vote, ta_vote,
+        ob_vote, ta_vote, vol_vote,
     ])
     # ✅ v12.9 FIX BUG MAJEUR: dir_votes négatif quand DOWN confirmé (convention "bullishness").
     # ⚠️ dir_votes lui-même INCHANGÉ (exception SOL tokenmax dir_votes<=-1 ailleurs en dépend).
@@ -3964,14 +4011,16 @@ async def job_oracle_lag(context):
 
     # ✅ v12.9 FIX: vérifie le consensus POUR la direction parié, pas le score brut haussier
     if votes_for_direction < 2:
-        log_skip(f"BTC: votes {votes_for_direction}/5 < 2 (→ skip: consensus faible)", direction,
+        log_skip(f"BTC: votes {votes_for_direction}/6 < 2 (→ skip: consensus faible)", direction,
                  features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":votes_for_direction,"dual":dual_dir,"filter":"votes_min","asset":"BTC"}); return
     if ev < ORACLE_EDGE_MIN_BTC:
         log_skip(f"BTC: EV {ev*100:+.1f}%<{ORACLE_EDGE_MIN_BTC*100:.0f}% (→ skip: edge insuffisant)", direction,
                  features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"dual":dual_dir,"filter":"ev","token":token_price,"ev":ev,"asset":"BTC"}); return
 
     payout = round(1/token_price, 2)
-    amount = kelly_bet(st.bankroll, p_oracle, payout, token_price, ev_bonus=True)
+    # ✅ demande user 21/06: Kelly DÉDIÉ oracle_lag ciblant 3-4% du BR (au lieu des tiers 5/10/15%
+    # de kelly_bet(), partagés avec job_tick/ob_signal) — remplace toutes les cryptos.
+    amount = kelly_bet_oracle(st.bankroll, p_oracle, payout, token_price, votes=votes_for_direction)
     if amount < MIN_BET_USD: return
 
     # ✅ tpu/tpd doivent être des PRIX (float), pas les token_id (string) — sinon TypeError
@@ -3982,20 +4031,25 @@ async def job_oracle_lag(context):
     except: market_end = cur_slot + 300
     sess = session_ctx(); conf_score = {"score":0,"signals":[]}
     reasoning = (f"⚡ORACLE LAG BTC {direction} | gap={spot_oracle_gap:+.3f}% delta={oracle_delta:+.3f}% "
-                 f"OB={st.ob_imbalance:+.2f} votes={dir_votes}/5 | tok={token_price:.3f}$ EV={ev*100:+.1f}% T-{int(slot_remaining)}s")
+                 f"OB={st.ob_imbalance:+.2f} votes={dir_votes}/6 | tok={token_price:.3f}$ EV={ev*100:+.1f}% T-{int(slot_remaining)}s")
 
     # ✅ reserved=True (demande user 20/06): BTC oracle a son propre slot réservé (st.bet2) pour ne plus
-    # être bloqué quand une position est déjà ouverte sur un autre actif/stratégie.
+    # être bloqué quand une position est déjà ouverte sur un autre actif/stratégie. Le verrou
+    # st.asset_trade_slot["BTC"] (posé dans place_bet) garantit malgré tout 1 SEUL bet BTC/slot,
+    # tous les slots/stratégies confondus (demande user 21/06: 1 bet par crypto et par slot).
     ok = await place_bet(context, direction, amount, round(p_oracle,2), reasoning, conf_score, sess, tpu, tpd, market_end, source="snipe", asset="BTC", reserved=True)
     if not ok: return
 
     st.last_trade_slot = cur_slot
     mode = "💰 RÉEL" if not st.paper_mode else "📄 paper"
     entry_tp = st.entry_token_price2 if not st.paper_mode else token_price
+    # ✅ demande user 21/06: montant RÉELLEMENT placé (1ère tranche si entrée étagée), pas le montant
+    # Kelly demandé — st.bet2["amount"] est posé par place_bet() avec first_amount (réel envoyé à l'exchange).
+    real_amount = (st.bet2 or {}).get("amount", amount)
     await send(context.bot,
         f"⚡ *ORACLE LAG ₿ BTC* [{mode}] 🔓réservé\n━━━━━━━━━━━━━━━\n"
-        f"*{direction}* | `{amount:.2f}$` | P:`{p_oracle*100:.0f}%` | ⏰T-`{int(slot_remaining)}s`\n"
-        f"Δslot:`{oracle_delta:+.3f}%` | Gap:`{spot_oracle_gap:+.3f}%` OB:`{st.ob_imbalance:+.2f}` TA:`{ta_score}` | Votes:`{dir_votes}/5`\n"
+        f"*{direction}* | Mise réelle:`{real_amount:.2f}$` | P:`{p_oracle*100:.0f}%` | ⏰T-`{int(slot_remaining)}s`\n"
+        f"Δslot:`{oracle_delta:+.3f}%` | Gap:`{spot_oracle_gap:+.3f}%` OB:`{st.ob_imbalance:+.2f}` TA:`{ta_score}` | Votes:`{dir_votes}/6`\n"
         f"Ret 3s:`{ret_3s:+.3f}%` 15s:`{ret_15s:+.3f}%`\n"
         f"Token:`{entry_tp:.3f}$` | EV:`{ev*100:+.1f}%` | Frais:`{fee*100:.2f}¢`\n"
         f"Oracle:`${st.oracle_price:,.2f}` → Spot:`${spot_now:,.2f}`\n\n"
@@ -4014,17 +4068,17 @@ async def job_oracle_lag_asset(context, asset:str):
         spot=st.eth_price; spot_ts=st.eth_ts; oracle=st.eth_oracle_price
         oracle_ts=st.eth_oracle_ts; slot_open=st.eth_oracle_slot_open
         last_ts=st.eth_last_trade_slot; slug_prefix="eth-updown-5m"
-        symbol="ETH"; emoji="Ξ"; ws_prices=st.eth_ws_prices
+        symbol="ETH"; emoji="Ξ"; ws_prices=st.eth_ws_prices; ws_volumes=st.eth_ws_volumes
     elif asset=="SOL":
         spot=st.sol_price; spot_ts=st.sol_ts; oracle=st.sol_oracle_price
         oracle_ts=st.sol_oracle_ts; slot_open=st.sol_oracle_slot_open
         last_ts=st.sol_last_trade_slot; slug_prefix="sol-updown-5m"
-        symbol="SOL"; emoji="◎"; ws_prices=st.sol_ws_prices
+        symbol="SOL"; emoji="◎"; ws_prices=st.sol_ws_prices; ws_volumes=st.sol_ws_volumes
     elif asset=="XRP":
         spot=st.xrp_price; spot_ts=st.xrp_ts; oracle=st.xrp_oracle_price
         oracle_ts=st.xrp_oracle_ts; slot_open=st.xrp_oracle_slot_open
         last_ts=st.xrp_last_trade_slot; slug_prefix="xrp-updown-5m"
-        symbol="XRP"; emoji="✕"; ws_prices=st.xrp_ws_prices
+        symbol="XRP"; emoji="✕"; ws_prices=st.xrp_ws_prices; ws_volumes=st.xrp_ws_volumes
     else: return
     if spot<=0 or oracle<=0 or slot_open<=0:
         log_skip(f"{symbol}: données manquantes spot={spot:.2f} oracle={oracle:.2f}", None); return
@@ -4033,6 +4087,12 @@ async def job_oracle_lag_asset(context, asset:str):
     if now-oracle_ts>15:
         log_skip(f"{symbol}: oracle périmé {int(now-oracle_ts)}s", None); return
     if last_ts==cur_slot: return
+    # ✅ demande user 21/06: même verrou anti sur-exposition multi-stratégies que BTC (avant: oracle_lag
+    # ETH/SOL/XRP ne vérifiait que son propre dernier slot, pas momentum/meanrev/confluence du même actif).
+    # Le verrou final reste st.asset_trade_slot[asset] dans place_bet — ceci évite juste du travail inutile.
+    _pfx0 = asset.lower()
+    if cur_slot in (getattr(st,f"momentum_last_slot_{_pfx0}",0), getattr(st,f"meanrev_last_slot_{_pfx0}",0), getattr(st,f"tds_last_slot_{_pfx0}",0)):
+        log_skip(f"{symbol}: slot déjà tradé par une stratégie (T-{int(slot_remaining)}s)", None); return
     # Ret 3s/15s
     pts=list(ws_prices)
     def ret_a(secs):
@@ -4125,11 +4185,13 @@ async def job_oracle_lag_asset(context, asset:str):
         elif divergence >= 0.025 and direction=="DOWN":
             btc_cascade_vote = max(btc_cascade_vote, 1)
             log.debug(f"{asset} SMT contra: {asset} underperform BTC → rebond UP")
+    # ✅ vol_vote (qty aggTrade Binance par asset) replié dans dir_votes — même fix que BTC.
+    vol_vote = compute_vol_vote(ws_volumes, direction, now)
     dir_votes=sum([
         1 if direction=="UP" and oracle_delta>0 else (-1 if direction=="DOWN" and oracle_delta<0 else 0),
         1 if direction=="UP" and spot_oracle_gap>0 else (-1 if direction=="DOWN" and spot_oracle_gap<0 else 0),
         1 if direction=="UP" and ret_15s>0 else (-1 if direction=="DOWN" and ret_15s<0 else 0),
-        btc_cascade_vote, ta_vote,
+        btc_cascade_vote, ta_vote, vol_vote,
     ])
     # ✅ v12.9 FIX BUG MAJEUR: dir_votes négatif quand DOWN confirmé (convention "bullishness").
     # ⚠️ dir_votes lui-même INCHANGÉ (exception SOL tokenmax dir_votes<=-1 plus bas en dépend).
@@ -4174,19 +4236,20 @@ async def job_oracle_lag_asset(context, asset:str):
     ev=p_oracle-token_price-fee
     # ✅ v12.9 FIX: consensus POUR la direction parié (était dir_votes brut, cassé pour DOWN)
     if votes_for_direction < 2:
-        log_skip(f"{symbol}: votes {votes_for_direction}/5 < 2 (→ skip: consensus faible)", direction,
+        log_skip(f"{symbol}: votes {votes_for_direction}/6 < 2 (→ skip: consensus faible)", direction,
                  features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":votes_for_direction,"dual":dual_dir,"filter":"votes_min"}); return
     if ev<ORACLE_EDGE_MIN_ALT:
         log_skip(f"{symbol}: EV {ev*100:+.1f}%<{ORACLE_EDGE_MIN_ALT*100:.0f}% insuffisant",direction,
                  features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"dual":dual_dir,"filter":"ev","token":token_price,"ev":ev,"smt_div":round(divergence,3)}); return
     payout=round(1/token_price,2)
-    amount=kelly_bet(st.bankroll,p_oracle,payout,token_price,ev_bonus=True)
+    # ✅ demande user 21/06: Kelly DÉDIÉ oracle_lag ciblant 3-4% du BR, toutes cryptos (cf. BTC).
+    amount=kelly_bet_oracle(st.bankroll,p_oracle,payout,token_price,votes=votes_for_direction)
     if amount<MIN_BET_USD: return
     # ✅ tpu/tpd = PRIX (float), pas token_id (string) — cf. fix job_oracle_lag BTC
     tpu = token_price if direction=="UP" else round(max(0.01,1-token_price),4)
     tpd = token_price if direction=="DOWN" else round(max(0.01,1-token_price),4)
     market_end=market.get("end_date",""); sess=session_ctx(); conf_score={"score":0,"signals":[]}
-    reasoning=f"ORACLE LAG {symbol} {direction} | gap={spot_oracle_gap:+.3f}% delta={oracle_delta:+.3f}% TA={ta_score} votes={dir_votes}/5 | tok={token_price:.3f}$ EV={ev*100:+.1f}% T-{int(slot_remaining)}s"
+    reasoning=f"ORACLE LAG {symbol} {direction} | gap={spot_oracle_gap:+.3f}% delta={oracle_delta:+.3f}% TA={ta_score} votes={dir_votes}/6 | tok={token_price:.3f}$ EV={ev*100:+.1f}% T-{int(slot_remaining)}s"
     st.current_market=market  # ✅ place_bet route l'ordre réel via st.current_market — doit pointer le marché de l'asset
     ok=await place_bet(context,direction,amount,round(p_oracle,2),reasoning,conf_score,sess,tpu,tpd,market_end,source="snipe",asset=asset)
     if not ok: return
@@ -4195,10 +4258,13 @@ async def job_oracle_lag_asset(context, asset:str):
     elif asset=="XRP": st.xrp_last_trade_slot=cur_slot
     mode="💰 RÉEL" if not st.paper_mode else "📄 paper"
     entry_tp=st.entry_token_price if not st.paper_mode else token_price
+    # ✅ demande user 21/06: montant RÉELLEMENT placé (1ère tranche si entrée étagée), pas le montant
+    # Kelly demandé — st.bet["amount"] est posé par place_bet() avec first_amount (réel envoyé à l'exchange).
+    real_amount = (st.bet or {}).get("amount", amount)
     await send(context.bot,
         f"⚡ *ORACLE LAG {emoji} {symbol}* [{mode}]\n━━━━━━━━━━━━━━━\n"
-        f"*{direction}* | `{amount:.2f}$` | P:`{p_oracle*100:.0f}%` | ⏰T-`{int(slot_remaining)}s`\n"
-        f"Δslot:`{oracle_delta:+.3f}%` | Gap:`{spot_oracle_gap:+.3f}%` TA:`{ta_score}` | Votes:`{dir_votes}/5`\n"
+        f"*{direction}* | Mise réelle:`{real_amount:.2f}$` | P:`{p_oracle*100:.0f}%` | ⏰T-`{int(slot_remaining)}s`\n"
+        f"Δslot:`{oracle_delta:+.3f}%` | Gap:`{spot_oracle_gap:+.3f}%` TA:`{ta_score}` | Votes:`{dir_votes}/6`\n"
         f"Ret 3s:`{ret_3s:+.3f}%` 15s:`{ret_15s:+.3f}%`\n"
         f"Token:`{entry_tp:.3f}$` | EV:`{ev*100:+.1f}%`\n"
         f"Oracle:`${oracle:,.2f}` → Spot:`${spot:,.2f}`\n\n"
