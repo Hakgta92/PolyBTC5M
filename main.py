@@ -5001,6 +5001,9 @@ async def job_ob_signal_asset(context, asset):
     Fenêtre T-150s→T-30s. Mise minimale. Respecte le verrou slot (1 trade/slot/asset toutes stratégies confondues).
     ⚠️ NON validé en exécution réelle — le 73% est mesuré à la résolution (look-ahead possible). Surveillance étroite."""
     if not OB_SIGNAL_ENABLED or not st.running or st.killed: return
+    # ✅ (21/06) demande user: OB signal DÉSACTIVÉ en réel (perf non validée en exécution réelle).
+    # Reste actif en paper pour continuer à mesurer la stratégie sans risquer de capital.
+    if not st.paper_mode: return
     now = time.time()
     cur_slot = int(now // 300) * 300
     slot_remaining = cur_slot + 300 - now
