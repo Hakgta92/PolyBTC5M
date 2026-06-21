@@ -7128,6 +7128,7 @@ async def cb(update,context):
        "fear":cmd_fear,"score":cmd_score,"run":cmd_run,"stop":cmd_stop,"paper":cmd_paper}
     if q.data in h: await h[q.data](update,context)
 
+_last_conflict_alert = [0.0]
 async def error_handler(update, context):
     """✅ Sans handler PTB explicite, les exceptions des handlers/jobs étaient juste logguées
     par PTB lui-même ("No error handlers are registered, logging exception.") sans traceback
@@ -7135,6 +7136,15 @@ async def error_handler(update, context):
     vraie traceback (capturée par _MemErrorHandler via exc_info) et on notifie l'admin."""
     log.error(f"Exception non gérée: {context.error}", exc_info=context.error)
     try:
+        from telegram.error import Conflict as _TgConflict
+        if isinstance(context.error, _TgConflict):
+            # ✅ Conflict = 2 instances pollent getUpdates en même temps (recouvrement pendant un
+            # redeploy le plus souvent) — PTB retente seul automatiquement. Pas une vraie panne
+            # applicative: on évite de spammer une alerte à chaque cycle de poll.
+            if time.time() - _last_conflict_alert[0] > 600:
+                _last_conflict_alert[0] = time.time()
+                await send(context.bot, "🟡 *Conflict Telegram* — une autre instance du bot est en train de poller (probable redeploy en cours). PTB retente seul; vérifie qu'il ne reste qu'1 instance active si ça persiste >2min.")
+            return
         import traceback as _tb
         tail = "".join(_tb.format_exception(type(context.error), context.error, context.error.__traceback__))[-500:]
         await send(context.bot, f"🔴 *Erreur interne*\n`{type(context.error).__name__}: {context.error}`\n```{tail}```")
