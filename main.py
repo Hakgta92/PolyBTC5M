@@ -1903,6 +1903,7 @@ class State:
             "daily_pause_until":self.daily_pause_until,"paper_mode":self.paper_mode,
             "skipped":self.skipped,"pass_reasons":self.pass_reasons[-50:],
             "calib_factor":self.calib_factor,"killed":self.killed,
+            "running":self.running,  # ✅ (21/06) persisté pour auto-reprise après redeploy
             "version":BOT_VERSION,"saved_at":int(time.time()),
             "oracle_patterns":self.oracle_patterns[-200:],
             "calibration_log":self.calibration_log[-20:],
@@ -1947,6 +1948,7 @@ class State:
                     FILTER_DELTA_CONTRA=d.get("filter_delta_contra", FILTER_DELTA_CONTRA)
                     FILTER_GAP_STRONG=d.get("filter_gap_strong", FILTER_GAP_STRONG)
                     self.calib_factor=d.get("calib_factor",1.0); self.killed=d.get("killed",False)
+                    self.running=d.get("running",False)  # ✅ (21/06) auto-reprise: restauré pour relancer au démarrage si actif avant
                     age=int((time.time()-d.get("saved_at",0))/60)
                     log.info(f"✅ State {filepath} ({age}min) BR:{self.bankroll:.2f}"); return
             except Exception as e: log.error(f"Load {filepath}: {e}")
@@ -5746,56 +5748,72 @@ async def cmd_start(update,context):
         f"*/passes* */fair* */setbalance {st.bankroll:.2f}* • */backup*",
         parse_mode="Markdown")
 
+def _schedule_all_jobs(jq):
+    """✅ (21/06) Planification centralisée de TOUS les jobs de trading. Appelée par /run ET par
+    l'auto-reprise au démarrage (main()), pour que les jobs ne dépendent plus d'un /run manuel
+    après chaque redeploy (cause du "bot tourne mais aucune passe/trade")."""
+    if not st.paper_mode:
+        jq.run_once(job_reconcile, when=8)  # ✅ #8 — réconcilie l'état avec les positions réelles au démarrage
+    st.price_job=jq.run_repeating(job_price,interval=30,first=5)
+    st.macro_job=jq.run_repeating(job_macro,interval=300,first=8)
+    st.tick_job=jq.run_repeating(job_tick,interval=30,first=10)
+    st.tp_job=jq.run_repeating(job_take_profit,interval=TAKE_PROFIT_CHECK,first=10)
+    st.backup_job=jq.run_repeating(job_backup,interval=120,first=60)  # v12.4 backup 2min
+    st.recap_job=jq.run_repeating(job_daily_recap,interval=3600,first=60)
+    jq.run_repeating(job_check_expiry,interval=30,first=15)
+    jq.run_repeating(job_ws_watchdog_all,interval=30,first=1)  # ✅ v10.23 tous les WS
+    jq.run_repeating(job_staged_entry,interval=5,first=14)     # ✅ v10.23 2e tranche
+    jq.run_repeating(job_oracle_lag,interval=2,first=16)
+    jq.run_repeating(job_oracle_lag_eth,interval=2,first=18)
+    jq.run_repeating(job_oracle_lag_sol,interval=2,first=20)
+    jq.run_repeating(job_oracle_lag_xrp,interval=2,first=22)
+    jq.run_repeating(job_momentum_btc,interval=2,first=24)  # ✅ v12.9 — 2ème fenêtre momentum
+    jq.run_repeating(job_mean_reversion_btc,interval=2,first=26)  # ✅ v12.9 — 3ème fenêtre mean-reversion (ajout pur)
+    # ✅ v12.9 — Extension multi-asset momentum+meanrev (ETH/SOL/XRP), sizing 1-3% BR dédié (demande user 17/06)
+    jq.run_repeating(job_momentum_eth,interval=2,first=28)
+    jq.run_repeating(job_momentum_sol,interval=2,first=30)
+    jq.run_repeating(job_momentum_xrp,interval=2,first=32)
+    jq.run_repeating(job_mean_reversion_eth,interval=2,first=34)
+    jq.run_repeating(job_mean_reversion_sol,interval=2,first=36)
+    jq.run_repeating(job_mean_reversion_xrp,interval=2,first=38)
+    # ✅ v12.9 — 4ème stratégie CONFLUENCE (/conf), demande user 17/06
+    jq.run_repeating(job_confluence_btc,interval=2,first=40)
+    jq.run_repeating(job_confluence_eth,interval=2,first=42)
+    jq.run_repeating(job_confluence_sol,interval=2,first=44)
+    jq.run_repeating(job_confluence_xrp,interval=2,first=46)
+    # ✅ v12.9 — STRATÉGIE OB SIGNAL (trade dans le sens du carnet, fenêtre T-150→T-30)
+    jq.run_repeating(job_ob_signal_btc,interval=3,first=48)
+    jq.run_repeating(job_ob_signal_eth,interval=3,first=49)
+    jq.run_repeating(job_ob_signal_sol,interval=3,first=50)
+    jq.run_repeating(job_ob_signal_xrp,interval=3,first=51)
+    jq.run_repeating(job_resolve_passes,interval=30,first=35)
+    # ✅ v12.9 — SLOT RECORDER: enregistrement principal à la bascule (ws_oracle_loop) + ce job en filet de sécurité
+    jq.run_repeating(job_slot_recorder,interval=30,first=50)
+    # ✅ v12.9 — TRACKER TIMING DE PRICING: mesure à quel T-Xs le token dépasse 0.95$ (10s)
+    jq.run_repeating(job_price_timing,interval=10,first=20)
+    jq.run_repeating(job_auto_calibrate,interval=7200,first=300)  # ✅ v10.37 seuils auto
+    jq.run_repeating(job_pattern_memory,interval=3600,first=600)  # ✅ v10.37 mémoire patterns
+    jq.run_repeating(job_haiku_analysis,interval=7200,first=900)  # ✅ v10.37 Haiku insights
+
+async def _job_autoresume_notify(context):
+    """✅ (21/06) Notifie l'auto-reprise du trading après un redémarrage/redeploy."""
+    await send(context.bot,
+        f"♻️ *Auto-reprise* — le bot était actif avant le redémarrage, trading relancé automatiquement.\n"
+        f"Mode:*{'📄 PAPER' if st.paper_mode else '💰 RÉEL'}* | BR:`{st.bankroll:.2f}$`")
+
 async def cmd_run(update,context):
     if not auth(update): return
     if st.running: await update.message.reply_text("⚠️ Déjà en cours."); return
+    if st.killed:
+        # ✅ (21/06) avant: /run planifiait les jobs MAIS ils sortaient tous sur `if st.killed: return`
+        # → bot "démarré" mais 100% inerte sans explication. Maintenant on prévient.
+        await update.message.reply_text("⛔ Kill-switch actif (pertes consécutives). Fais `/revive` d'abord, puis `/run`.", parse_mode="Markdown"); return
     if not st.paper_mode:
         if not poly.init_client():
             await update.message.reply_text("⚠️ Polymarket indispo — paper mode activé",parse_mode="Markdown")
             st.paper_mode=True
     st.running=True; st.session_start=time.time(); st.daily_ts=time.time()
-    if not st.paper_mode:
-        context.job_queue.run_once(job_reconcile, when=8)  # ✅ #8 — réconcilie l'état avec les positions réelles au démarrage
-    st.price_job=context.job_queue.run_repeating(job_price,interval=30,first=5)
-    st.macro_job=context.job_queue.run_repeating(job_macro,interval=300,first=8)
-    st.tick_job=context.job_queue.run_repeating(job_tick,interval=30,first=10)
-    st.tp_job=context.job_queue.run_repeating(job_take_profit,interval=TAKE_PROFIT_CHECK,first=10)
-    st.backup_job=context.job_queue.run_repeating(job_backup,interval=120,first=60)  # v12.4 backup 2min
-    st.recap_job=context.job_queue.run_repeating(job_daily_recap,interval=3600,first=60)
-    context.job_queue.run_repeating(job_check_expiry,interval=30,first=15)
-    context.job_queue.run_repeating(job_ws_watchdog_all,interval=30,first=1)  # ✅ v10.23 tous les WS
-    context.job_queue.run_repeating(job_staged_entry,interval=5,first=14)     # ✅ v10.23 2e tranche
-    context.job_queue.run_repeating(job_oracle_lag,interval=2,first=16)
-    context.job_queue.run_repeating(job_oracle_lag_eth,interval=2,first=18)
-    context.job_queue.run_repeating(job_oracle_lag_sol,interval=2,first=20)
-    context.job_queue.run_repeating(job_oracle_lag_xrp,interval=2,first=22)
-    context.job_queue.run_repeating(job_momentum_btc,interval=2,first=24)  # ✅ v12.9 — 2ème fenêtre momentum
-    context.job_queue.run_repeating(job_mean_reversion_btc,interval=2,first=26)  # ✅ v12.9 — 3ème fenêtre mean-reversion (ajout pur)
-    # ✅ v12.9 — Extension multi-asset momentum+meanrev (ETH/SOL/XRP), sizing 1-3% BR dédié (demande user 17/06)
-    context.job_queue.run_repeating(job_momentum_eth,interval=2,first=28)
-    context.job_queue.run_repeating(job_momentum_sol,interval=2,first=30)
-    context.job_queue.run_repeating(job_momentum_xrp,interval=2,first=32)
-    context.job_queue.run_repeating(job_mean_reversion_eth,interval=2,first=34)
-    context.job_queue.run_repeating(job_mean_reversion_sol,interval=2,first=36)
-    context.job_queue.run_repeating(job_mean_reversion_xrp,interval=2,first=38)
-    # ✅ v12.9 — 4ème stratégie CONFLUENCE (/conf), demande user 17/06
-    context.job_queue.run_repeating(job_confluence_btc,interval=2,first=40)
-    context.job_queue.run_repeating(job_confluence_eth,interval=2,first=42)
-    context.job_queue.run_repeating(job_confluence_sol,interval=2,first=44)
-    context.job_queue.run_repeating(job_confluence_xrp,interval=2,first=46)
-    # ✅ v12.9 — STRATÉGIE OB SIGNAL (trade dans le sens du carnet, fenêtre T-150→T-30)
-    context.job_queue.run_repeating(job_ob_signal_btc,interval=3,first=48)
-    context.job_queue.run_repeating(job_ob_signal_eth,interval=3,first=49)
-    context.job_queue.run_repeating(job_ob_signal_sol,interval=3,first=50)
-    context.job_queue.run_repeating(job_ob_signal_xrp,interval=3,first=51)
-    context.job_queue.run_repeating(job_resolve_passes,interval=30,first=35)
-    # ✅ v12.9 — SLOT RECORDER: enregistrement principal à la bascule (ws_oracle_loop) + ce job en filet de sécurité
-    context.job_queue.run_repeating(job_slot_recorder,interval=30,first=50)
-    # ✅ v12.9 — TRACKER TIMING DE PRICING: mesure à quel T-Xs le token dépasse 0.95$ (10s)
-    context.job_queue.run_repeating(job_price_timing,interval=10,first=20)
-    context.job_queue.run_repeating(job_auto_calibrate,interval=7200,first=300)  # ✅ v10.37 seuils auto
-    context.job_queue.run_repeating(job_pattern_memory,interval=3600,first=600)  # ✅ v10.37 mémoire patterns
-    context.job_queue.run_repeating(job_haiku_analysis,interval=7200,first=900)  # ✅ v10.37 Haiku insights
+    _schedule_all_jobs(context.job_queue)
     st.fg=await fetch_fear_greed(); st.btc24=await fetch_btc_24h(); sess=session_ctx()
     clob_bal = await fetch_clob_balance()
     if clob_bal is not None and clob_bal > 0:
@@ -7309,6 +7327,16 @@ def main():
         app.add_handler(CommandHandler(name,handler))
     app.add_handler(CallbackQueryHandler(cb))
     app.add_error_handler(error_handler)
+    # ✅ (21/06) AUTO-REPRISE: si le bot était actif avant le redémarrage (`running` désormais persisté)
+    # et pas killed, on replanifie TOUS les jobs au démarrage. Plus besoin de refaire /run après chaque
+    # redeploy — c'était la cause du "bot tourne mais aucune passe/trade" (jobs jamais planifiés).
+    if st.running and not st.killed:
+        st.session_start=time.time(); st.daily_ts=time.time()
+        _schedule_all_jobs(app.job_queue)
+        app.job_queue.run_once(_job_autoresume_notify, when=5)
+        log.info("♻️ Auto-reprise: trading relancé automatiquement (running restauré, killed=False)")
+    elif st.running and st.killed:
+        st.running=False  # incohérent (kill-switch prime) → on ne reprend pas
     log.info(f"🧠 PolyBot v{BOT_VERSION} démarré")
     app.run_polling(drop_pending_updates=True)
 
