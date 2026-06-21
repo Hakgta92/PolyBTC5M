@@ -3286,7 +3286,7 @@ async def resolve_paper_bet(context):
     st.backup()
 
 _last_clob_alert = [0.0]  # ✅ (21/06) dédoublonnage alerte "CLOB non authentifié" (1×/10min)
-async def place_bet(context, direction, amount, conf, reasoning, conf_score, sess, tpu, tpd, market_end, source="tick", asset="BTC", reserved=False):
+async def place_bet(context, direction, amount, conf, reasoning, conf_score, sess, tpu, tpd, market_end, source="tick", asset="BTC", reserved=False, market=None):
     """
     ✅ v10.23 — Placement centralisé: REFETCH prix + MAKER order (undercut) +
     ENTRÉE ÉTAGÉE (la 2e tranche est gérée dans st.bet["staged_remaining"]).
@@ -3327,8 +3327,12 @@ async def place_bet(context, direction, amount, conf, reasoning, conf_score, ses
             if staged_remaining < MIN_BET_USD:  # le reste serait sous le minimum → on met tout d'un coup
                 first_amount = amount; staged_remaining = 0.0
 
-        if not st.paper_mode and st.current_market:
-            token_used=st.current_market["token_up"] if direction=="UP" else st.current_market["token_down"]
+        # ✅ (21/06) FIX ROUTAGE D'ACTIF: on utilise le marché passé EXPLICITEMENT (capturé par le job
+        # appelant) et PAS le global st.current_market — partagé et écrasé par les jobs oracle concurrents
+        # (BTC/ETH/SOL/XRP toutes les 2s) entre les await → un ordre "BTC" partait sur le marché XRP.
+        mkt = market if market is not None else st.current_market
+        if not st.paper_mode and mkt:
+            token_used=mkt["token_up"] if direction=="UP" else mkt["token_down"]
             # ✅ (21/06) CLOB pas authentifié (clé API non créée) → impossible de poster un ordre réel.
             # Alerte Telegram dédoublonnée (1×/10min) au lieu d'un "ordre refusé" cryptique en boucle.
             # Cause fréquente: 2 instances du bot tournent et se volent la clé API (voir erreur Conflict).
@@ -3742,7 +3746,7 @@ async def job_tick(context):
     if amount < MIN_BET_USD:
         log_skip(f"Mise calculée {amount:.2f}$<{MIN_BET_USD}$ minimum absolu", direction); return
     if st.bankroll<amount: return
-    ok = await place_bet(context, direction, amount, dec["conf"], dec["reasoning"], conf_score, sess, tpu, tpd, market_end, source="tick", asset="BTC")
+    ok = await place_bet(context, direction, amount, dec["conf"], dec["reasoning"], conf_score, sess, tpu, tpd, market_end, source="tick", asset="BTC", market=market)
     if not ok: return
     mode="💰 RÉEL" if not st.paper_mode else "📄 paper"
     risk_e={"LOW":"🟢","MEDIUM":"🟡","HIGH":"🔴"}.get(dec["risk"],"🟡")
@@ -4104,12 +4108,14 @@ async def job_oracle_lag(context):
     # être bloqué quand une position est déjà ouverte sur un autre actif/stratégie. Le verrou
     # st.asset_trade_slot["BTC"] (posé dans place_bet) garantit malgré tout 1 SEUL bet BTC/slot,
     # tous les slots/stratégies confondus (demande user 21/06: 1 bet par crypto et par slot).
-    ok = await place_bet(context, direction, amount, round(p_oracle,2), reasoning, conf_score, sess, tpu, tpd, market_end, source="snipe", asset="BTC", reserved=True)
+    ok = await place_bet(context, direction, amount, round(p_oracle,2), reasoning, conf_score, sess, tpu, tpd, market_end, source="snipe", asset="BTC", reserved=True, market=market)
     if not ok: return
 
     st.last_trade_slot = cur_slot
     mode = "💰 RÉEL" if not st.paper_mode else "📄 paper"
-    entry_tp = st.entry_token_price2 if not st.paper_mode else token_price
+    # ✅ (21/06) fallback prix: si l'entrée réelle mesurée est 0 (fill non vu), afficher le prix token
+    # pré-ordre au lieu de "Token:0.000$" (trompeur).
+    entry_tp = (st.entry_token_price2 or token_price) if not st.paper_mode else token_price
     # ✅ demande user 21/06: montant RÉELLEMENT placé (1ère tranche si entrée étagée), pas le montant
     # Kelly demandé — st.bet2["amount"] est posé par place_bet() avec first_amount (réel envoyé à l'exchange).
     real_amount = (st.bet2 or {}).get("amount", amount)
@@ -4321,13 +4327,13 @@ async def job_oracle_lag_asset(context, asset:str):
     market_end=market.get("end_date",""); sess=session_ctx(); conf_score={"score":0,"signals":[]}
     reasoning=f"ORACLE LAG {symbol} {direction} | gap={spot_oracle_gap:+.3f}% delta={oracle_delta:+.3f}% TA={ta_score} votes={dir_votes}/6 | tok={token_price:.3f}$ EV={ev*100:+.1f}% T-{int(slot_remaining)}s"
     st.current_market=market  # ✅ place_bet route l'ordre réel via st.current_market — doit pointer le marché de l'asset
-    ok=await place_bet(context,direction,amount,round(p_oracle,2),reasoning,conf_score,sess,tpu,tpd,market_end,source="snipe",asset=asset)
+    ok=await place_bet(context,direction,amount,round(p_oracle,2),reasoning,conf_score,sess,tpu,tpd,market_end,source="snipe",asset=asset,market=market)
     if not ok: return
     if asset=="ETH": st.eth_last_trade_slot=cur_slot
     elif asset=="SOL": st.sol_last_trade_slot=cur_slot
     elif asset=="XRP": st.xrp_last_trade_slot=cur_slot
     mode="💰 RÉEL" if not st.paper_mode else "📄 paper"
-    entry_tp=st.entry_token_price if not st.paper_mode else token_price
+    entry_tp=(st.entry_token_price or token_price) if not st.paper_mode else token_price  # ✅ (21/06) fallback prix si entrée réelle=0
     # ✅ demande user 21/06: montant RÉELLEMENT placé (1ère tranche si entrée étagée), pas le montant
     # Kelly demandé — st.bet["amount"] est posé par place_bet() avec first_amount (réel envoyé à l'exchange).
     real_amount = (st.bet or {}).get("amount", amount)
@@ -4515,7 +4521,7 @@ async def job_momentum_btc(context):
     reasoning = f"⚡MOMENTUM BTC {direction} | ret60s={ret_60s:+.3f}% ret30s={ret_30s:+.3f}% ret3s={ret_3s:+.3f}% trend10m={trend_10m:+.3f}% | tok={token_price:.2f}$ EV={ev*100:+.1f}% T-{int(slot_remaining)}s"
 
     st.current_market = market  # ✅ place_bet route l'ordre réel via st.current_market
-    ok = await place_bet(context, direction, amount, round(p_mom,2), reasoning, conf_score, sess, tpu, tpd, market_end, source="momentum", asset="BTC")
+    ok = await place_bet(context, direction, amount, round(p_mom,2), reasoning, conf_score, sess, tpu, tpd, market_end, source="momentum", asset="BTC", market=market)
     if not ok: return
 
     st.momentum_last_slot = cur_slot
@@ -4631,7 +4637,7 @@ async def job_momentum_asset(context, asset):
                  f"trend10m={trend_10m:+.3f}% | tok={token_price:.2f}$ EV={ev*100:+.1f}% T-{int(slot_remaining)}s")
 
     st.current_market = market  # ✅ place_bet route l'ordre réel via st.current_market — doit pointer le marché de l'asset
-    ok = await place_bet(context, direction, amount, round(p_mom,2), reasoning, conf_score, sess, tpu, tpd, market_end, source="momentum", asset=asset)
+    ok = await place_bet(context, direction, amount, round(p_mom,2), reasoning, conf_score, sess, tpu, tpd, market_end, source="momentum", asset=asset, market=market)
     if not ok: return
 
     setattr(st, cfg["mom_slot"], cur_slot)
@@ -4768,7 +4774,7 @@ async def job_mean_reversion_btc(context):
                  f"ret3s={ret_3s:+.3f}% | tok={token_price:.2f}$ EV={ev*100:+.1f}% T-{int(slot_remaining)}s")
 
     st.current_market = market  # ✅ place_bet route l'ordre réel via st.current_market
-    ok = await place_bet(context, direction, amount, round(p_rev,2), reasoning, conf_score, sess, tpu, tpd, market_end, source="meanrev", asset="BTC")
+    ok = await place_bet(context, direction, amount, round(p_rev,2), reasoning, conf_score, sess, tpu, tpd, market_end, source="meanrev", asset="BTC", market=market)
     if not ok: return
 
     st.meanrev_last_slot = cur_slot
@@ -4879,7 +4885,7 @@ async def job_mean_reversion_asset(context, asset):
                  f"ret3s={ret_3s:+.3f}% | tok={token_price:.2f}$ EV={ev*100:+.1f}% T-{int(slot_remaining)}s")
 
     st.current_market = market  # ✅ place_bet route l'ordre réel via st.current_market — doit pointer le marché de l'asset
-    ok = await place_bet(context, direction, amount, round(p_rev,2), reasoning, conf_score, sess, tpu, tpd, market_end, source="meanrev", asset=asset)
+    ok = await place_bet(context, direction, amount, round(p_rev,2), reasoning, conf_score, sess, tpu, tpd, market_end, source="meanrev", asset=asset, market=market)
     if not ok: return
 
     setattr(st, cfg["mr_slot"], cur_slot)
@@ -5008,7 +5014,7 @@ async def job_ob_signal_asset(context, asset):
     ok = await place_bet(context, direction, amount, p_conf, reasoning, {"score":0,"signals":[]}, sess,
                          token_price if direction=="UP" else 1-token_price,
                          token_price if direction=="DOWN" else 1-token_price,
-                         cur_slot+300, source="ob_signal", asset=asset)
+                         cur_slot+300, source="ob_signal", asset=asset, market=market)
     if ok:
         st.ob_last_slot[asset] = cur_slot
         log.info(f"📖 OB SIGNAL TRADE {asset} {direction} {amount:.2f}$ (OB={ob:+.2f})")
@@ -5154,7 +5160,7 @@ async def job_confluence_asset(context, asset):
                  f"gap={gap_pct:+.3f}% BW={bandwidth:.3f}% | tok={token_price:.2f}$ EV={ev*100:+.1f}% T-{int(slot_remaining)}s")
 
     st.current_market = market  # ✅ place_bet route l'ordre réel via st.current_market — doit pointer le marché de l'asset
-    ok = await place_bet(context, direction, amount, round(p_conf,2), reasoning, conf_score, sess, tpu, tpd, market_end, source="confluence", asset=asset)
+    ok = await place_bet(context, direction, amount, round(p_conf,2), reasoning, conf_score, sess, tpu, tpd, market_end, source="confluence", asset=asset, market=market)
     if not ok: return
 
     setattr(st, cfg["tds_slot"], cur_slot)
@@ -6194,7 +6200,7 @@ async def cmd_signal(update,context):
         if amount >= MIN_BET_USD and st.bankroll >= amount:
             market_end = st.current_market.get("end_date", "")
             ok = await place_bet(context, d["dir"], amount, d["conf"], d["reasoning"], cs, sess,
-                                 tu, td, market_end, source="signal", asset="BTC")
+                                 tu, td, market_end, source="signal", asset="BTC", market=st.current_market)
             if ok:
                 await update.message.reply_text(
                     f"🎯 *Ordre placé depuis /signal !*\n"
