@@ -2172,16 +2172,23 @@ async def _resolve_expired_bet(context, reserved=False):
     if bet_expiry <= 0: return
     remaining = bet_expiry - now
     active_token_id = getattr(st, f"active_token_id{sfx}")
-    entry_token_price = getattr(st, f"entry_token_price{sfx}")
+    # ✅ (21/06) entrée robuste: si le prix d'entrée mesuré est 0 (fill non vu), on retombe sur
+    # bet["entry_token"] (prix pré-ordre stocké) — sinon le multiplicateur affichait "x0.00" à tort.
+    entry_token_price = getattr(st, f"entry_token_price{sfx}") or bet.get("entry_token", 0)
     tag = " 🔓réservé" if reserved else ""
 
-    if 50 <= remaining <= 70:
-        current_price = await poly.get_token_price(active_token_id) if active_token_id else 0
-        gain_mult = current_price/entry_token_price if entry_token_price>0 and current_price>0 else 0
-        await send(context.bot,
-            f"⏰ *Position expire dans ~1min*{tag}\n"
-            f"`{bet['dir']}` | Token:`{current_price:.3f}$` | x`{gain_mult:.2f}`\n"
-            f"BTC:`${st.price:,.2f}`")
+    # ✅ (21/06) alerte ~30s avant expiration (était ~1min), fenêtre large (≥ l'intervalle 30s du job
+    # pour ne jamais la rater) + flag anti-doublon (était envoyée 2× si le job échantillonnait 2× la fenêtre).
+    if 20 <= remaining <= 50:
+        if not getattr(st, f"expiry_alerted{sfx}", False):
+            setattr(st, f"expiry_alerted{sfx}", True)
+            current_price = await poly.get_token_price(active_token_id) if active_token_id else 0
+            gain_mult = current_price/entry_token_price if entry_token_price>0 and current_price>0 else 0
+            mult_txt = f"x`{gain_mult:.2f}`" if gain_mult>0 else "x`?` _(prix d'entrée inconnu)_"
+            await send(context.bot,
+                f"⏰ *Position expire dans ~{int(remaining)}s*{tag}\n"
+                f"`{bet['dir']}` | Token:`{current_price:.3f}$` | {mult_txt}\n"
+                f"BTC:`${st.price:,.2f}`")
         return
     # ✅ Clôture automatique 60s après expiration.
     # Résultat = VRAIE résolution (slot recorder: close vs open oracle = règle Polymarket),
@@ -2241,6 +2248,7 @@ async def _resolve_expired_bet(context, reserved=False):
         "fill_type":bet.get("fill_type","?"),"fee_est":bet.get("fee_est",0)})
     setattr(st, f"bet{sfx}", None); setattr(st, f"active_token_id{sfx}", None); setattr(st, f"active_order_id{sfx}", None)
     setattr(st, f"shares_bought{sfx}", 0); setattr(st, f"entry_token_price{sfx}", 0); setattr(st, f"bet_expiry{sfx}", 0)
+    setattr(st, f"expiry_alerted{sfx}", False)  # ✅ (21/06) reset flag alerte T-30s à la clôture
     if not reserved: st.token_price_peak=0; st.trailing_active=False
     emoji="✅" if won else "❌"
     # ✅ demande user 21/06: mise réelle (cost = shares réelles × prix d'entrée réel) + gain réel
@@ -3464,6 +3472,7 @@ async def place_bet(context, direction, amount, conf, reasoning, conf_score, ses
                 "staged_remaining":staged_remaining,"staged_done":staged_remaining<=0,"source":source,
                 "asset":asset,"entry_token":round(entry_tp,4),"t_remaining":t_remaining,
                 "fill_type":fill_type,"fee_est":fee_est,"reserved":reserved})
+        setattr(st, f"expiry_alerted{sfx}", False)  # ✅ (21/06) reset flag alerte T-30s pour la nouvelle position
         if asset == "BTC" and not reserved:
             st.last_trade_slot = cur_slot  # ✅ dédup BTC (job_tick/momentum/meanrev/oracle BTC s'y réfèrent)
         return True
@@ -5803,6 +5812,11 @@ def _schedule_all_jobs(jq):
     """✅ (21/06) Planification centralisée de TOUS les jobs de trading. Appelée par /run ET par
     l'auto-reprise au démarrage (main()), pour que les jobs ne dépendent plus d'un /run manuel
     après chaque redeploy (cause du "bot tourne mais aucune passe/trade")."""
+    # ✅ (21/06) IDEMPOTENT: retire d'abord tous les jobs déjà planifiés. Sinon un 2e appel (ex: /stop
+    # puis /run — /stop ne retirait que 6 jobs sur ~36) DOUBLAIT chaque stratégie → 2× trades + 2× alertes.
+    for _j in list(jq.jobs()):
+        try: _j.schedule_removal()
+        except Exception: pass
     if not st.paper_mode:
         jq.run_once(job_reconcile, when=8)  # ✅ #8 — réconcilie l'état avec les positions réelles au démarrage
     st.price_job=jq.run_repeating(job_price,interval=30,first=5)
@@ -5900,10 +5914,11 @@ async def cmd_run(update,context):
 async def cmd_stop(update,context):
     if not auth(update): return
     st.running=False
-    for j in [st.tick_job,st.price_job,st.macro_job,st.tp_job,st.backup_job,st.recap_job]:
-        if j:
-            try: j.schedule_removal()
-            except: pass
+    # ✅ (21/06) retire TOUS les jobs planifiés (avant: seulement 6 sur ~36 → les stratégies oracle/
+    # momentum/etc. continuaient à tourner après /stop, et /run les redoublait).
+    for j in list(context.job_queue.jobs()):
+        try: j.schedule_removal()
+        except Exception: pass
     st.tick_job=st.price_job=st.macro_job=st.tp_job=st.backup_job=st.recap_job=None
     st.backup()
     await update.message.reply_text(
