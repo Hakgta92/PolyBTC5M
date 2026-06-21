@@ -1774,6 +1774,9 @@ class State:
         self.eth_oracle_price=0.0; self.eth_oracle_ts=0.0
         self.eth_oracle_slot_open=0.0; self.eth_oracle_slot_ts=0
         self.eth_last_trade_slot=0
+        # ✅ ob_ts (BTC) manquait ici — n'était posé que par ws_clob_loop() au 1er message WS, donc
+        # st.ob_ts crashait (AttributeError) si lu avant ça (ex: job_oracle_lag juste après démarrage).
+        self.ob_imbalance=0.0; self.ob_ts=0.0; self.ob_asset_id=""
         self.eth_ob_imbalance=0.0; self.eth_ob_ts=0.0; self.eth_ob_asset_id=""; self.eth_clob_ws_task=None
         # SOL
         self.sol_price=0.0; self.sol_ts=0; self.sol_ws_task=None
@@ -3884,7 +3887,7 @@ async def job_oracle_lag(context):
 
     # OB vote
     ob_vote = 0
-    if time.time() - st.ob_ts < 10:
+    if time.time() - getattr(st, "ob_ts", 0) < 10:
         if st.ob_imbalance > 0.15: ob_vote = 1
         elif st.ob_imbalance < -0.15: ob_vote = -1
 
@@ -3968,7 +3971,10 @@ async def job_oracle_lag(context):
     amount = kelly_bet(st.bankroll, p_oracle, payout, token_price, ev_bonus=True)
     if amount < MIN_BET_USD: return
 
-    tpu = market["token_up"]; tpd = market["token_down"]
+    # ✅ tpu/tpd doivent être des PRIX (float), pas les token_id (string) — sinon TypeError
+    # str/int dès que place_bet compare entry_tp>0 (mode paper ou fallback prix).
+    tpu = token_price if direction=="UP" else round(max(0.01,1-token_price),4)
+    tpd = token_price if direction=="DOWN" else round(max(0.01,1-token_price),4)
     try: market_end = datetime.fromisoformat(market.get("end_date","").replace("Z","+00:00")).timestamp()
     except: market_end = cur_slot + 300
     sess = session_ctx(); conf_score = {"score":0,"signals":[]}
@@ -4173,7 +4179,9 @@ async def job_oracle_lag_asset(context, asset:str):
     payout=round(1/token_price,2)
     amount=kelly_bet(st.bankroll,p_oracle,payout,token_price,ev_bonus=True)
     if amount<MIN_BET_USD: return
-    tpu=market["token_up"]; tpd=market["token_down"]
+    # ✅ tpu/tpd = PRIX (float), pas token_id (string) — cf. fix job_oracle_lag BTC
+    tpu = token_price if direction=="UP" else round(max(0.01,1-token_price),4)
+    tpd = token_price if direction=="DOWN" else round(max(0.01,1-token_price),4)
     market_end=market.get("end_date",""); sess=session_ctx(); conf_score={"score":0,"signals":[]}
     reasoning=f"ORACLE LAG {symbol} {direction} | gap={spot_oracle_gap:+.3f}% delta={oracle_delta:+.3f}% TA={ta_score} votes={dir_votes}/5 | tok={token_price:.3f}$ EV={ev*100:+.1f}% T-{int(slot_remaining)}s"
     st.current_market=market  # ✅ place_bet route l'ordre réel via st.current_market — doit pointer le marché de l'asset
@@ -4359,7 +4367,9 @@ async def job_momentum_btc(context):
 
     log.info(f"⚡ MOMENTUM BTC {direction} | ret60s={ret_60s:+.3f}% ret30s={ret_30s:+.3f}% tok={token_price:.2f}$ EV={ev*100:.1f}%")
 
-    tpu = market["token_up"]; tpd = market["token_down"]
+    # ✅ tpu/tpd = PRIX (float), pas token_id (string) — cf. fix job_oracle_lag BTC
+    tpu = token_price if direction=="UP" else round(max(0.01,1-token_price),4)
+    tpd = token_price if direction=="DOWN" else round(max(0.01,1-token_price),4)
     market_end = market.get("end_date","")
     sess = session_ctx()
     conf_score = {"score":0,"signals":[]}
@@ -4472,7 +4482,9 @@ async def job_momentum_asset(context, asset):
 
     log.info(f"⚡ MOMENTUM {asset} {direction} | ret60s={ret_60s:+.3f}% ret30s={ret_30s:+.3f}% tok={token_price:.2f}$ EV={ev*100:.1f}%")
 
-    tpu = market["token_up"]; tpd = market["token_down"]
+    # ✅ tpu/tpd = PRIX (float), pas token_id (string) — cf. fix job_oracle_lag BTC
+    tpu = token_price if direction=="UP" else round(max(0.01,1-token_price),4)
+    tpd = token_price if direction=="DOWN" else round(max(0.01,1-token_price),4)
     market_end = market.get("end_date","")
     sess = session_ctx()
     conf_score = {"score":0,"signals":[]}
@@ -4607,7 +4619,9 @@ async def job_mean_reversion_btc(context):
 
     log.info(f"🔄 MEAN-REV BTC {direction} | bandwidth={bandwidth:.3f}% overext={overext:.3f}% tok={token_price:.2f}$ EV={ev*100:.1f}%")
 
-    tpu = market["token_up"]; tpd = market["token_down"]
+    # ✅ tpu/tpd = PRIX (float), pas token_id (string) — cf. fix job_oracle_lag BTC
+    tpu = token_price if direction=="UP" else round(max(0.01,1-token_price),4)
+    tpd = token_price if direction=="DOWN" else round(max(0.01,1-token_price),4)
     market_end = market.get("end_date","")
     sess = session_ctx()
     conf_score = {"score":0,"signals":[]}
@@ -4716,7 +4730,9 @@ async def job_mean_reversion_asset(context, asset):
 
     log.info(f"🔄 MEAN-REV {asset} {direction} | bandwidth={bandwidth:.3f}% overext={overext:.3f}% tok={token_price:.2f}$ EV={ev*100:.1f}%")
 
-    tpu = market["token_up"]; tpd = market["token_down"]
+    # ✅ tpu/tpd = PRIX (float), pas token_id (string) — cf. fix job_oracle_lag BTC
+    tpu = token_price if direction=="UP" else round(max(0.01,1-token_price),4)
+    tpd = token_price if direction=="DOWN" else round(max(0.01,1-token_price),4)
     market_end = market.get("end_date","")
     sess = session_ctx()
     conf_score = {"score":0,"signals":[]}
@@ -4988,7 +5004,9 @@ async def job_confluence_asset(context, asset):
 
     log.info(f"🎯 CONFLUENCE {asset} {direction} | TDS={tds:.2f} conf={confidence:.2f} type={setup_type} oracle={oracle_score:.2f} setup={setup_score:.2f} tok={token_price:.2f}$ EV={ev*100:.1f}%")
 
-    tpu = market["token_up"]; tpd = market["token_down"]
+    # ✅ tpu/tpd = PRIX (float), pas token_id (string) — cf. fix job_oracle_lag BTC
+    tpu = token_price if direction=="UP" else round(max(0.01,1-token_price),4)
+    tpd = token_price if direction=="DOWN" else round(max(0.01,1-token_price),4)
     market_end = market.get("end_date","")
     sess = session_ctx()
     conf_score = {"score":0,"signals":[]}
