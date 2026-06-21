@@ -204,8 +204,8 @@ TDS_TOKEN_MAX        = 0.72
 SHADOW_DOWN_ENABLED      = True   # passer à False pour désactiver le shadow logging
 SHADOW_DOWN_GAP_MIN      = 0.005  # gap positif minimum (spot encore au-dessus oracle figé)
 SHADOW_DOWN_DELTA_MIN    = 0.010  # |delta négatif| minimum (oracle descend de façon nette)
-ORACLE_WINDOW_START = 90    # ✅ (21/06) demande user: fenêtre resserrée T-90s→T-20s (était T-125s→T-30s)
-ORACLE_WINDOW_END   = 20    # ✅ (21/06) demande user: fenêtre resserrée T-90s→T-20s (était T-125s→T-30s)
+ORACLE_WINDOW_START = 70    # ✅ (21/06) demande user: fenêtre resserrée T-70s→T-20s (était T-90s puis T-125s→T-30s)
+ORACLE_WINDOW_END   = 20    # ✅ (21/06) demande user: fenêtre resserrée T-70s→T-20s (était T-90s puis T-125s→T-30s)
 # ✅ v10.36 — Filtres WR validés par étude live (medium.com/@gwrx2005, mars 2026)
 # Source: filtre 10min → -93% pertes, seuils relevés → -73% fréquence = bien meilleur WR
 ORACLE_DELTA_CONTRA_MAX = 0.03  # Si votes=1/3, delta contre doit être < 0.03% sinon skip
@@ -4135,12 +4135,12 @@ async def job_oracle_lag(context):
     cur_slot = int(now // 300) * 300
     slot_remaining = cur_slot + 300 - now
     # ✅ v12.9 — Régime trendsession: >60% deltaneg → resserrer le DÉBUT (entrer plus tard, plus près de la décision)
-    # Doit rester > ORACLE_WINDOW_END (20). ⚠️ (21/06) avec la fenêtre resserrée T-90s→T-20s, ce floor
-    # max(.,90) == ORACLE_WINDOW_START par défaut → ce régime ne resserre plus rien en pratique (no-op).
-    # Dis-moi si tu veux un floor plus bas (ex: 60) pour que ce mécanisme garde un effet.
+    # ✅ (21/06) FIX: l'ancien floor fixe à 90 dépassait désormais ORACLE_WINDOW_START (70) → ça ÉLARGISSAIT
+    # la fenêtre en régime baissier au lieu de la resserrer (effet inverse de l'intention). On borne
+    # maintenant par min(défaut, floor) pour garantir que ce régime ne fait QUE resserrer, jamais élargir.
     recent_30=[p for p in st.pass_reasons if now-p.get("ts",0)<=1800]
     dn_ratio=sum(1 for p in recent_30 if "delta" in p.get("reason","").lower() and "<0" in p.get("reason",""))/max(len(recent_30),1)
-    btc_win_start=max(ORACLE_WINDOW_END+30, 90) if dn_ratio>0.60 else ORACLE_WINDOW_START
+    btc_win_start=min(ORACLE_WINDOW_START, max(ORACLE_WINDOW_END+30, 50)) if dn_ratio>0.60 else ORACLE_WINDOW_START
     if slot_remaining > btc_win_start or slot_remaining < ORACLE_WINDOW_END: return
 
     _resolve_pending_passes()  # ✅ v12.9 — Résolution immédiate
