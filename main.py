@@ -164,6 +164,27 @@ OB_DISAGREE_PCT       = 0.02   # 2% du bankroll
 # si les 1ers trades BTC à EV 8-15% perdent, remonter à 15%.
 ORACLE_EDGE_MIN_BTC = 0.08
 
+# ✅ (21/06) demande user — FIABILISATION oracle_lag (#1→#5):
+# #1 Marge de sécurité dépendante du temps: la résolution = oracle_close vs oracle_open, donc le delta
+#    oracle doit dépasser une fraction du mouvement résiduel attendu (σ_oracle·√t_restant) sinon il peut
+#    encore s'inverser avant la clôture. Strict tôt dans le slot, permissif près de T-30s.
+ORACLE_SAFETY_K       = 0.45   # delta requis ≥ K × (σ·√t_restant). 0=désactivé, ↑=plus strict
+ORACLE_VOL_LOOKBACK   = 60     # fenêtre (s) d'estimation de la volatilité réalisée de l'oracle/spot
+# #3 Persistance du gap (anti-spike): le spot doit être resté du bon côté de l'oracle, pas un pic isolé.
+GAP_PERSIST_LOOKBACK  = 5      # fenêtre (s) de vérification de persistance du gap
+GAP_PERSIST_MIN_FRAC  = 0.70   # fraction min de ticks du bon côté de l'oracle
+# #4 Intégrité de la source de résolution (Chainlink): le bot lit EXACTEMENT le feed qui résout
+#    (topic crypto_prices_chainlink). On exige sa fraîcheur + un open de slot capturé près de la frontière.
+CHAINLINK_MAX_AGE     = 25     # âge max (s) du dernier tick Chainlink — au-delà, delta non fiable → skip
+ORACLE_OPEN_LAG_MAX   = 12     # retard max (s) de capture de l'open du slot; au-delà ET delta marginal → skip
+ORACLE_OPEN_LAG_DELTA = 0.020  # delta (%) sous lequel un open capturé tard rend le sens non fiable
+# #5 Filtre spread du carnet Polymarket: un book large érode l'entrée réelle (frais inclus) → -EV caché.
+ORACLE_MAX_SPREAD     = 0.05   # spread max (¢ en fraction, 0.05=5¢) toléré sur le token tradé
+# #2 Calibration empirique de p_oracle: win-rate réel par bucket (asset/signal/|delta|/votes), mélangé
+#    à la formule a priori via shrinkage bayésien (K pseudo-observations). Auto-corrige l'EV au fil des trades.
+ORACLE_CALIB_PRIOR_K  = 25     # poids de l'a priori (formule). ↑=fait moins confiance à l'empirique tôt
+ORACLE_CALIB_MIN_N    = 8      # nb min d'observations dans le bucket avant d'ajuster p_oracle
+
 # ✅ v12.9 — 4ème stratégie CONFLUENCE (/conf): combine oracle (biais) × régime/setup (mean-rev ou momentum) × bruit
 # Formule multiplicative: TDS = oracle_score × setup_score × (1-noise_penalty). Seuils de départ raisonnés, À CALIBRER.
 TDS_GAP_MIN          = 0.025  # seuil minimum gap oracle pour avoir un biais (cohérent avec gap_min existant)
@@ -389,6 +410,80 @@ def kelly_bet_oracle(bankroll, win_prob, payout_mult, token_price=0.5, votes=0):
     result = round(min(MAX_BET_USD, max(MIN_BET_USD, raw_bet)), 2)
     log.debug(f"Kelly oracle: kp={kp:.3f} pct={pct*100:.1f}% strength={strength:.2f} → {result:.2f}$")
     return result
+
+# ═══════════ ✅ (21/06) FIABILISATION oracle_lag — helpers #1/#2/#3 ═══════════
+def oracle_vol_pct(pts, now, lookback=ORACLE_VOL_LOOKBACK):
+    """#1 — Volatilité réalisée du prix (spot, proxy de l'oracle qui le suit): écart-type des rendements
+    NORMALISÉS à 1s sur `lookback` secondes, exprimé en %/√s. Renvoie None si données insuffisantes
+    (l'appelant ne bloque alors PAS — pas de filtre à l'aveugle)."""
+    rows = [(t, p) for t, p in pts if now - t <= lookback and p > 0]
+    if len(rows) < 8:
+        return None
+    rets = []
+    for i in range(1, len(rows)):
+        dt = rows[i][0] - rows[i-1][0]
+        if dt <= 0 or rows[i-1][1] <= 0:
+            continue
+        r = (rows[i][1] - rows[i-1][1]) / rows[i-1][1]
+        rets.append(r / math.sqrt(dt))  # rendement ramené à 1s
+    if len(rets) < 5:
+        return None
+    m = sum(rets) / len(rets)
+    var = sum((x - m) ** 2 for x in rets) / len(rets)
+    return math.sqrt(var) * 100.0  # %/√s
+
+def oracle_safety_ok(pts, oracle_delta_pct, remaining, now):
+    """#1 — Marge de sécurité dépendante du temps restant. La résolution = oracle_close vs oracle_open;
+    pour que le pari tienne, le delta doit dépasser une fraction du mouvement résiduel attendu
+    (σ·√t_restant). Renvoie (ok, expected_move_pct). ok=True si la vol n'est pas estimable."""
+    if ORACLE_SAFETY_K <= 0:
+        return True, 0.0
+    sig = oracle_vol_pct(pts, now)
+    if sig is None:
+        return True, 0.0
+    expected = sig * math.sqrt(max(1.0, remaining))
+    return (abs(oracle_delta_pct) >= ORACLE_SAFETY_K * expected), expected
+
+def gap_persistent(pts, oracle_price, gap_dir, now, lookback=GAP_PERSIST_LOOKBACK):
+    """#3 — Anti-spike: le spot doit être resté du bon côté de l'oracle sur `lookback`s (≥ fraction min),
+    pas un pic isolé d'1 tick qui mean-revert et referme le gap dans le mauvais sens. True si données
+    insuffisantes (ne bloque pas)."""
+    if not gap_dir or oracle_price <= 0:
+        return True
+    rows = [p for t, p in pts if now - t <= lookback and p > 0]
+    if len(rows) < 4:
+        return True
+    good = sum(1 for p in rows if (p > oracle_price if gap_dir == "UP" else p < oracle_price))
+    return good / len(rows) >= GAP_PERSIST_MIN_FRAC
+
+def oracle_bucket(asset, signal, delta_pct, votes):
+    """#2 — Clé de bucket pour la calibration empirique de p_oracle (granularité volontairement grossière
+    pour accumuler assez d'observations): asset / type de signal / magnitude delta / tranche de votes."""
+    ad = abs(delta_pct)
+    dmag = "d0" if ad < 0.01 else ("d1" if ad < 0.03 else ("d2" if ad < 0.06 else "d3"))
+    vb = "v2" if votes < 3 else ("v3" if votes < 4 else "v4")
+    return f"{asset}|{signal}|{dmag}|{vb}"
+
+def oracle_calibrated_p(prior_p, bucket):
+    """#2 — Mélange l'a priori (formule) au win-rate empirique du bucket via shrinkage bayésien:
+    p = (prior·K + wins) / (K + n). Tant que n < ORACLE_CALIB_MIN_N on garde l'a priori tel quel."""
+    rec = st.oracle_calib.get(bucket)
+    if not rec:
+        return prior_p
+    wins, n = rec[0], rec[1]
+    if n < ORACLE_CALIB_MIN_N:
+        return prior_p
+    blended = (prior_p * ORACLE_CALIB_PRIOR_K + wins) / (ORACLE_CALIB_PRIOR_K + n)
+    return max(0.05, min(0.97, blended))
+
+def oracle_calib_update(bucket, won):
+    """#2 — Met à jour le compteur empirique [wins, total] du bucket à la résolution d'un trade oracle."""
+    if not bucket:
+        return
+    rec = st.oracle_calib.get(bucket, [0, 0])
+    rec[0] += 1 if won else 0
+    rec[1] += 1
+    st.oracle_calib[bucket] = rec
 
 def compute_vol_vote(volumes, direction, now):
     """✅ Vote volume (job_oracle_lag, toutes cryptos) — confirme la direction si spike de volume
@@ -1824,6 +1919,10 @@ class State:
         self.ws_volumes=deque(maxlen=300)
         self.ws_price=0.0
         self.gap_history=deque(maxlen=60)  # ✅ v11.1 — (ts, gap%) historique du gap spot↔oracle
+        # ✅ (21/06) FIABILISATION oracle_lag: calibration empirique p_oracle (#2) + retard de capture
+        # de l'open de slot par crypto (#4, intégrité de la source de résolution Chainlink).
+        self.oracle_calib={}      # bucket → [wins, total]
+        self.oracle_open_lag={}   # asset → secondes entre la frontière du slot et la capture de l'open
         self.ws_connected=False
         self.ws_task=None
         self.slot_open_price=0.0
@@ -1944,6 +2043,7 @@ class State:
             "running":self.running,  # ✅ (21/06) persisté pour auto-reprise après redeploy
             "version":BOT_VERSION,"saved_at":int(time.time()),
             "oracle_patterns":self.oracle_patterns[-200:],
+            "oracle_calib":self.oracle_calib,  # ✅ (21/06) calibration empirique p_oracle (#2)
             "calibration_log":self.calibration_log[-20:],
             "haiku_insights":self.haiku_insights[-20:],
             "filter_ret3s":FILTER_RET3S,
@@ -1978,6 +2078,7 @@ class State:
                     self.paper_mode=d.get("paper_mode",PAPER_MODE)
                     self.skipped=d.get("skipped",0); self.pass_reasons=d.get("pass_reasons",[])
                     self.oracle_patterns=d.get("oracle_patterns",[])
+                    self.oracle_calib=d.get("oracle_calib",{})  # ✅ (21/06) calibration empirique (#2)
                     self.calibration_log=d.get("calibration_log",[])
                     self.haiku_insights=d.get("haiku_insights",[])
                     # ✅ Restaurer les seuils auto-calibrés
@@ -2234,6 +2335,7 @@ async def _resolve_expired_bet(context, asset="BTC"):
         if remaining > -600: return
         won = False
     log.info(f"Slot résolu {bet_asset} {bet['dir']} → {'WIN' if won else 'LOSS'} (recorder={'oui' if rec else 'non'})")
+    oracle_calib_update(bet.get("calib_bucket"), won)  # ✅ (21/06) #2 — alimente la calibration empirique p_oracle
     # Montant déterministe depuis les shares (position pleine, plus de vente anticipée)
     shares = getattr(st, f"shares_bought{sfx}") or 0; entry = entry_token_price or 0
     cost = round(shares*entry, 2) if entry>0 else bet.get("amount",0)
@@ -2786,6 +2888,7 @@ async def ws_oracle_loop():
                                         _record_slot("BTC", st.oracle_slot_ts, st.oracle_slot_open, prev_close, st.ws_prices)
                                         log.info(f"📝 SLOT REC BTC: open={st.oracle_slot_open:.2f} close={prev_close:.2f} → total={len(st.slot_records)}")
                                     st.oracle_slot_ts=slot_start; st.oracle_slot_open=p
+                                    st.oracle_open_lag["BTC"]=round(now-slot_start,1)  # #4 retard de capture de l'open
                                     log.info(f"📌 BTC slot open: ${p:,.2f}")
                                 st.oracle_price=p; st.oracle_ts=now
                             elif symbol == "eth/usd" and p>100:
@@ -2794,6 +2897,7 @@ async def ws_oracle_loop():
                                     if st.eth_oracle_slot_ts>0 and st.eth_oracle_slot_open>0 and prev_close>0:
                                         _record_slot("ETH", st.eth_oracle_slot_ts, st.eth_oracle_slot_open, prev_close, st.eth_ws_prices)
                                     st.eth_oracle_slot_ts=slot_start; st.eth_oracle_slot_open=p
+                                    st.oracle_open_lag["ETH"]=round(now-slot_start,1)  # #4
                                 st.eth_oracle_price=p; st.eth_oracle_ts=now
                             elif symbol == "sol/usd" and p>1:
                                 if st.sol_oracle_slot_ts!=slot_start:
@@ -2801,6 +2905,7 @@ async def ws_oracle_loop():
                                     if st.sol_oracle_slot_ts>0 and st.sol_oracle_slot_open>0 and prev_close>0:
                                         _record_slot("SOL", st.sol_oracle_slot_ts, st.sol_oracle_slot_open, prev_close, st.sol_ws_prices)
                                     st.sol_oracle_slot_ts=slot_start; st.sol_oracle_slot_open=p
+                                    st.oracle_open_lag["SOL"]=round(now-slot_start,1)  # #4
                                 st.sol_oracle_price=p; st.sol_oracle_ts=now
                             elif symbol == "xrp/usd" and p>0.01:
                                 if st.xrp_oracle_slot_ts!=slot_start:
@@ -2808,6 +2913,7 @@ async def ws_oracle_loop():
                                     if st.xrp_oracle_slot_ts>0 and st.xrp_oracle_slot_open>0 and prev_close>0:
                                         _record_slot("XRP", st.xrp_oracle_slot_ts, st.xrp_oracle_slot_open, prev_close, st.xrp_ws_prices)
                                     st.xrp_oracle_slot_ts=slot_start; st.xrp_oracle_slot_open=p
+                                    st.oracle_open_lag["XRP"]=round(now-slot_start,1)  # #4
                                 st.xrp_oracle_price=p; st.xrp_oracle_ts=now
                         elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                             break
@@ -4024,6 +4130,13 @@ async def job_oracle_lag(context):
         log_skip(f"BTC: WS non dispo (T-{int(slot_remaining)}s)", None); return
     if now - st.oracle_ts > 15:
         log_skip(f"BTC: tick périmé {int(now-st.oracle_ts)}s (T-{int(slot_remaining)}s)", None); return
+    # ✅ (21/06) #4 — Intégrité source de résolution: le marché résout sur le PRIX CHAINLINK (open vs close).
+    # Si le dernier tick Chainlink est trop vieux, st.oracle_price ne reflète plus le feed de résolution
+    # → le delta est non fiable. On s'abstient plutôt que de parier sur une donnée périmée.
+    cl_age = now - st.oracle_chainlink_ts if st.oracle_chainlink_ts > 0 else 999
+    if cl_age > CHAINLINK_MAX_AGE:
+        log_skip(f"BTC: Chainlink périmé {int(cl_age)}s (>{CHAINLINK_MAX_AGE}s) — source de résolution non fiable", None,
+                 features={"filter":"chainlink_stale","asset":"BTC"}); return
     # ✅ v12.9 — verrou GLOBAL anti sur-exposition: 1 seul trade par slot toutes stratégies confondues
     # (nécessaire car l'oracle lag T-150→T-30 chevauche désormais momentum/meanrev/confluence T-150→T-60)
     if cur_slot in (st.last_trade_slot, getattr(st,"momentum_last_slot",0), getattr(st,"meanrev_last_slot",0), getattr(st,"tds_last_slot",0)):
@@ -4086,6 +4199,24 @@ async def job_oracle_lag(context):
         log_skip(f"BTC: delta {oracle_delta:+.3f}%>0 (→ skip: contre DOWN)", direction,
                  features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":0,"filter":"delta_contra","asset":"BTC"}); return
 
+    # ✅ (21/06) #4 — Open de slot capturé en retard (Chainlink n'a pas tické pile à la frontière) → l'open
+    # de référence peut différer de celui de Polymarket: sur un delta marginal, le SENS est non fiable.
+    open_lag = st.oracle_open_lag.get("BTC", 0)
+    if open_lag > ORACLE_OPEN_LAG_MAX and abs(oracle_delta) < ORACLE_OPEN_LAG_DELTA:
+        log_skip(f"BTC: open capturé tard ({open_lag:.0f}s) + delta marginal {oracle_delta:+.3f}% → sens non fiable", direction,
+                 features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":0,"filter":"open_lag","asset":"BTC"}); return
+    # ✅ (21/06) #1 — Marge de sécurité dépendante du temps: le delta oracle doit dominer le mouvement
+    # résiduel attendu (σ·√t_restant), sinon l'oracle peut s'inverser avant la clôture. Strict tôt, souple tard.
+    safe_ok, exp_move = oracle_safety_ok(pts, oracle_delta, slot_remaining, now)
+    if not safe_ok:
+        log_skip(f"BTC: marge insuffisante delta {oracle_delta:+.3f}% < {ORACLE_SAFETY_K:.2f}×{exp_move:.3f}% attendu (T-{int(slot_remaining)}s)", direction,
+                 features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":0,"filter":"safety_margin","exp_move":round(exp_move,4),"asset":"BTC"}); return
+    # ✅ (21/06) #3 — Persistance du gap (signal gap uniquement): un pic isolé qui mean-revert referme le
+    # gap dans le mauvais sens. On exige que le spot soit resté du bon côté de l'oracle sur ~5s.
+    if primary_signal == "gap" and not gap_persistent(pts, st.oracle_price, gap_dir, now):
+        log_skip(f"BTC: gap non persistant (spike) {spot_oracle_gap:+.3f}% — anti mean-revert", direction,
+                 features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":0,"filter":"gap_spike","asset":"BTC"}); return
+
     # TA score
     price_hist = [{"price":p,"ts":t} for t,p in pts]
     ta_score, ta_dir, ta_details = compute_ta_score(price_hist, "BTC")
@@ -4145,6 +4276,13 @@ async def job_oracle_lag(context):
     if token_price < ORACLE_TOKEN_MIN:
         log_skip(f"BTC: token {token_price:.2f}$<{ORACLE_TOKEN_MIN}$ (→ skip: trop incertain)", direction,
                  features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"dual":dual_dir,"filter":"tokenmin","token":token_price,"asset":"BTC"}); return
+    # ✅ (21/06) #5 — Filtre spread du carnet: un book large → l'entrée réelle (frais inclus) érode l'EV
+    # affichée. On skip si le spread frais dépasse le seuil (carnet périmé >10s → filtre ignoré, pas de blocage).
+    if time.time() - getattr(st, "ob_ts", 0) < 10:
+        cur_spread = getattr(st, "ob_spread", 0) or 0
+        if cur_spread > ORACLE_MAX_SPREAD:
+            log_skip(f"BTC: spread carnet {cur_spread*100:.1f}¢>{ORACLE_MAX_SPREAD*100:.0f}¢ (→ skip: entrée érode l'EV)", direction,
+                     features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"dual":dual_dir,"filter":"wide_spread","spread":cur_spread,"asset":"BTC"}); return
 
     fee = taker_fee_per_share(token_price)
     p_oracle = min(0.93, 0.85 + abs(spot_oracle_gap)*3.0) if primary_signal=="gap" else min(0.90, 0.80 + abs(oracle_delta)*2.0)
@@ -4158,6 +4296,10 @@ async def job_oracle_lag(context):
         micro_ok = (direction=="UP" and micro_sig > 0) or (direction=="DOWN" and micro_sig < 0)
         ofi_ok   = (direction=="UP" and ofi > 0) or (direction=="DOWN" and ofi < 0)
         if micro_ok and ofi_ok: p_oracle = min(0.97, p_oracle + 0.02)
+    # ✅ (21/06) #2 — Calibration empirique: remplace/ajuste p_oracle par le win-rate RÉEL observé pour ce
+    # bucket (asset/signal/|delta|/votes), mélangé à la formule via shrinkage. Corrige les EV mal estimées.
+    calib_bucket = oracle_bucket("BTC", primary_signal, oracle_delta, votes_for_direction)
+    p_oracle = oracle_calibrated_p(p_oracle, calib_bucket)
     ev = p_oracle - token_price - fee
 
     # ✅ v12.9 FIX: vérifie le consensus POUR la direction parié, pas le score brut haussier
@@ -4188,6 +4330,7 @@ async def job_oracle_lag(context):
     # via asset_trade_slot["BTC"]; ETH/SOL/XRP ont leurs propres slots → les 4 cryptos en parallèle.
     ok = await place_bet(context, direction, amount, round(p_oracle,2), reasoning, conf_score, sess, tpu, tpd, market_end, source="snipe", asset="BTC", market=market)
     if not ok: return
+    if st.bet: st.bet["calib_bucket"] = calib_bucket  # ✅ #2 — mémorise le bucket pour MAJ à la résolution
 
     st.last_trade_slot = cur_slot
     mode = "💰 RÉEL" if not st.paper_mode else "📄 paper"
@@ -4234,6 +4377,11 @@ async def job_oracle_lag_asset(context, asset:str):
         log_skip(f"{symbol}: prix spot périmé {int(now-spot_ts)}s", None); return
     if now-oracle_ts>15:
         log_skip(f"{symbol}: oracle périmé {int(now-oracle_ts)}s", None); return
+    # ✅ (21/06) #4 — fraîcheur Chainlink (source de résolution open vs close). cl_ts partagé (tous symboles).
+    cl_age = now - st.oracle_chainlink_ts if st.oracle_chainlink_ts > 0 else 999
+    if cl_age > CHAINLINK_MAX_AGE:
+        log_skip(f"{symbol}: Chainlink périmé {int(cl_age)}s (>{CHAINLINK_MAX_AGE}s) — résolution non fiable", None,
+                 features={"filter":"chainlink_stale"}); return
     if last_ts==cur_slot: return
     # ✅ demande user 21/06: même verrou anti sur-exposition multi-stratégies que BTC (avant: oracle_lag
     # ETH/SOL/XRP ne vérifiait que son propre dernier slot, pas momentum/meanrev/confluence du même actif).
@@ -4292,6 +4440,20 @@ async def job_oracle_lag_asset(context, asset:str):
     if direction=="DOWN" and oracle_delta>0.005 and not ret3s_override:
         log_skip(f"{symbol}: delta {oracle_delta:+.3f}%>0 (→ skip: contre DOWN)",direction,
                  features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":0,"filter":"delta_contra"}); return
+    # ✅ (21/06) #4 — open de slot capturé tard + delta marginal → sens non fiable
+    open_lag = st.oracle_open_lag.get(asset, 0)
+    if open_lag > ORACLE_OPEN_LAG_MAX and abs(oracle_delta) < ORACLE_OPEN_LAG_DELTA:
+        log_skip(f"{symbol}: open capturé tard ({open_lag:.0f}s) + delta marginal {oracle_delta:+.3f}% → sens non fiable",direction,
+                 features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":0,"filter":"open_lag"}); return
+    # ✅ (21/06) #1 — marge de sécurité dépendante du temps restant (delta vs σ·√t_restant)
+    safe_ok, exp_move = oracle_safety_ok(pts, oracle_delta, slot_remaining, now)
+    if not safe_ok:
+        log_skip(f"{symbol}: marge insuffisante delta {oracle_delta:+.3f}% < {ORACLE_SAFETY_K:.2f}×{exp_move:.3f}% attendu (T-{int(slot_remaining)}s)",direction,
+                 features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":0,"filter":"safety_margin","exp_move":round(exp_move,4)}); return
+    # ✅ (21/06) #3 — persistance du gap (anti-spike), signal gap uniquement
+    if primary_signal=="gap" and not gap_persistent(pts, oracle, gap_dir, now):
+        log_skip(f"{symbol}: gap non persistant (spike) {spot_oracle_gap:+.3f}% — anti mean-revert",direction,
+                 features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":0,"filter":"gap_spike"}); return
     price_hist=[{"price":p,"ts":t} for t,p in pts]
     ta_score,ta_dir,ta_details=compute_ta_score(price_hist,asset)
     ta_vote=1 if ta_dir=="UP" else (-1 if ta_dir=="DOWN" else 0)
@@ -4370,17 +4532,27 @@ async def job_oracle_lag_asset(context, asset:str):
     if token_price<ORACLE_TOKEN_MIN:
         log_skip(f"{symbol}: token {token_price:.2f}$<{ORACLE_TOKEN_MIN}$ (incertain)",direction,
                  features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"dual":dual_dir,"filter":"tokenmin","token":token_price}); return
+    _pfx = asset.lower()
+    # ✅ (21/06) #5 — filtre spread du carnet (érosion EV à l'entrée). XRP n'a pas de WS carnet → spread=0
+    # (filtre naturellement ignoré). Carnet périmé >10s → ignoré aussi (pas de blocage).
+    ob_ts_asset = getattr(st, f"{_pfx}_ob_ts", 0)
+    if time.time() - ob_ts_asset < 10:
+        cur_spread = getattr(st, f"{_pfx}_ob_spread", 0) or 0
+        if cur_spread > ORACLE_MAX_SPREAD:
+            log_skip(f"{symbol}: spread carnet {cur_spread*100:.1f}¢>{ORACLE_MAX_SPREAD*100:.0f}¢ (→ skip: entrée érode l'EV)",direction,
+                     features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"dual":dual_dir,"filter":"wide_spread","spread":cur_spread}); return
     fee=taker_fee_per_share(token_price)
     p_oracle=min(0.93,0.85+abs(spot_oracle_gap)*3.0) if primary_signal=="gap" else min(0.90,0.80+abs(oracle_delta)*2.0)
     if votes_for_direction>=3: p_oracle=min(0.95,p_oracle+0.03)
     # ✅ #5 — Microprice + OFI par asset en confirmation (ETH/SOL calculés par ws_clob_loop_asset; XRP=0)
-    _pfx = asset.lower()
     micro_sig = getattr(st, f"{_pfx}_ob_micro_signal", 0.0); ofi = getattr(st, f"{_pfx}_ob_ofi", 0.0)
-    ob_ts_asset = getattr(st, f"{_pfx}_ob_ts", 0)
     if time.time() - ob_ts_asset < 10:
         micro_ok = (direction=="UP" and micro_sig > 0) or (direction=="DOWN" and micro_sig < 0)
         ofi_ok   = (direction=="UP" and ofi > 0) or (direction=="DOWN" and ofi < 0)
         if micro_ok and ofi_ok: p_oracle = min(0.96, p_oracle + 0.02)
+    # ✅ (21/06) #2 — calibration empirique p_oracle (win-rate réel du bucket, shrinkage vers la formule)
+    calib_bucket = oracle_bucket(asset, primary_signal, oracle_delta, votes_for_direction)
+    p_oracle = oracle_calibrated_p(p_oracle, calib_bucket)
     ev=p_oracle-token_price-fee
     # ✅ v12.9 FIX: consensus POUR la direction parié (était dir_votes brut, cassé pour DOWN)
     if votes_for_direction < 2:
@@ -4401,6 +4573,8 @@ async def job_oracle_lag_asset(context, asset:str):
     st.current_market=market  # ✅ place_bet route l'ordre réel via st.current_market — doit pointer le marché de l'asset
     ok=await place_bet(context,direction,amount,round(p_oracle,2),reasoning,conf_score,sess,tpu,tpd,market_end,source="snipe",asset=asset,market=market)
     if not ok: return
+    _b = getattr(st, f"bet{_possfx(asset)}")
+    if _b: _b["calib_bucket"] = calib_bucket  # ✅ #2 — mémorise le bucket pour MAJ à la résolution
     if asset=="ETH": st.eth_last_trade_slot=cur_slot
     elif asset=="SOL": st.sol_last_trade_slot=cur_slot
     elif asset=="XRP": st.xrp_last_trade_slot=cur_slot
