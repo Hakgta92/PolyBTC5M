@@ -123,6 +123,7 @@ MAKER_UNDERCUT      = 0.02   # ✅ v10.25 — 2¢ sous le prix (meilleure chance
 # ✅ #1 — Exécution fill-aware: on confirme le fill RÉEL au lieu de supposer l'ordre rempli
 FILL_WAIT_S         = 3.0    # grâce laissée au maker GTC pour être rempli avant annulation
 FILL_TAKER_WAIT_S   = 1.5    # délai de vérif du fill après bascule taker (croise le spread)
+MAKER_RETRY_WINDOW_S = 10.0  # ✅ (21/06) demande user: réessaie le maker (re-prix) ~10s avant taker
 # Calibration sigma (auto-correction de VOL_SAFETY après N trades)
 CALIB_MIN_TRADES    = 30     # Trades mini avant d'auto-calibrer
 # Kill-switch drawdown
@@ -3401,57 +3402,79 @@ async def place_bet(context, direction, amount, conf, reasoning, conf_score, ses
                 log_skip(f"SNIPE: prix token bougé ({entry_tp:.2f}$)", direction); st.asset_trade_slot[asset] = 0; return False
             # ✅ #1 — Baseline du solde AVANT l'ordre, pour confirmer un fill réel (vs supposer rempli)
             bal0 = await poly.get_position_size(token_used)
-            order_id=await poly.place_order(token_used, first_amount, entry_tp, "BUY")  # ✅ maker GTC uniquement
-            maker_placed = order_id is not None
+            # ✅ (21/06) baseline CASH (USDC) AVANT l'ordre → permet de mesurer le COÛT RÉEL exécuté
+            # (parts × prix de fill + FRAIS taker), donc d'afficher exactement la mise/prix Polymarket
+            # au lieu d'une estimation (prix marché × parts) qui ignore le spread maker et les frais.
+            usdc0 = await fetch_clob_balance()
             fill_type = "assumed"  # v1/non vérifiable: on suppose rempli (ancien comportement)
             real_shares = None     # shares RÉELLEMENT reçues (mesurées via le solde), pas supposées
-            filled = True          # défaut: si le solde n'est pas vérifiable (bal0=None) on suppose rempli
-            if not maker_placed:
-                # Maker GTC rejeté → place_order ne fait plus de FAK interne. UN SEUL taker ici
-                # (le maker n'est pas sur le book → aucun risque de double fill).
-                log.info(f"{asset}: maker rejeté, taker direct")
-                order_id = await poly.place_market_order(token_used, first_amount, "BUY")
-                if not order_id:
-                    await send(context.bot,"⚠️ *Ordre Polymarket refusé — réessai prochain slot*"); st.asset_trade_slot[asset] = 0; return False
-                if bal0 is not None:
-                    bal2 = await poly.get_position_size_polled(token_used, bal0, tries=4, delay=0.8)
-                    filled = (bal2 is not None and bal2 > bal0)
-                    fill_type = "taker" if filled else "none"
-                    if filled: real_shares = round(bal2 - bal0, 4)
+            real_cost = None       # coût RÉEL en $ (débit cash) FRAIS INCLUS, mesuré via usdc0-usdc1
+            filled = False
+            order_id = None
+            taker_blocked = False  # True si annulation maker incertaine → on s'interdit le taker (anti-doublon)
+
+            if bal0 is None:
+                # Solde non vérifiable (client v1) → ancien comportement: 1 maker supposé rempli, sinon taker.
+                order_id = await poly.place_order(token_used, first_amount, entry_tp, "BUY")
+                if order_id:
+                    filled = True; fill_type = "assumed"
                 else:
-                    fill_type = "taker"  # non vérifiable → filled reste True
-            elif bal0 is not None:
-                # ✅ Vérification du fill (le GTC maker à -2¢ peut rester POSÉ sans être exécuté).
-                await asyncio.sleep(FILL_WAIT_S)
-                cancel_info = await poly.cancel_order(order_id)
-                # ✅ ANTI-DOUBLON (20/06): le solde CLOB est EN RETARD → on POLL avec retry au lieu d'1 seule
-                # lecture, sinon un maker déjà rempli passe pour "non rempli" et on place un taker EN DOUBLE.
-                bal1 = await poly.get_position_size_polled(token_used, bal0)
-                maker_filled = (bal1 is not None and bal1 > bal0)
-                # maker non annulable (déjà matché / erreur) → probablement rempli → JAMAIS de taker.
-                cancel_uncertain = (not cancel_info.get("ok")) or cancel_info.get("already_filled")
-                filled = maker_filled
-                fill_type = "maker" if maker_filled else "none"
-                if maker_filled: real_shares = round(bal1 - bal0, 4)
-                # ✅ (21/06) ANTI-DOUBLE-FILL autoritatif: le solde lag de 1-3s, donc on demande À L'API
-                # combien de parts le maker a déjà matché. Si >0 → maker considéré REMPLI, on ne croise
-                # JAMAIS en taker (cas vu: 9 parts maker + 1 part taker sur ETH/XRP = 2 ordres/slot).
-                # Best-effort: None si la lib ne le supporte pas → comportement inchangé.
-                if not maker_filled:
+                    log.info(f"{asset}: maker rejeté, taker direct (solde non vérifiable)")
+                    order_id = await poly.place_market_order(token_used, first_amount, "BUY")
+                    if not order_id:
+                        await send(context.bot,"⚠️ *Ordre Polymarket refusé — réessai prochain slot*"); st.asset_trade_slot[asset] = 0; return False
+                    filled = True; fill_type = "taker"
+            else:
+                # ✅ (21/06) demande user: on RÉESSAIE le maker (re-prix frais à chaque tentative) pendant
+                # ~MAKER_RETRY_WINDOW_S secondes avant de basculer en taker. Chaque tentative: pose GTC,
+                # attend FILL_WAIT_S, vérifie le fill; si non rempli ET annulation propre → reboucle.
+                maker_deadline = time.time() + MAKER_RETRY_WINDOW_S
+                attempt = 0
+                while time.time() < maker_deadline and not filled:
+                    attempt += 1
+                    fresh = await poly.get_token_price(token_used)
+                    ref_px = fresh if fresh > 0 else entry_tp
+                    mid = await poly.place_order(token_used, first_amount, ref_px, "BUY")  # maker GTC
+                    if not mid:
+                        log.info(f"{asset}: maker rejeté (essai {attempt}) — bascule taker")
+                        break  # maker pas sur le book → taker safe plus bas
+                    order_id = mid
+                    await asyncio.sleep(FILL_WAIT_S)
+                    # Rempli pendant l'attente ? (solde CLOB en retard → poll avec retry)
+                    bal1 = await poly.get_position_size_polled(token_used, bal0)
+                    if bal1 is not None and bal1 > bal0:
+                        filled = True; fill_type = "maker"; real_shares = round(bal1 - bal0, 4); break
+                    # Pas (encore) vu rempli → on annule pour réessayer un meilleur prix
+                    cancel_info = await poly.cancel_order(order_id)
+                    cancel_uncertain = (not cancel_info.get("ok")) or cancel_info.get("already_filled")
+                    # ✅ ANTI-DOUBLE-FILL autoritatif: demande à l'API combien de parts le maker a déjà matché.
                     matched = await poly.get_order_matched(order_id)
                     if matched and matched > 0:
-                        maker_filled = True; filled = True; fill_type = "maker"
-                        real_shares = round(bal1 - bal0, 4) if (bal1 is not None and bal1 > bal0) else round(matched, 4)
-                        log.info(f"{asset}: maker matché {matched} parts (API autoritative) — taker bloqué (anti-doublon)")
-                if not maker_filled and not cancel_uncertain:
-                    # Maker annulé d'après l'API. 2e vérif solde PLUS LONGUE avant de croiser en taker:
-                    # un fill maker tardif peut ne pas être visible (lag) → évite un taker par-dessus
-                    # un maker en réalité rempli (= 2 fills même slot).
-                    bal_confirm = await poly.get_position_size_polled(token_used, bal0, tries=4, delay=0.8)
-                    if bal_confirm is not None and bal_confirm > bal0:
-                        filled = True; fill_type = "maker"; real_shares = round(bal_confirm - bal0, 4)
+                        filled = True; fill_type = "maker"
+                        bconf = await poly.get_position_size_polled(token_used, bal0, tries=4, delay=0.8)
+                        real_shares = round(bconf - bal0, 4) if (bconf is not None and bconf > bal0) else round(matched, 4)
+                        log.info(f"{asset}: maker matché {matched} parts (API) — taker bloqué (anti-doublon)")
+                        break
+                    if cancel_uncertain:
+                        # Annulation incertaine → maker peut-être rempli (lag). On NE reposte PAS et on
+                        # s'interdit le taker. Vérif solde élargie.
+                        bconf = await poly.get_position_size_polled(token_used, bal0, tries=4, delay=0.8)
+                        if bconf is not None and bconf > bal0:
+                            filled = True; fill_type = "maker"; real_shares = round(bconf - bal0, 4)
+                        else:
+                            taker_blocked = True
+                            log.warning(f"{asset}: maker non annulable, fill non confirmé — pas de taker (anti-doublon)")
+                        break
+                    # Annulation propre + non rempli → on reboucle (re-post maker à prix frais) si fenêtre restante
+                    log.info(f"{asset}: maker non rempli (essai {attempt}), reprise…")
+                # ✅ Repli TAKER: maker épuisé sans fill ET annulation toujours propre (pas de risque doublon)
+                if not filled and not taker_blocked:
+                    # Dernière vérif solde avant de croiser (faux no-fill possible: fill maker tardif)
+                    bconf = await poly.get_position_size_polled(token_used, bal0, tries=4, delay=0.8)
+                    if bconf is not None and bconf > bal0:
+                        filled = True; fill_type = "maker"; real_shares = round(bconf - bal0, 4)
                     else:
-                        log.info(f"{asset}: maker confirmé non rempli, bascule taker")
+                        log.info(f"{asset}: maker non rempli après ~{MAKER_RETRY_WINDOW_S:.0f}s → taker")
                         order_id = await poly.place_market_order(token_used, first_amount, "BUY")
                         if order_id:
                             bal2 = await poly.get_position_size_polled(token_used, bal0, tries=4, delay=0.8)
@@ -3460,15 +3483,14 @@ async def place_bet(context, direction, amount, conf, reasoning, conf_score, ses
                             if filled: real_shares = round(bal2 - bal0, 4)
                         else:
                             filled = False
-                elif not maker_filled and cancel_uncertain:
-                    # Annulation incertaine → maker peut-être rempli (lag). PAS de taker. Vérif élargie.
-                    bal1b = await poly.get_position_size_polled(token_used, bal0, tries=4, delay=0.8)
-                    if bal1b is not None and bal1b > bal0:
-                        filled = True; fill_type = "maker"; real_shares = round(bal1b - bal0, 4)
-                    else:
-                        filled = False
-                        log.warning(f"{asset}: maker non annulable et fill non confirmé — pas de taker (anti-doublon)")
-            # else: maker placé mais solde non vérifiable (bal0=None) → fill_type assumed, filled=True
+            # ✅ (21/06) COÛT RÉEL frais inclus = débit cash USDC pendant l'ordre (usdc0 - usdc1).
+            if filled and real_shares and real_shares > 0:
+                usdc1 = await fetch_clob_balance()
+                if usdc0 is not None and usdc1 is not None and usdc0 > usdc1:
+                    rc = round(usdc0 - usdc1, 2)
+                    per = rc / real_shares
+                    if 0 < per <= 1.05:  # prix/part plausible (≤1$ + petite marge frais) → fiable
+                        real_cost = rc
             # ✅ Gestion UNIQUE du no-fill pour TOUS les chemins réels (maker rejeté, maker GTC, etc.)
             if not filled:
                 st.exec_stats["nofill"] = st.exec_stats.get("nofill",0) + 1
@@ -3483,17 +3505,30 @@ async def place_bet(context, direction, amount, conf, reasoning, conf_score, ses
             # ✅ (21/06) prix d'entrée = prix marché réel (entry_tp). Le budget Kelly ($) peut différer
             # du coût réel à cause du minimum Polymarket de 5 PARTS → coût réel = parts × prix (et non le
             # budget Kelly). La mise affichée/enregistrée = parts × prix.
+            cost_measured = False
             if real_shares and real_shares > 0:
                 shares_bought_final = real_shares
-                entry_token_price_final = entry_tp if entry_tp>0 else round(first_amount/real_shares, 4)
+                if real_cost is not None:
+                    # ✅ (21/06) mise + prix RÉELS mesurés via le débit cash USDC = exactement ce que
+                    # Polymarket a prélevé (fill + frais inclus) → l'affichage Telegram colle au réel.
+                    entry_token_price_final = round(real_cost / real_shares, 4)
+                    first_amount = real_cost
+                    cost_measured = True
+                else:
+                    entry_token_price_final = entry_tp if entry_tp>0 else round(first_amount/real_shares, 4)
+                    first_amount = round(shares_bought_final * entry_token_price_final, 2)
             else:
                 entry_token_price_final = entry_tp
                 shares_bought_final = float(max(1, round(first_amount/entry_tp))) if entry_tp>0 else 0
+                first_amount = round(shares_bought_final * entry_token_price_final, 2)
             setattr(st, f"entry_token_price{sfx}", entry_token_price_final)
             setattr(st, f"shares_bought{sfx}", shares_bought_final)
-            first_amount = round(shares_bought_final * entry_token_price_final, 2)  # mise RÉELLE (parts × prix)
-            # frais estimés: ~0 en maker (rebate), taker_fee_per_share sinon — basé sur le prix réel
-            fee_est = 0.0 if fill_type=="maker" else round(taker_fee_per_share(entry_token_price_final) * shares_bought_final, 3)
+            # frais: si coût mesuré → déjà inclus dans first_amount (part frais ≈ coût - parts×prix_marché,
+            # informatif). Sinon estimation: ~0 en maker (rebate), taker_fee_per_share sinon.
+            if cost_measured:
+                fee_est = round(max(0.0, first_amount - shares_bought_final * entry_tp), 3) if entry_tp>0 else 0.0
+            else:
+                fee_est = 0.0 if fill_type=="maker" else round(taker_fee_per_share(entry_token_price_final) * shares_bought_final, 3)
             if asset=="BTC": st.token_price_peak=1.0; st.trailing_active=False
             setattr(st, f"bet_expiry{sfx}", market_end if market_end>0 else (int(time.time()//300)*300+300))
         else:
