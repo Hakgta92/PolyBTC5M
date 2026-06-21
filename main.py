@@ -2223,21 +2223,16 @@ async def _resolve_expired_bet(context, asset="BTC"):
     # BR: solde réel si le payout a été crédité ET cohérent — UNIQUEMENT si AUCUNE autre position
     # n'est ouverte en parallèle (sinon le solde reflète plusieurs cryptos et on mal-attribuerait le
     # gain). Avec jusqu'à 4 positions simultanées (1/crypto), on retombe sur l'estimation par shares.
-    others_open = any(getattr(st, f"bet{_possfx(a)}") for a in ASSETS if a != asset)
-    clob_bal = None if others_open else await fetch_clob_balance()
-    # ✅ (21/06) GARDE-FOU anti-BR-aberrant: le gain d'UN trade binaire est borné par le payout max de
-    # la position (≈ shares × 1$). Si le solde CLOB lu implique un saut absurde (lecture corrompue:
-    # allowance/unités/glitch API — vu en prod: BR passé à 6.3M$), on l'IGNORE et on retombe sur est_gross.
-    max_plausible = (shares or 0) + (cost or 0) + 5.0  # payout max + mise + marge
-    if clob_bal is not None and abs(clob_bal - st.bankroll) > max_plausible:
-        log.warning(f"clob_bal aberrant ({clob_bal:.2f}$ vs BR {st.bankroll:.2f}$, max plausible {max_plausible:.2f}$) — IGNORÉ, est_gross={est_gross:.2f}$")
-        clob_bal = None
-    if (clob_bal and clob_bal > 0 and abs(clob_bal - st.bankroll) >= 0.01
-            and not (won and clob_bal < st.bankroll) and not ((not won) and clob_bal > st.bankroll)):
-        gross = round(clob_bal - st.bankroll, 2); st.bankroll = clob_bal
-    else:
-        gross = est_gross; st.bankroll = max(0.0, round(st.bankroll + est_gross, 2))
+    # ✅ (21/06) demande user: à la résolution, BR = SOLDE POLYMARKET RÉEL récupéré MAINTENANT (pas une
+    # estimation locale qui dérivait — vu: message BR 36.14$ alors que le solde réel était 47.66$).
+    # gross = PnL déterministe de CE trade (parts × résultat), pour le PnL cumulé/stats uniquement.
+    gross = est_gross
     st.pnl += gross
+    clob_bal = await fetch_clob_balance()  # valeurs aberrantes (>1M$/<0) déjà filtrées → None
+    if clob_bal is not None and clob_bal > 0:
+        st.bankroll = clob_bal  # ← BR réel
+    else:
+        st.bankroll = max(0.0, round(st.bankroll + est_gross, 2))  # repli si lecture indispo
     register_trade_result(won)  # ✅ streaks + conservateur aussi en réel
     result_txt = "WIN" if won else "LOSS"
     if not won and st.consec >= CONSERVATIVE_AFTER_LOSSES:
