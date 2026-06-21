@@ -104,8 +104,8 @@ KELLY_FRACTION  = 0.25
 ENTRY_LAST_SECONDS = 60   # Entrée jusqu'à T-60s (polybacktest: pas trop tard)
 SNIPE_MIN_PROB     = 0.72 # ✅ v10.28 — abaissé (compensé par EV gate plus strict)
 SNIPE_EDGE_MIN     = 0.10 # ✅ v10.28/29 — EV net après vrais frais ≥10% (ex: token 0.65$ → p_dir≥0.77)
-SNIPE_TOKEN_MIN    = 0.55 # ✅ v10.28 — R:R FIX: besoin token<0.70$ pour EV>0 à 70% WR
-SNIPE_TOKEN_MAX    = 0.75 # ✅ v10.28 — Cap: à 0.75$ avec 70% WR → EV +2.7%
+SNIPE_TOKEN_MIN    = 0.41 # ✅ (21/06) aligné sur la fenêtre oracle 0.41→0.70$
+SNIPE_TOKEN_MAX    = 0.70 # ✅ (21/06) aligné sur la fenêtre oracle 0.41→0.70$
 
 # ✅ v10.24 — Stop loss réintroduit
 STOP_LOSS_MULT     = 0.01   # v12.4 désactivé  # Vendre si token tombe sous 45% du prix d'entrée (perte >55%)
@@ -133,8 +133,8 @@ KILL_SWITCH_LOSSES  = 5      # Pertes consécutives → arrêt total (au-delà d
 # L'orderbook Polymarket met 30-55s à suivre → fenêtre d'arb
 # Strategy: si oracle a bougé X% depuis slot open ET token gagnant encore pas cher → BUY
 ORACLE_ENTRY_DELTA  = 0.02  # v12.4  # ✅ v10.31 — baissé 0.05→0.03% (-0.049% bloqué mais ✅ dans passes)
-ORACLE_TOKEN_MAX    = 0.80  # v12.6 — élargi pour accumuler des données  # ✅ v10.32 — breakeven exact @92%WR = token 0.92$ (EV>0 jusqu'à 0.92$)
-ORACLE_TOKEN_MIN    = 0.51  # Token min (trop proche de 0.50$ = incertitude trop haute)
+ORACLE_TOKEN_MAX    = 0.70  # ✅ (21/06) demande user: token 0.41→0.70$ sur TOUTES les cryptos
+ORACLE_TOKEN_MIN    = 0.41  # ✅ (21/06) demande user: min 0.41$
 ORACLE_EDGE_MIN     = 0.15  # v12.4  # EV minimum — 15% (momentum/meanrev/confluence sur tous assets)
 # ✅ v12.9 (18/06) — EV oracle lag ETH/SOL/XRP abaissé 15%→10% (demande user). ⚠️ RISQUE DOCUMENTÉ:
 # les ev-skips ETH/SOL historiques sont 0W/7L (que des pertes dans cette zone). XRP non mesuré.
@@ -150,6 +150,13 @@ OB_SIGNAL_TOKEN_MAX = 0.75
 OB_SIGNAL_WIN_START = 150     # ✅ v12.9 (19/06) — élargi T-90→T-150 (demande user) pour capter plus de signaux OB. Fin reste T-30s
 OB_SIGNAL_WIN_END   = 30
 OB_SIGNAL_EV_MIN     = 0.03  # EV min dédié OB (bas car signal mesuré à 73% = edge réel; un seuil élevé bloquerait tout trade)
+# ✅ (21/06) demande user — Stratégie ob_oracle_disagree (RÉEL, BTC uniquement): trade quand le carnet
+# (OB) et l'oracle DIVERGENT; on suit le carnet (acheteurs→UP, vendeurs→DOWN). Token 0.41-0.75$, mise 2% BR.
+OB_DISAGREE_ENABLED   = True
+OB_DISAGREE_THRESHOLD = 0.15   # |OB imbalance| minimum pour agir
+OB_DISAGREE_TOKEN_MIN = 0.41
+OB_DISAGREE_TOKEN_MAX = 0.75
+OB_DISAGREE_PCT       = 0.02   # 2% du bankroll
 # ✅ v12.9 (18/06) — EV minimum SPÉCIFIQUE BTC oracle lag abaissé à 8% (Sonnet: ev-skips BTC 8W/2L=80%,
 # l'EV semblait sous-estimé par le token élevé au dénominateur). UNIQUEMENT BTC oracle lag — ETH/SOL/XRP
 # restent à 15% car leurs ev-skips sont 0W/7L (baisser = acheter des pertes). Surveillance rapprochée:
@@ -174,7 +181,7 @@ TDS_TOKEN_MAX        = 0.72
 SHADOW_DOWN_ENABLED      = True   # passer à False pour désactiver le shadow logging
 SHADOW_DOWN_GAP_MIN      = 0.005  # gap positif minimum (spot encore au-dessus oracle figé)
 SHADOW_DOWN_DELTA_MIN    = 0.010  # |delta négatif| minimum (oracle descend de façon nette)
-ORACLE_WINDOW_START = 150   # v12.9 — élargi T-45→T-150 (demande user 18/06) pour mesurer la zone large + tracker timing  # Fenêtre: T-150s→T-30s
+ORACLE_WINDOW_START = 125   # ✅ (21/06) demande user: fenêtre T-125s→T-30s
 ORACLE_WINDOW_END   = 30    # v12.9 — élargi T-5→T-30 (demande user 18/06) — fin plus sûre côté exécution (moins de latence)
 # ✅ v10.36 — Filtres WR validés par étude live (medium.com/@gwrx2005, mars 2026)
 # Source: filtre 10min → -93% pertes, seuils relevés → -73% fréquence = bien meilleur WR
@@ -376,7 +383,7 @@ def kelly_bet_oracle(bankroll, win_prob, payout_mult, token_price=0.5, votes=0):
     edge_ratio = min(1.0, max(0.0, ev_real / 0.15))
     vote_ratio = min(1.0, max(0.0, votes / 6.0))  # dir_votes compte 6 signaux (cf. job_oracle_lag*)
     strength = max(edge_ratio, vote_ratio)
-    pct = 0.03 + 0.01 * strength  # adaptatif: 3% (edge/votes faibles) → 4% (edge fort, votes 5/5)
+    pct = 0.02 + 0.02 * strength  # ✅ (21/06) demande user: adaptatif 2% (faible) → 4% (edge fort/votes max)
     raw_bet = bankroll * pct * liquidity_factor
     result = round(min(MAX_BET_USD, max(MIN_BET_USD, raw_bet)), 2)
     log.debug(f"Kelly oracle: kp={kp:.3f} pct={pct*100:.1f}% strength={strength:.2f} → {result:.2f}$")
@@ -823,10 +830,9 @@ class PolyClient:
                 side_v2 = Side.BUY if side=="BUY" else Side.SELL
                 # Maker: undercut léger (BUY → un peu plus bas; on reste sous l'ask)
                 maker_price=round(max(0.01,min(0.99, ref_price - MAKER_UNDERCUT)),2)
-                # ✅ (21/06) size = nombre ENTIER de PARTS, minimum 5 (règle Polymarket: "Size lower than
-                # minimum: 5"). Entier × prix(2 déc) = montant maker à 2 déc → respecte aussi "maker amount
-                # max 2 decimals". budget$/prix arrondi à l'entier, plancher 5 parts.
-                size_val=float(max(5, round(amount_float/maker_price)))
+                # ✅ (21/06) demande user: minimum 1 PART (pas 5 — l'achat manuel d'1 part marche).
+                # Entier de parts (× prix 2 déc = montant maker 2 déc → respecte "maker amount max 2 decimals").
+                size_val=float(max(1, round(amount_float/maker_price)))
                 # ✅ (anti-doublon 20/06) UNIQUEMENT le maker GTC ici. Le repli taker est géré
                 # EXCLUSIVEMENT par place_bet (avec vérif de fill via le solde). Avant, ce loop
                 # plaçait aussi un FAK taker en interne quand le GTC ne renvoyait pas un succès
@@ -874,9 +880,8 @@ class PolyClient:
                 except:
                     price_val = 0.50
 
-                # ✅ (21/06) size = ENTIER de parts, min 5 (cf. place_order): respecte "Size min 5" ET
-                # "maker amount max 2 decimals" (entier × prix 2 déc = 2 déc).
-                size_val = float(max(5, round(amount_float / price_val)))
+                # ✅ (21/06) min 1 part (cf. place_order) + entier (maker amount 2 déc).
+                size_val = float(max(1, round(amount_float / price_val)))
 
                 log.info(f"V2 order: token={token_id[:10]} price={price_val} size={size_val}")
 
@@ -2211,9 +2216,21 @@ async def _resolve_expired_bet(context, asset="BTC"):
         res_price = await poly.get_token_price(active_token_id)
         if res_price >= 0.6: won = True
         elif 0 < res_price <= 0.4: won = False
-    # 3) Toujours ambigu → on réessaie au prochain cycle, sauf délai max (~3min) dépassé
+    # 3) ✅ (21/06) Fallback FIABLE: mouvement de l'oracle sur le slot (open mémorisé à l'entrée vs prix
+    # oracle actuel ≈ close). Corrige les FAUX LOSS quand le recorder n'a pas encore enregistré le slot
+    # ET que le prix token résolu renvoie 0 (marché clos) — cas vu: BTC/SOL gagnants marqués LOSS.
     if won is None:
-        if remaining > -180: return
+        slot_open_px = bet.get("slot_open_px", 0)
+        _close_map = {"BTC":st.oracle_price or st.ws_price,"ETH":st.eth_oracle_price or st.eth_price,
+                      "SOL":st.sol_oracle_price or st.sol_price,"XRP":st.xrp_oracle_price or st.xrp_price}
+        close_px = _close_map.get(bet_asset, 0)
+        if slot_open_px > 0 and close_px > 0:
+            won = (("UP" if close_px >= slot_open_px else "DOWN") == bet["dir"])
+            log.info(f"{bet_asset}: résultat reconstruit oracle open={slot_open_px:.2f} close={close_px:.2f} → {'WIN' if won else 'LOSS'}")
+    # 4) Toujours ambigu → on réessaie (le recorder finit par enregistrer); LOSS en TOUT DERNIER recours
+    # après ~10min (avant: 3min → trop tôt, défaut LOSS sur des gagnants).
+    if won is None:
+        if remaining > -600: return
         won = False
     log.info(f"Slot résolu {bet_asset} {bet['dir']} → {'WIN' if won else 'LOSS'} (recorder={'oui' if rec else 'non'})")
     # Montant déterministe depuis les shares (position pleine, plus de vente anticipée)
@@ -3471,7 +3488,7 @@ async def place_bet(context, direction, amount, conf, reasoning, conf_score, ses
                 entry_token_price_final = entry_tp if entry_tp>0 else round(first_amount/real_shares, 4)
             else:
                 entry_token_price_final = entry_tp
-                shares_bought_final = float(max(5, round(first_amount/entry_tp))) if entry_tp>0 else 0
+                shares_bought_final = float(max(1, round(first_amount/entry_tp))) if entry_tp>0 else 0
             setattr(st, f"entry_token_price{sfx}", entry_token_price_final)
             setattr(st, f"shares_bought{sfx}", shares_bought_final)
             first_amount = round(shares_bought_final * entry_token_price_final, 2)  # mise RÉELLE (parts × prix)
@@ -3487,10 +3504,15 @@ async def place_bet(context, direction, amount, conf, reasoning, conf_score, ses
             fill_type = "paper"; fee_est = 0.0
         # t restant dans le slot au moment de l'entrée (pour l'analyse de timing /zones)
         t_remaining = round(max(0.0, (market_end - time.time()) if market_end and market_end>0 else (cur_slot+300 - time.time())), 1)
+        # ✅ (21/06) prix d'OUVERTURE du slot (oracle) mémorisé → permet de reconstruire le résultat
+        # UP/DOWN à la résolution si le slot recorder n'a pas (encore) enregistré (corrige les faux LOSS).
+        _slot_open_map = {"BTC":st.oracle_slot_open,"ETH":st.eth_oracle_slot_open,
+                          "SOL":st.sol_oracle_slot_open,"XRP":st.xrp_oracle_slot_open}
+        slot_open_px = _slot_open_map.get(asset, 0) or 0
         setattr(st, f"bet{sfx}", {"dir":direction,"amount":first_amount,"conf":conf,"entry":consensus_price() if consensus_price()>0 else st.price,
                 "reasoning":reasoning,"ts":int(time.time()),"score":conf_score.get("score",0),"session":sess["session"],
                 "staged_remaining":staged_remaining,"staged_done":staged_remaining<=0,"source":source,
-                "asset":asset,"entry_token":round(entry_tp,4),"t_remaining":t_remaining,
+                "asset":asset,"entry_token":round(entry_tp,4),"t_remaining":t_remaining,"slot_open_px":slot_open_px,
                 "fill_type":fill_type,"fee_est":fee_est,"reserved":reserved})
         setattr(st, f"expiry_alerted{sfx}", False)  # ✅ (21/06) reset flag alerte T-30s pour la nouvelle position
         if asset == "BTC":
@@ -4081,16 +4103,10 @@ async def job_oracle_lag(context):
             st.clob_ws_task.cancel()
         st.clob_ws_task = asyncio.create_task(ws_clob_loop(asset_up))
 
-    # ✅ v12.9 Sonnet P1: BTC tokenmax ret3s≤+0.010%
-    # ✅ v12.9 Sonnet P3: BTC ultra exception si delta≥+0.114% ET gap≥+0.060% (7W/0L=100%)
+    # ✅ (21/06) demande user: cap DUR 0.70$ (overrides retirés) — token 0.41→0.70$
     if token_price > ORACLE_TOKEN_MAX:
-        if ret_3s <= 0.010:
-            log.debug(f"BTC tokenmax override ret3s: tok={token_price:.2f}$ ret3s={ret_3s:+.3f}% → autoriser")
-        elif oracle_delta >= 0.114 and spot_oracle_gap >= 0.060:
-            log.debug(f"BTC tokenmax ultra-override: delta={oracle_delta:+.3f}% gap={spot_oracle_gap:+.3f}% (7W/0L pattern) → autoriser")
-        else:
-            log_skip(f"BTC: token {token_price:.2f}$>{ORACLE_TOKEN_MAX}$ (→ skip: marché a déjà pricé la direction)", direction,
-                     features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"dual":dual_dir,"filter":"tokenmax","token":token_price,"asset":"BTC"}); return
+        log_skip(f"BTC: token {token_price:.2f}$>{ORACLE_TOKEN_MAX}$ (→ skip: marché a déjà pricé la direction)", direction,
+                 features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"dual":dual_dir,"filter":"tokenmax","token":token_price,"asset":"BTC"}); return
     if token_price < ORACLE_TOKEN_MIN:
         log_skip(f"BTC: token {token_price:.2f}$<{ORACLE_TOKEN_MIN}$ (→ skip: trop incertain)", direction,
                  features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"dual":dual_dir,"filter":"tokenmin","token":token_price,"asset":"BTC"}); return
@@ -4311,11 +4327,8 @@ async def job_oracle_lag_asset(context, asset:str):
     elif asset=="SOL" and asset_up_ob and st.sol_ob_asset_id != asset_up_ob:
         if st.sol_clob_ws_task and not st.sol_clob_ws_task.done(): st.sol_clob_ws_task.cancel()
         st.sol_clob_ws_task = asyncio.create_task(ws_clob_loop_asset(asset_up_ob,"SOL"))
-    # ✅ v12.6 — SOL tokenmax 0.95$ si votes ≤ -1 (Sonnet: 2W/0L à 0.92-0.98$)
-    # ✅ v12.9 Sonnet: ETH/XRP ≥0.95$ bloqués (1W/9L ETH, 1W/6L SOL à 0.99$)
-    if asset == "SOL" and dir_votes <= -1: effective_token_max = 0.95
-    elif asset in ("ETH","XRP"): effective_token_max = 0.95
-    else: effective_token_max = ORACLE_TOKEN_MAX
+    # ✅ (21/06) demande user: cap DUR 0.70$ pour TOUTES les cryptos (token 0.41→0.70$)
+    effective_token_max = ORACLE_TOKEN_MAX
     if token_price>effective_token_max:
         log_skip(f"{symbol}: token {token_price:.2f}$>{effective_token_max}$ (déjà pricé)",direction,
                  features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"dual":dual_dir,"filter":"tokenmax","token":token_price}); return
@@ -5049,6 +5062,59 @@ async def job_ob_signal_btc(context):  await job_ob_signal_asset(context, "BTC")
 async def job_ob_signal_eth(context):  await job_ob_signal_asset(context, "ETH")
 async def job_ob_signal_sol(context):  await job_ob_signal_asset(context, "SOL")
 async def job_ob_signal_xrp(context):  await job_ob_signal_asset(context, "XRP")
+
+
+async def job_ob_oracle_disagree(context):
+    """✅ (21/06) demande user — Stratégie RÉELLE BTC uniquement: ob_oracle_disagree.
+    Trade quand le CARNET (OB imbalance) et l'ORACLE divergent → on suit le carnet.
+    OB acheteurs (imbalance>0) → UP, OB vendeurs (<0) → DOWN. Token 0.41-0.75$, mise 2% BR.
+    1 bet BTC/slot (partagé avec les autres stratégies BTC via asset_trade_slot)."""
+    if not OB_DISAGREE_ENABLED or not st.running or st.killed: return
+    if st.paper_mode: return  # réel uniquement (demande user)
+    now = time.time()
+    cur_slot = int(now//300)*300
+    slot_remaining = cur_slot+300-now
+    if slot_remaining > 120 or slot_remaining < 30: return  # ✅ (21/06) demande user: fenêtre T-120→T-30s
+    if st.bet is not None or st.asset_trade_slot.get("BTC") == cur_slot: return  # slot BTC déjà pris
+    # Carnet frais ?
+    if time.time() - getattr(st, "ob_ts", 0) > 10:
+        log_skip("OBdis BTC: carnet périmé", None); return
+    ob = st.ob_imbalance
+    if abs(ob) < OB_DISAGREE_THRESHOLD: return  # carnet pas assez déséquilibré
+    # Direction oracle
+    if st.oracle_slot_open <= 0 or st.oracle_price <= 0: return
+    oracle_delta = (st.oracle_price - st.oracle_slot_open)/st.oracle_slot_open*100
+    ob_dir = "UP" if ob > 0 else "DOWN"
+    oracle_dir = "UP" if oracle_delta > 0 else ("DOWN" if oracle_delta < 0 else None)
+    # SIGNAL: il faut un DÉSACCORD carnet ↔ oracle
+    if oracle_dir is None or ob_dir == oracle_dir:
+        log_skip(f"OBdis BTC: pas de désaccord (OB {ob_dir} / oracle {oracle_dir})", ob_dir,
+                 features={"ob":ob,"delta":oracle_delta,"filter":"no_disagree","asset":"BTC"}); return
+    direction = ob_dir  # on suit le carnet
+    market = await poly.find_btc_5min_market()
+    if not market: return
+    token_used = market["token_up"] if direction=="UP" else market["token_down"]
+    token_price = await poly.get_token_price(token_used)
+    if not token_price or token_price <= 0: return
+    if token_price < OB_DISAGREE_TOKEN_MIN or token_price > OB_DISAGREE_TOKEN_MAX:
+        log_skip(f"OBdis BTC: token {token_price:.2f}$ hors 0.41-0.75$", direction,
+                 features={"ob":ob,"delta":oracle_delta,"token":token_price,"filter":"token_range","asset":"BTC"}); return
+    amount = max(MIN_BET_USD, round(st.bankroll * OB_DISAGREE_PCT, 2))  # 2% BR
+    tpu = token_price if direction=="UP" else round(max(0.01,1-token_price),4)
+    tpd = token_price if direction=="DOWN" else round(max(0.01,1-token_price),4)
+    market_end = market.get("end_date",""); sess = session_ctx()
+    reasoning = (f"🔀 OB-ORACLE DISAGREE BTC {direction} | OB={ob:+.2f} ({'acheteurs' if ob>0 else 'vendeurs'}) "
+                 f"≠ oracleΔ={oracle_delta:+.3f}% | tok={token_price:.3f}$ T-{int(slot_remaining)}s")
+    st.current_market = market
+    ok = await place_bet(context, direction, amount, 0.55, reasoning, {"score":0,"signals":[]}, sess,
+                         tpu, tpd, market_end, source="ob_disagree", asset="BTC", market=market)
+    if not ok: return
+    real_amount = (st.bet or {}).get("amount", amount)
+    await send(context.bot,
+        f"🔀 *OB-ORACLE DISAGREE ₿ BTC* [💰 RÉEL]\n━━━━━━━━━━━━━━━\n"
+        f"*{direction}* | Mise réelle:`{real_amount:.2f}$` | ⏰T-`{int(slot_remaining)}s`\n"
+        f"Carnet:`{ob:+.2f}` ({'acheteurs→UP' if ob>0 else 'vendeurs→DOWN'}) ≠ OracleΔ:`{oracle_delta:+.3f}%`\n"
+        f"Token:`{token_price:.3f}$`\n\n💭 _{reasoning}_")
 
 
 async def job_confluence_asset(context, asset):
@@ -5867,6 +5933,7 @@ def _schedule_all_jobs(jq):
     jq.run_repeating(job_ob_signal_eth,interval=3,first=49)
     jq.run_repeating(job_ob_signal_sol,interval=3,first=50)
     jq.run_repeating(job_ob_signal_xrp,interval=3,first=51)
+    jq.run_repeating(job_ob_oracle_disagree,interval=3,first=52)  # ✅ (21/06) ob_oracle_disagree (BTC réel)
     jq.run_repeating(job_resolve_passes,interval=30,first=35)
     # ✅ v12.9 — SLOT RECORDER: enregistrement principal à la bascule (ws_oracle_loop) + ce job en filet de sécurité
     jq.run_repeating(job_slot_recorder,interval=30,first=50)
