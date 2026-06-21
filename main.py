@@ -881,26 +881,24 @@ class PolyClient:
 
                 log.info(f"V2 order: token={token_id[:10]} price={price_val} size={size_val}")
 
-                for order_type_v2 in [OrderType.FAK, OrderType.GTC]:
-                    try:
-                        resp = self.client.create_and_post_order(
-                            order_args=OrderArgs(
-                                token_id=token_id,
-                                price=price_val,
-                                side=side_v2,
-                                size=size_val,
-                            ),
-                            options=PartialCreateOrderOptions(tick_size="0.01"),
-                            order_type=order_type_v2,
-                        )
-                        log.info(f"V2 {order_type_v2} réponse: {resp}")
-                        if resp and resp.get("success"):
-                            oid = resp.get("orderID", resp.get("id", "unknown"))
-                            log.info(f"✅ Ordre V2 {order_type_v2} placé: {oid}")
-                            return oid
-                        log.warning(f"V2 {order_type_v2} refusé: {resp}")
-                    except Exception as e:
-                        log.warning(f"V2 {order_type_v2} erreur: {e}")
+                # ✅ (21/06) FAK UNIQUEMENT (avant: boucle FAK→GTC). Un FAK partiellement rempli pouvait
+                # renvoyer success=False → on plaçait alors un GTC PLEINE TAILLE qui restait sur le book et
+                # se remplissait plus tard = DOUBLE achat (cas vu: 7 parts + 5 parts ETH). Un seul ordre FAK:
+                # il prend ce qui est dispo immédiatement et annule le reste, jamais d'ordre résiduel.
+                try:
+                    resp = self.client.create_and_post_order(
+                        order_args=OrderArgs(token_id=token_id, price=price_val, side=side_v2, size=size_val),
+                        options=PartialCreateOrderOptions(tick_size="0.01"),
+                        order_type=OrderType.FAK,
+                    )
+                    log.info(f"V2 FAK réponse: {resp}")
+                    if resp and resp.get("success"):
+                        oid = resp.get("orderID", resp.get("id", "unknown"))
+                        log.info(f"✅ Ordre V2 FAK placé: {oid}")
+                        return oid
+                    log.warning(f"V2 FAK refusé: {resp}")
+                except Exception as e:
+                    log.warning(f"V2 FAK erreur: {e}")
             except Exception as e:
                 log.error(f"V2 order erreur: {e}")
             return None
@@ -2271,6 +2269,21 @@ async def job_check_expiry(context):
     if st.paper_mode: return
     for a in ASSETS:
         await _resolve_expired_bet(context, asset=a)
+
+async def job_sync_balance(context):
+    """✅ (21/06) demande user: BR TOUJOURS synchronisé avec le solde réel Polymarket (CLOB USDC).
+    Lit le solde toutes les 60s → st.bankroll = solde réel. Auto-répare toute dérive/corruption
+    (ex: BR aberrant à 2.4M$ → revient au vrai solde). Les valeurs aberrantes (>1M$ / <0) sont déjà
+    filtrées par fetch_clob_balance (→ None, ignorées). Ignoré en paper mode.
+    NB: le solde reflète le cash disponible (hors parts en cours) → c'est exactement le solde affiché
+    sur Polymarket; il remonte automatiquement quand les positions se résolvent."""
+    if st.paper_mode or not poly.ready: return
+    clob_bal = await fetch_clob_balance()
+    if clob_bal is not None and clob_bal > 0:
+        if abs(clob_bal - st.bankroll) >= 0.01:
+            log.info(f"BR sync: {st.bankroll:.2f}$ → {clob_bal:.2f}$ (solde Polymarket réel)")
+        st.bankroll = clob_bal
+        if st.bankroll_ref <= 0: st.bankroll_ref = clob_bal
 
 async def job_take_profit(context):
     """❌ DÉSACTIVÉ (demande user 20/06): plus AUCUNE vente anticipée (ni TP x2/x3/x4, ni stop, ni
@@ -5834,6 +5847,7 @@ def _schedule_all_jobs(jq):
     st.backup_job=jq.run_repeating(job_backup,interval=120,first=60)  # v12.4 backup 2min
     st.recap_job=jq.run_repeating(job_daily_recap,interval=3600,first=60)
     jq.run_repeating(job_check_expiry,interval=30,first=15)
+    jq.run_repeating(job_sync_balance,interval=60,first=12)  # ✅ (21/06) BR toujours = solde Polymarket réel
     jq.run_repeating(job_ws_watchdog_all,interval=30,first=1)  # ✅ v10.23 tous les WS
     jq.run_repeating(job_staged_entry,interval=5,first=14)     # ✅ v10.23 2e tranche
     jq.run_repeating(job_oracle_lag,interval=2,first=16)
