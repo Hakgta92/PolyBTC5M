@@ -655,6 +655,7 @@ new Chart(ctx, {{
 class PolyClient:
     def __init__(self):
         self.client=None; self.ready=False; self.client_version="v1"
+        self.auth_failed=False  # ✅ (21/06) True si create_or_derive_api_key échoue (ex: 400 "Could not create api key")
 
     def init_client(self):
         if not POLY_PRIVATE_KEY or not POLY_PROXY_WALLET:
@@ -680,7 +681,7 @@ class PolyClient:
                 funder=deposit_wallet,
                 creds=creds
             )
-            self.ready = True
+            self.ready = True; self.auth_failed = False
             self.client_version = "v2"
             log.info(f"✅ Polymarket CLOB V2 initialisé (sig_type=3, deposit={deposit_wallet[:10]}...)"); return True
         except ImportError:
@@ -694,10 +695,14 @@ class PolyClient:
                 signature_type=1,funder=POLY_PROXY_WALLET)
             creds=self.client.create_or_derive_api_creds()
             self.client.set_api_creds(creds)
-            self.ready=True
+            self.ready=True; self.auth_failed = False
             self.client_version = "v1"
             log.info("✅ Polymarket CLOB V1 initialisé"); return True
-        except Exception as e: log.error(f"Polymarket init: {e}"); return False
+        except Exception as e:
+            # ✅ (21/06) auth CLOB échouée (ex: 400 "Could not create api key" — souvent quand 2 instances
+            # tournent et se volent la clé API). Flag lu par place_bet pour alerter sur Telegram.
+            self.auth_failed = True
+            log.error(f"Polymarket init: {e}"); return False
 
     async def get_market_by_slug(self, slug:str):
         """v12.9 — CORRIGÉ (bug majeur trouvé 17/06): l'ancien code utilisait /events?slug=X et
@@ -3243,6 +3248,7 @@ async def resolve_paper_bet(context):
     await send(context.bot,f"{'✅' if won else '❌'} *Trade clôturé* [📄]\n`{bet['dir']}` `${bet['entry']:,.0f}`→`${st.price:,.0f}`\nPnL:`{'+' if gross>=0 else ''}{gross:.2f}$` BR:`{st.bankroll:.2f}` ROI:`{roi()}`{cd_msg}")
     st.backup()
 
+_last_clob_alert = [0.0]  # ✅ (21/06) dédoublonnage alerte "CLOB non authentifié" (1×/10min)
 async def place_bet(context, direction, amount, conf, reasoning, conf_score, sess, tpu, tpd, market_end, source="tick", asset="BTC", reserved=False):
     """
     ✅ v10.23 — Placement centralisé: REFETCH prix + MAKER order (undercut) +
@@ -3286,6 +3292,16 @@ async def place_bet(context, direction, amount, conf, reasoning, conf_score, ses
 
         if not st.paper_mode and st.current_market:
             token_used=st.current_market["token_up"] if direction=="UP" else st.current_market["token_down"]
+            # ✅ (21/06) CLOB pas authentifié (clé API non créée) → impossible de poster un ordre réel.
+            # Alerte Telegram dédoublonnée (1×/10min) au lieu d'un "ordre refusé" cryptique en boucle.
+            # Cause fréquente: 2 instances du bot tournent et se volent la clé API (voir erreur Conflict).
+            if not poly.ready or poly.auth_failed:
+                if time.time() - _last_clob_alert[0] > 600:
+                    _last_clob_alert[0] = time.time()
+                    await send(context.bot, "🔴 *CLOB non authentifié* — clé API Polymarket non créée (erreur 400 \"Could not create api key\").\nAucun trade réel possible. Vérifie qu'**une seule** instance du bot tourne (l'erreur `Conflict` indique 2 instances qui se volent la clé), puis redéploie proprement.")
+                log_skip("CLOB non authentifié (clé API non créée) — ordre réel impossible", direction)
+                st.asset_trade_slot[asset] = 0
+                return False
             if market_end > 0 and (market_end - time.time()) < 15:
                 log_skip(f"Slot expire dans {market_end-time.time():.0f}s — ordre annulé", direction)
                 st.asset_trade_slot[asset] = 0
@@ -3973,7 +3989,11 @@ async def job_oracle_lag(context):
     st.current_market = market
     token_used = market["token_up"] if direction=="UP" else market["token_down"]
     token_price = await poly.get_token_price(token_used)
-    if not token_price or token_price <= 0: return
+    if not token_price or token_price <= 0:
+        # ✅ (21/06) avant: return SILENCIEUX → aucune passe loggée si le prix CLOB est indispo,
+        # d'où "le bot ne fait plus rien" sans trace. Maintenant on loggue une passe visible.
+        log_skip(f"BTC: prix token indispo (CLOB/price down) (T-{int(slot_remaining)}s)", direction,
+                 features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"filter":"price_unavail","asset":"BTC"}); return
 
     asset_up = market.get("token_up","")
     if asset_up and st.ob_asset_id != asset_up:
@@ -4202,7 +4222,10 @@ async def job_oracle_lag_asset(context, asset:str):
                  features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"filter":"no_market"}); return
     token_used=market["token_up"] if direction=="UP" else market["token_down"]
     token_price=await poly.get_token_price(token_used)
-    if not token_price or token_price<=0: return
+    if not token_price or token_price<=0:
+        # ✅ (21/06) avant: return SILENCIEUX → aucune passe loggée si le prix CLOB est indispo.
+        log_skip(f"{symbol}: prix token indispo (CLOB/price down) (T-{int(slot_remaining)}s)", direction,
+                 features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"filter":"price_unavail"}); return
     # ✅ v12.4 — Lancer WS CLOB OB pour ETH/SOL
     asset_up_ob = market.get("token_up","")
     if asset=="ETH" and asset_up_ob and st.eth_ob_asset_id != asset_up_ob:
