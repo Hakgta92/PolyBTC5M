@@ -760,9 +760,11 @@ class PolyClient:
             try:
                 from py_clob_client_v2 import OrderArgs, OrderType, PartialCreateOrderOptions, Side
                 side_v2 = Side.BUY if side=="BUY" else Side.SELL
-                size_val=round(max(5.0,amount_float),2)
                 # Maker: undercut léger (BUY → un peu plus bas; on reste sous l'ask)
                 maker_price=round(max(0.01,min(0.99, ref_price - MAKER_UNDERCUT)),2)
+                # ✅ OrderArgs.size = nombre de PARTS (shares), PAS le montant en $ — bug source du
+                # montant réel ≠ montant affiché sur Telegram. Conversion: shares = budget$ / prix.
+                size_val=round(max(5.0,amount_float)/maker_price,2)
                 # ✅ (anti-doublon 20/06) UNIQUEMENT le maker GTC ici. Le repli taker est géré
                 # EXCLUSIVEMENT par place_bet (avec vérif de fill via le solde). Avant, ce loop
                 # plaçait aussi un FAK taker en interne quand le GTC ne renvoyait pas un succès
@@ -795,7 +797,6 @@ class PolyClient:
             try:
                 from py_clob_client_v2 import OrderArgs, OrderType, PartialCreateOrderOptions, Side
                 side_v2 = Side.BUY if side == "BUY" else Side.SELL
-                size_val = round(max(5.0, amount_float), 2)  # min 5$
 
                 # ✅ v10.19 — Prix dynamique avec slippage adaptatif
                 try:
@@ -810,6 +811,10 @@ class PolyClient:
                         price_val = 0.50
                 except:
                     price_val = 0.50
+
+                # ✅ OrderArgs.size = nombre de PARTS (shares), PAS le montant en $ — bug source du
+                # montant réel ≠ montant affiché sur Telegram. Conversion: shares = budget$ / prix.
+                size_val = round(max(5.0, amount_float) / price_val, 2)  # min 5$ de budget
 
                 log.info(f"V2 order: token={token_id[:10]} price={price_val} size={size_val}")
 
@@ -862,8 +867,9 @@ class PolyClient:
         if getattr(self, "client_version", "v1") != "v2": return None
         try:
             from py_clob_client_v2 import OrderArgs, OrderType, PartialCreateOrderOptions, Side
-            size_val = round(max(5.0, float(amount_usdc)), 2)
             price_val = round(min(0.99, max(0.01, price)), 2)
+            # ✅ size = shares, pas $ — conversion budget$ / prix (cf. place_order/place_market_order)
+            size_val = round(max(5.0, float(amount_usdc)) / price_val, 2)
             resp = self.client.create_and_post_order(
                 order_args=OrderArgs(token_id=token_id, price=price_val,
                                      side=Side.BUY if side=="BUY" else Side.SELL, size=size_val),
