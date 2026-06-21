@@ -226,7 +226,16 @@ class _MemErrorHandler(logging.Handler):
     def emit(self, record):
         try:
             if record.levelno >= logging.WARNING:
-                _RECENT_ERRORS.append((time.time(), record.levelname, record.getMessage()))
+                msg = record.getMessage()
+                # ✅ Sans ça, les exceptions non gérées par PTB ("No error handlers are
+                # registered, logging exception.") n'affichaient que ce message générique
+                # dans /lasterrors — le vrai type/cause de l'exception (dans la traceback
+                # attachée au record) était silencieusement perdu.
+                if record.exc_info:
+                    import traceback as _tb
+                    tb_lines = _tb.format_exception(*record.exc_info)
+                    msg = msg + " | " + "".join(tb_lines[-2:]).strip().replace("\n", " ")
+                _RECENT_ERRORS.append((time.time(), record.levelname, msg))
         except Exception:
             pass
 _mem_err_handler = _MemErrorHandler(level=logging.WARNING)
@@ -312,7 +321,10 @@ def kelly_bet(bankroll, win_prob, payout_mult, token_price=0.5, ev_bonus=False):
     edge_ratio = min(1.0, max(0.0, ev_real / 0.15))
     floor_pct = 0.01 + 0.03 * edge_ratio
     dynamic_min = max(MIN_BET_USD, round(bankroll * floor_pct, 2))
-    result = round(max(dynamic_min, min(raw_bet, MAX_BET_USD)), 2)
+    # ✅ MAX_BET_USD est un PLAFOND ABSOLU — avant, dynamic_min (% du bankroll, non plafonné)
+    # passait par-dessus via max(), donc un bankroll qui grossit (paper mode) faisait grimper
+    # les mises à l'infini malgré le cap. min() final = plafond strict quel que soit dynamic_min.
+    result = round(min(MAX_BET_USD, max(dynamic_min, raw_bet)), 2)
     log.debug(f"Kelly tier={tier_name} EV={ev_real:.2f} P={win_prob:.2f} floor={floor_pct*100:.1f}% → {result:.2f}$")
     return result
 
@@ -335,7 +347,9 @@ def kelly_bet_secondary(bankroll, win_prob, payout_mult, confidence=1.0):
         return 0.0  # Edge négatif → ne pas trader
     pct = min(max(kp * 0.25, 0.01), 0.03)  # cap strict 1%-3% BR (base)
     pct = min(max(pct * confidence, 0.01), 0.03)  # ajustement confidence, cap 1-3% toujours respecté
-    result = round(bankroll * pct, 2)
+    # ✅ MAX_BET_USD = plafond absolu en $ — le cap 1-3% seul ne suffit pas si le bankroll
+    # grossit beaucoup (paper mode), il fait grimper la mise en $ sans limite.
+    result = round(min(MAX_BET_USD, bankroll * pct), 2)
     log.debug(f"Kelly secondary: kp={kp:.3f} pct={pct*100:.1f}% conf={confidence:.2f} → {result:.2f}$")
     return result
 
@@ -6244,7 +6258,7 @@ async def cmd_lasterrors(update,context):
     for ts, lvl, msg in items:
         t = datetime.fromtimestamp(ts).strftime("%d/%m %H:%M:%S")
         e = "🔴" if lvl == "ERROR" or lvl == "CRITICAL" else "🟡"
-        lines.append(f"{e} `{t}` {msg[:160]}")
+        lines.append(f"{e} `{t}` {msg[:350]}")
     text = "\n".join(lines)
     try:
         await update.message.reply_text(text, parse_mode="Markdown")
@@ -7114,6 +7128,19 @@ async def cb(update,context):
        "fear":cmd_fear,"score":cmd_score,"run":cmd_run,"stop":cmd_stop,"paper":cmd_paper}
     if q.data in h: await h[q.data](update,context)
 
+async def error_handler(update, context):
+    """✅ Sans handler PTB explicite, les exceptions des handlers/jobs étaient juste logguées
+    par PTB lui-même ("No error handlers are registered, logging exception.") sans traceback
+    exploitable dans /lasterrors, et sans aucune alerte Telegram. On logue ici avec la
+    vraie traceback (capturée par _MemErrorHandler via exc_info) et on notifie l'admin."""
+    log.error(f"Exception non gérée: {context.error}", exc_info=context.error)
+    try:
+        import traceback as _tb
+        tail = "".join(_tb.format_exception(type(context.error), context.error, context.error.__traceback__))[-500:]
+        await send(context.bot, f"🔴 *Erreur interne*\n`{type(context.error).__name__}: {context.error}`\n```{tail}```")
+    except Exception:
+        pass
+
 def main():
     import signal as _signal, asyncio as _asyncio
 
@@ -7161,6 +7188,7 @@ def main():
         ("learn",cmd_learn),("revive",cmd_revive),("autotune",cmd_autotune),("lasterrors",cmd_lasterrors)]:
         app.add_handler(CommandHandler(name,handler))
     app.add_handler(CallbackQueryHandler(cb))
+    app.add_error_handler(error_handler)
     log.info(f"🧠 PolyBot v{BOT_VERSION} démarré")
     app.run_polling(drop_pending_updates=True)
 
