@@ -763,18 +763,21 @@ class PolyClient:
                 size_val=round(max(5.0,amount_float),2)
                 # Maker: undercut léger (BUY → un peu plus bas; on reste sous l'ask)
                 maker_price=round(max(0.01,min(0.99, ref_price - MAKER_UNDERCUT)),2)
-                # 1) Tente GTC (maker, peut obtenir rebate)
-                for price_val, otype in [(maker_price, OrderType.GTC), (round(min(0.99,ref_price*1.02),2), OrderType.FAK)]:
-                    try:
-                        resp=self.client.create_and_post_order(
-                            order_args=OrderArgs(token_id=token_id, price=price_val, side=side_v2, size=size_val),
-                            options=PartialCreateOrderOptions(tick_size="0.01"),
-                            order_type=otype)
-                        log.info(f"place_order {otype} @{price_val}: {resp}")
-                        if resp and (resp.get("success") or resp.get("orderID")):
-                            return resp.get("orderID", resp.get("id","unknown"))
-                    except Exception as e:
-                        log.warning(f"place_order {otype}: {e}")
+                # ✅ (anti-doublon 20/06) UNIQUEMENT le maker GTC ici. Le repli taker est géré
+                # EXCLUSIVEMENT par place_bet (avec vérif de fill via le solde). Avant, ce loop
+                # plaçait aussi un FAK taker en interne quand le GTC ne renvoyait pas un succès
+                # "propre" alors qu'il pouvait être live → 2 ordres/fills sur le même slot, en plus
+                # du taker de place_bet.
+                try:
+                    resp=self.client.create_and_post_order(
+                        order_args=OrderArgs(token_id=token_id, price=maker_price, side=side_v2, size=size_val),
+                        options=PartialCreateOrderOptions(tick_size="0.01"),
+                        order_type=OrderType.GTC)
+                    log.info(f"place_order GTC @{maker_price}: {resp}")
+                    if resp and (resp.get("success") or resp.get("orderID")):
+                        return resp.get("orderID", resp.get("id","unknown"))
+                except Exception as e:
+                    log.warning(f"place_order GTC: {e}")
             except Exception as e:
                 log.error(f"place_order v2: {e}")
             return None
@@ -3219,56 +3222,74 @@ async def place_bet(context, direction, amount, conf, reasoning, conf_score, ses
                 log_skip(f"SNIPE: prix token bougé ({entry_tp:.2f}$)", direction); st.asset_trade_slot[asset] = 0; return False
             # ✅ #1 — Baseline du solde AVANT l'ordre, pour confirmer un fill réel (vs supposer rempli)
             bal0 = await poly.get_position_size(token_used)
-            order_id=await poly.place_order(token_used, first_amount, entry_tp, "BUY")  # ✅ maker/limite
-            if not order_id:
-                await send(context.bot,"⚠️ *Ordre Polymarket refusé — réessai prochain slot*"); st.asset_trade_slot[asset] = 0; return False
+            order_id=await poly.place_order(token_used, first_amount, entry_tp, "BUY")  # ✅ maker GTC uniquement
+            maker_placed = order_id is not None
             fill_type = "assumed"  # v1/non vérifiable: on suppose rempli (ancien comportement)
-            real_shares = None  # ✅ shares RÉELLEMENT reçues (mesurées via le solde), pas supposées
-            # ✅ #1 — Vérification du fill (le GTC maker à -2¢ peut rester POSÉ sans être exécuté).
-            if bal0 is not None:
+            real_shares = None     # shares RÉELLEMENT reçues (mesurées via le solde), pas supposées
+            filled = True          # défaut: si le solde n'est pas vérifiable (bal0=None) on suppose rempli
+            if not maker_placed:
+                # Maker GTC rejeté → place_order ne fait plus de FAK interne. UN SEUL taker ici
+                # (le maker n'est pas sur le book → aucun risque de double fill).
+                log.info(f"{asset}: maker rejeté, taker direct")
+                order_id = await poly.place_market_order(token_used, first_amount, "BUY")
+                if not order_id:
+                    await send(context.bot,"⚠️ *Ordre Polymarket refusé — réessai prochain slot*"); st.asset_trade_slot[asset] = 0; return False
+                if bal0 is not None:
+                    bal2 = await poly.get_position_size_polled(token_used, bal0, tries=4, delay=0.8)
+                    filled = (bal2 is not None and bal2 > bal0)
+                    fill_type = "taker" if filled else "none"
+                    if filled: real_shares = round(bal2 - bal0, 4)
+                else:
+                    fill_type = "taker"  # non vérifiable → filled reste True
+            elif bal0 is not None:
+                # ✅ Vérification du fill (le GTC maker à -2¢ peut rester POSÉ sans être exécuté).
                 await asyncio.sleep(FILL_WAIT_S)
-                cancel_info = await poly.cancel_order(order_id)  # annule le reliquat non rempli du maker
+                cancel_info = await poly.cancel_order(order_id)
                 # ✅ ANTI-DOUBLON (20/06): le solde CLOB est EN RETARD → on POLL avec retry au lieu d'1 seule
                 # lecture, sinon un maker déjà rempli passe pour "non rempli" et on place un taker EN DOUBLE.
                 bal1 = await poly.get_position_size_polled(token_used, bal0)
                 maker_filled = (bal1 is not None and bal1 > bal0)
-                # Si le maker n'a PAS pu être annulé (déjà matché / erreur d'annulation), il est
-                # PROBABLEMENT rempli: on n'envoie SURTOUT pas de taker (sinon position doublée).
+                # maker non annulable (déjà matché / erreur) → probablement rempli → JAMAIS de taker.
                 cancel_uncertain = (not cancel_info.get("ok")) or cancel_info.get("already_filled")
                 filled = maker_filled
                 fill_type = "maker" if maker_filled else "none"
                 if maker_filled: real_shares = round(bal1 - bal0, 4)
                 if not maker_filled and not cancel_uncertain:
-                    # Maker proprement annulé ET non rempli → croiser le spread en taker (EV inclut les frais taker)
-                    log.info(f"{asset}: maker annulé non rempli, bascule taker")
-                    order_id = await poly.place_market_order(token_used, first_amount, "BUY")
-                    if order_id:
-                        await asyncio.sleep(FILL_TAKER_WAIT_S)
-                        bal2 = await poly.get_position_size_polled(token_used, bal0)
-                        filled = (bal2 is not None and bal2 > bal0)
-                        if filled: fill_type = "taker"; real_shares = round(bal2 - bal0, 4)
+                    # Maker annulé d'après l'API. 2e vérif solde PLUS LONGUE avant de croiser en taker:
+                    # un fill maker tardif peut ne pas être visible (lag) → évite un taker par-dessus
+                    # un maker en réalité rempli (= 2 fills même slot).
+                    bal_confirm = await poly.get_position_size_polled(token_used, bal0, tries=4, delay=0.8)
+                    if bal_confirm is not None and bal_confirm > bal0:
+                        filled = True; fill_type = "maker"; real_shares = round(bal_confirm - bal0, 4)
+                    else:
+                        log.info(f"{asset}: maker confirmé non rempli, bascule taker")
+                        order_id = await poly.place_market_order(token_used, first_amount, "BUY")
+                        if order_id:
+                            bal2 = await poly.get_position_size_polled(token_used, bal0, tries=4, delay=0.8)
+                            filled = (bal2 is not None and bal2 > bal0)
+                            fill_type = "taker" if filled else "none"
+                            if filled: real_shares = round(bal2 - bal0, 4)
+                        else:
+                            filled = False
                 elif not maker_filled and cancel_uncertain:
-                    # Annulation incertaine → maker peut-être rempli mais solde en retard. PAS de taker.
-                    # Dernière vérif solde un peu plus longue avant de conclure.
+                    # Annulation incertaine → maker peut-être rempli (lag). PAS de taker. Vérif élargie.
                     bal1b = await poly.get_position_size_polled(token_used, bal0, tries=4, delay=0.8)
                     if bal1b is not None and bal1b > bal0:
                         filled = True; fill_type = "maker"; real_shares = round(bal1b - bal0, 4)
                     else:
+                        filled = False
                         log.warning(f"{asset}: maker non annulable et fill non confirmé — pas de taker (anti-doublon)")
-                if not filled:
-                    st.exec_stats["nofill"] = st.exec_stats.get("nofill",0) + 1
-                    # ⚠️ ANTI-DOUBLON (demande user 20/06: 1 SEUL bet/slot/crypto).
-                    # Le solde peut être EN RETARD: maker rempli puis lag, ou FAK taker accepté/exécuté
-                    # alors que get_position_size renvoie encore l'ancien solde → faux "no-fill".
-                    # Si on relâchait le verrou ici (asset_trade_slot=0), une autre stratégie du MÊME
-                    # crypto re-rentrerait dans le même slot et on se retrouvait avec 2-4 positions
-                    # réelles en double (sans notif, car ce chemin renvoie False). Dès qu'un ordre a
-                    # atteint l'exchange, on GARDE le verrou pour tout le slot. job_reconcile alerte
-                    # si une position réelle non suivie existe vraiment.
-                    log.warning(f"{asset}: no-fill rapporté — verrou slot CONSERVÉ (anti-doublon, fill possible non vu)")
-                    log_skip(f"{asset}: ordre non rempli rapporté (verrou slot gardé anti-doublon)", direction)
-                    return False
-                st.exec_stats[fill_type] = st.exec_stats.get(fill_type,0) + 1
+            # else: maker placé mais solde non vérifiable (bal0=None) → fill_type assumed, filled=True
+            # ✅ Gestion UNIQUE du no-fill pour TOUS les chemins réels (maker rejeté, maker GTC, etc.)
+            if not filled:
+                st.exec_stats["nofill"] = st.exec_stats.get("nofill",0) + 1
+                # On GARDE le verrou asset_trade_slot (déjà posé) pour tout le slot dès qu'un ordre a
+                # atteint l'exchange — le solde peut être en retard (faux no-fill) et une autre stratégie
+                # du même crypto re-rentrerait sinon. job_reconcile alerte si une position réelle subsiste.
+                log.warning(f"{asset}: no-fill rapporté — verrou slot CONSERVÉ (anti-doublon, fill possible non vu)")
+                log_skip(f"{asset}: ordre non rempli rapporté (verrou slot gardé anti-doublon)", direction)
+                return False
+            st.exec_stats[fill_type] = st.exec_stats.get(fill_type,0) + 1
             setattr(st, f"active_order_id{sfx}", order_id); setattr(st, f"active_token_id{sfx}", token_used)
             # ✅ Prix d'entrée RÉEL = montant dépensé / shares réellement reçues (solde avant/après),
             # PAS le prix de référence pré-ordre (entry_tp) qui diffère du prix réel rempli en cas de
