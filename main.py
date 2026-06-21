@@ -823,9 +823,11 @@ class PolyClient:
                 side_v2 = Side.BUY if side=="BUY" else Side.SELL
                 # Maker: undercut léger (BUY → un peu plus bas; on reste sous l'ask)
                 maker_price=round(max(0.01,min(0.99, ref_price - MAKER_UNDERCUT)),2)
-                # ✅ OrderArgs.size = nombre de PARTS (shares), PAS le montant en $ — bug source du
-                # montant réel ≠ montant affiché sur Telegram. Conversion: shares = budget$ / prix.
-                size_val=round(max(5.0,amount_float)/maker_price,2)
+                # ✅ OrderArgs.size = nombre de PARTS (shares), PAS le montant en $. Conversion: shares = budget$ / prix.
+                # ✅ (21/06) plancher max(5.0,...) SUPPRIMÉ — il forçait 5$ de budget même quand Kelly disait 2.39$
+                # (bug "Mise réelle ≠ réel": le bot dépensait ~5$ en affichant 2.39$, et cassait le sizing 3-4% BR).
+                # MIN_BET_USD (1$) est documenté comme au-dessus du seuil Polymarket; on respecte le montant Kelly.
+                size_val=round(max(MIN_BET_USD,amount_float)/maker_price,2)
                 # ✅ (anti-doublon 20/06) UNIQUEMENT le maker GTC ici. Le repli taker est géré
                 # EXCLUSIVEMENT par place_bet (avec vérif de fill via le solde). Avant, ce loop
                 # plaçait aussi un FAK taker en interne quand le GTC ne renvoyait pas un succès
@@ -873,9 +875,9 @@ class PolyClient:
                 except:
                     price_val = 0.50
 
-                # ✅ OrderArgs.size = nombre de PARTS (shares), PAS le montant en $ — bug source du
-                # montant réel ≠ montant affiché sur Telegram. Conversion: shares = budget$ / prix.
-                size_val = round(max(5.0, amount_float) / price_val, 2)  # min 5$ de budget
+                # ✅ OrderArgs.size = nombre de PARTS (shares), PAS le montant en $. Conversion: shares = budget$ / prix.
+                # ✅ (21/06) plancher max(5.0,...) SUPPRIMÉ (cf. place_order) — forçait 5$ au lieu du montant Kelly.
+                size_val = round(max(MIN_BET_USD, amount_float) / price_val, 2)
 
                 log.info(f"V2 order: token={token_id[:10]} price={price_val} size={size_val}")
 
@@ -1014,6 +1016,26 @@ class PolyClient:
             except Exception as e:
                 log.warning(f"cancel_order ({meth}): {e}")
         return {"ok": False, "already_filled": False, "resp": None}
+
+    async def get_order_matched(self, order_id):
+        """✅ (21/06) Best-effort: nombre de PARTS déjà matchées d'un ordre, lu DIRECTEMENT via l'API
+        (autoritatif, contrairement au solde qui lag de 1-3s). Sert à bloquer le taker quand le maker
+        a (partiellement) matché → anti double-fill (cas vu: 9 parts maker + 1 part taker sur ETH).
+        Renvoie un float ≥0, ou None si la lib/endpoint ne le supporte pas (→ repli sur le solde)."""
+        if not self.ready or not self.client or not order_id:
+            return None
+        for meth in ("get_order", "get_order_by_id", "get_order_status"):
+            try:
+                fn = getattr(self.client, meth, None)
+                if not fn: continue
+                resp = fn(order_id)
+                if isinstance(resp, dict):
+                    for k in ("size_matched", "sizeMatched", "matched_size", "filled_size", "size_filled"):
+                        if resp.get(k) is not None:
+                            return float(resp.get(k) or 0)
+            except Exception as e:
+                log.debug(f"get_order_matched ({meth}): {e}")
+        return None
 
     async def sell_position(self, token_id, shares, opposite_token_id=None, current_price=0.5):
         """
@@ -1532,7 +1554,13 @@ async def fetch_clob_balance():
         if resp:
             bal = resp.get("balance", resp.get("amount", None))
             if bal is not None:
-                return round(float(bal) / 1e6, 2)
+                val = round(float(bal) / 1e6, 2)
+                # ✅ (21/06) garde-fou: >1M$ = lecture corrompue (allowance/glitch API), pas un vrai solde
+                # d'un bot 5min. On renvoie None plutôt que de propager une valeur aberrante (cf. BR à 6.3M$).
+                if val > 1_000_000 or val < 0:
+                    log.warning(f"fetch_clob_balance valeur aberrante ignorée: {val}$ (raw={bal})")
+                    return None
+                return val
     except Exception as e:
         log.warning(f"fetch_clob_balance: {e}")
     return None
@@ -2187,6 +2215,13 @@ async def _resolve_expired_bet(context, reserved=False):
     # déterministe par shares (fiable depuis le fix prix d'entrée/shares réels).
     other_bet = st.bet if reserved else st.bet2
     clob_bal = None if other_bet is not None else await fetch_clob_balance()
+    # ✅ (21/06) GARDE-FOU anti-BR-aberrant: le gain d'UN trade binaire est borné par le payout max de
+    # la position (≈ shares × 1$). Si le solde CLOB lu implique un saut absurde (lecture corrompue:
+    # allowance/unités/glitch API — vu en prod: BR passé à 6.3M$), on l'IGNORE et on retombe sur est_gross.
+    max_plausible = (shares or 0) + (cost or 0) + 5.0  # payout max + mise + marge
+    if clob_bal is not None and abs(clob_bal - st.bankroll) > max_plausible:
+        log.warning(f"clob_bal aberrant ({clob_bal:.2f}$ vs BR {st.bankroll:.2f}$, max plausible {max_plausible:.2f}$) — IGNORÉ, est_gross={est_gross:.2f}$")
+        clob_bal = None
     if (clob_bal and clob_bal > 0 and abs(clob_bal - st.bankroll) >= 0.01
             and not (won and clob_bal < st.bankroll) and not ((not won) and clob_bal > st.bankroll)):
         gross = round(clob_bal - st.bankroll, 2); st.bankroll = clob_bal
@@ -3349,6 +3384,16 @@ async def place_bet(context, direction, amount, conf, reasoning, conf_score, ses
                 filled = maker_filled
                 fill_type = "maker" if maker_filled else "none"
                 if maker_filled: real_shares = round(bal1 - bal0, 4)
+                # ✅ (21/06) ANTI-DOUBLE-FILL autoritatif: le solde lag de 1-3s, donc on demande À L'API
+                # combien de parts le maker a déjà matché. Si >0 → maker considéré REMPLI, on ne croise
+                # JAMAIS en taker (cas vu: 9 parts maker + 1 part taker sur ETH/XRP = 2 ordres/slot).
+                # Best-effort: None si la lib ne le supporte pas → comportement inchangé.
+                if not maker_filled:
+                    matched = await poly.get_order_matched(order_id)
+                    if matched and matched > 0:
+                        maker_filled = True; filled = True; fill_type = "maker"
+                        real_shares = round(bal1 - bal0, 4) if (bal1 is not None and bal1 > bal0) else round(matched, 4)
+                        log.info(f"{asset}: maker matché {matched} parts (API autoritative) — taker bloqué (anti-doublon)")
                 if not maker_filled and not cancel_uncertain:
                     # Maker annulé d'après l'API. 2e vérif solde PLUS LONGUE avant de croiser en taker:
                     # un fill maker tardif peut ne pas être visible (lag) → évite un taker par-dessus
