@@ -971,7 +971,10 @@ class PolyClient:
                 BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id))
             if resp:
                 bal = resp.get("balance", resp.get("amount", 0))
-                return float(bal)
+                # ✅ (21/06) /1e6: les tokens conditionnels Polymarket ont 6 décimales (ERC1155) → le solde
+                # brut = parts × 1e6. Sans cette division, real_shares était gonflé ×1e6 → est_gross =
+                # shares-cost explosait (BR à 2.4M$) et le prix d'entrée tombait à ~0 ("Token:0.000$").
+                return float(bal) / 1e6
         except Exception as e:
             log.warning(f"get_position_size: {e}")
         return None
