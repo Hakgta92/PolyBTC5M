@@ -123,7 +123,7 @@ MAKER_UNDERCUT      = 0.02   # ✅ v10.25 — 2¢ sous le prix (meilleure chance
 # ✅ #1 — Exécution fill-aware: on confirme le fill RÉEL au lieu de supposer l'ordre rempli
 FILL_WAIT_S         = 3.0    # grâce laissée au maker GTC pour être rempli avant annulation
 FILL_TAKER_WAIT_S   = 1.5    # délai de vérif du fill après bascule taker (croise le spread)
-MAKER_RETRY_WINDOW_S = 10.0  # ✅ (22/06) réessaie le maker (re-prix) ~10s — maker-only, plus de bascule taker
+MAKER_RETRY_WINDOW_S = 1.0   # ✅ (22/06) demande user: réessaie le maker ~1s seulement, puis bascule taker si pas rempli
 # Calibration sigma (auto-correction de VOL_SAFETY après N trades)
 CALIB_MIN_TRADES    = 30     # Trades mini avant d'auto-calibrer
 # Kill-switch drawdown
@@ -206,8 +206,8 @@ TDS_TOKEN_MAX        = 0.72
 SHADOW_DOWN_ENABLED      = True   # passer à False pour désactiver le shadow logging
 SHADOW_DOWN_GAP_MIN      = 0.005  # gap positif minimum (spot encore au-dessus oracle figé)
 SHADOW_DOWN_DELTA_MIN    = 0.010  # |delta négatif| minimum (oracle descend de façon nette)
-ORACLE_WINDOW_START = 40    # ✅ (22/06) demande user: fenêtre resserrée T-40s→T-10s
-ORACLE_WINDOW_END   = 10    # ✅ (22/06) demande user: fenêtre resserrée T-40s→T-10s
+ORACLE_WINDOW_START = 45    # ✅ (22/06) demande user: fenêtre T-45s→T-5s (fin abaissée de T-10s)
+ORACLE_WINDOW_END   = 5     # ✅ (22/06) demande user: fenêtre T-45s→T-5s (fin abaissée de T-10s)
 # ✅ v10.36 — Filtres WR validés par étude live (medium.com/@gwrx2005, mars 2026)
 # Source: filtre 10min → -93% pertes, seuils relevés → -73% fréquence = bien meilleur WR
 ORACLE_DELTA_CONTRA_MAX = 0.03  # Si votes=1/3, delta contre doit être < 0.03% sinon skip
@@ -225,7 +225,7 @@ POLY_FEE            = 0.02 # Legacy: estimation flat pour le paper mode uniqueme
 MAX_CONSEC_LOSS     = 2
 COOLDOWN_MIN        = 0      # v12.4
 MAX_TRADES_PER_H    = 3    # ✅ v10.26 — Max 3/heure (supprimé la limite 1, garde-fou à 3)
-CONSERVATIVE_AFTER_LOSSES = 2
+CONSERVATIVE_AFTER_LOSSES = 3  # ✅ (22/06) demande user: mode conservateur après 3 pertes consécutives (était 2)
 BOOST_AFTER_WINS    = 999
 DAILY_LOSS_MAX      = 0.99  # v12.4
 DAILY_PAUSE_H       = 3
@@ -976,10 +976,9 @@ class PolyClient:
             except Exception as e:
                 log.error(f"place_order v2: {e}")
             return None
-        # ✅ (22/06) demande user: MAKER UNIQUEMENT — plus de fallback taker ici non plus (cas client v1,
-        # ne devrait normalement pas arriver puisque v2 s'init en premier). Avant: faisait un taker silencieux.
-        log.warning("place_order: client v1 (pas de GTC maker dispo) — pas de taker, ordre abandonné (maker-only)")
-        return None
+        # ✅ (22/06) demande user: taker restauré en fallback (cas client v1, ne devrait normalement
+        # pas arriver puisque v2 s'init en premier, mais si ça arrive on ne veut pas rester sans rien).
+        return await self.place_market_order(token_id, amount_usdc, side)
 
     async def place_market_order(self,token_id,amount_usdc,side="BUY"):
         if not self.ready or not self.client: return None
@@ -3031,7 +3030,7 @@ async def job_funding_rate(context):
         except Exception as e:
             log.debug(f"funding {asset}: {e}")
 
-
+async def job_ws_watchdog_all(context):
     """✅ v10.23 — Garde TOUS les WS en vie (Binance + Coinbase + Kraken + Oracle)"""
     if st.ws_task is None or st.ws_task.done():
         st.ws_task = asyncio.create_task(ws_binance_loop())
@@ -3639,21 +3638,32 @@ async def place_bet(context, direction, amount, conf, reasoning, conf_score, ses
             taker_blocked = False  # True si annulation maker incertaine → on s'interdit le taker (anti-doublon)
 
             if bal0 is None:
-                # ✅ (22/06) demande user: MAKER UNIQUEMENT, plus aucun ordre taker. Solde non vérifiable
-                # (client v1) → 1 tentative maker; si rejetée, pas de fallback taker, on abandonne ce slot.
+                # ✅ (22/06) demande user: taker restauré en fallback. Solde non vérifiable (client v1)
+                # → 1 maker supposé rempli, sinon taker direct.
                 order_id = await poly.place_order(token_used, first_amount, entry_tp, "BUY")
                 if order_id:
                     filled = True; fill_type = "assumed"
                 else:
-                    log.info(f"{asset}: maker rejeté (solde non vérifiable) — pas de taker (maker-only), abandon")
-                    log_skip(f"{asset}: maker rejeté, pas de taker (maker-only)", direction)
-                    st.asset_trade_slot[asset] = 0
-                    return False
+                    log.info(f"{asset}: maker rejeté, taker direct (solde non vérifiable)")
+                    order_id = await poly.place_market_order(token_used, first_amount, "BUY")
+                    if not order_id:
+                        await send(context.bot,"⚠️ *Ordre Polymarket refusé — réessai prochain slot*"); st.asset_trade_slot[asset] = 0; return False
+                    filled = True; fill_type = "taker"
             else:
+                # ✅ (22/06) demande user: délai maker ADAPTATIF au temps réel restant avant la fin du
+                # slot (market_end), au lieu d'une constante fixe. Avec la fenêtre élargie jusqu'à T-5s,
+                # un signal tardif peut n'avoir que ~5s de marge — attendre 3s pile pour 1 seul check de
+                # fill prendrait 60% de ce qui reste. On répartit le temps dispo: 40% du temps restant
+                # pour l'attente de fill (plafonné à FILL_WAIT_S, plancher 0.5s), 50% pour la fenêtre de
+                # retry maker globale (plafonné à MAKER_RETRY_WINDOW_S). Loin de la fin (signal précoce
+                # T-45s par ex), ça revient simplement aux constantes normales (plein temps disponible).
+                time_left = max(0.0, market_end - time.time())
+                fill_wait = max(0.5, min(FILL_WAIT_S, time_left * 0.4))
+                retry_window = max(0.5, min(MAKER_RETRY_WINDOW_S, time_left * 0.5))
                 # ✅ (21/06) demande user: on RÉESSAIE le maker (re-prix frais à chaque tentative) pendant
-                # ~MAKER_RETRY_WINDOW_S secondes avant de basculer en taker. Chaque tentative: pose GTC,
-                # attend FILL_WAIT_S, vérifie le fill; si non rempli ET annulation propre → reboucle.
-                maker_deadline = time.time() + MAKER_RETRY_WINDOW_S
+                # ~retry_window secondes avant de basculer en taker. Chaque tentative: pose GTC,
+                # attend fill_wait, vérifie le fill; si non rempli ET annulation propre → reboucle.
+                maker_deadline = time.time() + retry_window
                 attempt = 0
                 while time.time() < maker_deadline and not filled:
                     attempt += 1
@@ -3661,10 +3671,10 @@ async def place_bet(context, direction, amount, conf, reasoning, conf_score, ses
                     ref_px = fresh if fresh > 0 else entry_tp
                     mid = await poly.place_order(token_used, first_amount, ref_px, "BUY")  # maker GTC
                     if not mid:
-                        log.info(f"{asset}: maker rejeté (essai {attempt}) — abandon ce slot (maker-only)")
+                        log.info(f"{asset}: maker rejeté (essai {attempt}) — bascule taker")
                         break  # maker pas sur le book → taker safe plus bas
                     order_id = mid
-                    await asyncio.sleep(FILL_WAIT_S)
+                    await asyncio.sleep(fill_wait)
                     # Rempli pendant l'attente ? (solde CLOB en retard → poll avec retry)
                     bal1 = await poly.get_position_size_polled(token_used, bal0)
                     if bal1 is not None and bal1 > bal0:
@@ -3692,16 +3702,22 @@ async def place_bet(context, direction, amount, conf, reasoning, conf_score, ses
                         break
                     # Annulation propre + non rempli → on reboucle (re-post maker à prix frais) si fenêtre restante
                     log.info(f"{asset}: maker non rempli (essai {attempt}), reprise…")
-                # ✅ (22/06) demande user: MAKER UNIQUEMENT. Maker épuisé sans fill ET annulation toujours
-                # propre → on N'ENVOIE PLUS d'ordre taker, on abandonne simplement ce slot (pas de fill).
+                # ✅ Repli TAKER: maker épuisé sans fill ET annulation toujours propre (pas de risque doublon)
                 if not filled and not taker_blocked:
-                    # Dernière vérif solde (faux no-fill possible: fill maker tardif détecté en retard)
+                    # Dernière vérif solde avant de croiser (faux no-fill possible: fill maker tardif)
                     bconf = await poly.get_position_size_polled(token_used, bal0, tries=4, delay=0.8)
                     if bconf is not None and bconf > bal0:
                         filled = True; fill_type = "maker"; real_shares = round(bconf - bal0, 4)
                     else:
-                        log.info(f"{asset}: maker non rempli après ~{MAKER_RETRY_WINDOW_S:.0f}s — abandon (maker-only, pas de taker)")
-                        filled = False; fill_type = "none"
+                        log.info(f"{asset}: maker non rempli après ~{retry_window:.1f}s (adaptatif) → taker")
+                        order_id = await poly.place_market_order(token_used, first_amount, "BUY")
+                        if order_id:
+                            bal2 = await poly.get_position_size_polled(token_used, bal0, tries=4, delay=0.8)
+                            filled = (bal2 is not None and bal2 > bal0)
+                            fill_type = "taker" if filled else "none"
+                            if filled: real_shares = round(bal2 - bal0, 4)
+                        else:
+                            filled = False
             # ✅ (21/06) COÛT RÉEL frais inclus = débit cash USDC pendant l'ordre (usdc0 - usdc1).
             if filled and real_shares and real_shares > 0:
                 usdc1 = await fetch_clob_balance()
@@ -5947,7 +5963,10 @@ PARAMÈTRES ACTUELS:
 - MEAN-REVERSION (BTC/ETH/SOL/XRP): Bollinger Bandwidth≤0.12% (régime squeeze) | parie contre un spike (prix hors bandes 2σ) | tok 0.51$-0.70$ | Kelly dédié 1-3% BR (3ème fenêtre, même T-150s→T-60s, régime complémentaire au momentum — squeeze vs expansion). Stratégie NOUVELLE, seuils à calibrer avec données réelles. Extension ETH/SOL/XRP NOUVELLE (17/06).
 - CONFLUENCE (BTC/ETH/SOL/XRP, 4ème stratégie /conf): TDS = oracle_score(gap≥0.025%, fort≥0.060%) × setup_score(mean-rev ou momentum, UNIQUEMENT si aligné avec le biais oracle) × (1-noise_penalty si chop détecté) | seuil TDS≥0.35 | tok 0.52$-0.72$ | Kelly dédié 1-3% BR avec SIZING DYNAMIQUE (confidence 0.7x à TDS=seuil → 1.3x à TDS=1.0, toujours capé 1-3% BR) | même fenêtre T-150s→T-60s. Poids adaptatifs MR/momentum ajustés UNIQUEMENT après ≥20 trades par branche (neutres sinon — anti-overfitting). Stratégie TRÈS NOUVELLE (17/06), tous les seuils sont des points de départ raisonnés à calibrer en priorité avec les premières données réelles.
 - Commun: delta≥0.020% | token BTC 0.51$-0.80$ (exceptions: ret3s≤+0.010% OU delta≥0.114%+gap≥0.060%) | ETH/XRP/SOL(votes≤-1) token max 0.95$ | EV≥{int(ORACLE_EDGE_MIN_BTC*100)}% pour BTC oracle lag, EV≥{int(ORACLE_EDGE_MIN_ALT*100)}% pour ETH/SOL/XRP oracle lag (abaissé à 5% le 22/06 sur demande user — ⚠️ RISQUE: seuil bas jamais validé en réel, surveiller via /edge et remonter si l'écart EV théorique/réalisé est négatif), EV≥15% pour momentum/meanrev/confluence | votes≥2 (consensus pour la direction parié, pas score brut)
-- ✅ (22/06) MAKER UNIQUEMENT sur oracle lag: plus aucun fallback taker (2 chemins fermés). Effet attendu: moins de trades exécutés (no-fill si le maker ne se remplit pas dans MAKER_RETRY_WINDOW_S), mais zéro frais taker. Surveiller le taux de no-fill via /exec.
+- ✅ (22/06) Maker en priorité (zéro frais + rebate), TAKER en fallback si pas rempli. Délai d'attente
+  maker ADAPTATIF (pas une constante fixe): proportionnel au temps réel restant avant la fin du slot —
+  signal précoce (proche T-45s) = plein temps normal (~3s/tentative, jusqu'à 1s de fenêtre retry),
+  signal tardif (proche T-5s) = bascule taker quasi immédiate pour ne pas rater le slot.
 - ✅ (22/06) Confirmations additionnelles oracle lag (petit bonus +0.02 à p_oracle, jamais un gate dur): (1) OB microprice+OFI LISSÉS sur ~5s avec exigence de persistance ≥70% (remplace l'ancienne lecture instantanée bruitée) — BTC/ETH/SOL seulement, XRP=0 (pas de flux OB XRP); (2) pression de liquidation Binance Futures nette ≥{LIQ_PRESSURE_MIN_USD}$ sur {LIQ_PRESSURE_WINDOW_S}s (mécanique directe: short liquidé→achat forcé→haussier, et inversement) — 4 cryptos. Funding rate Binance collecté et affiché via /oracle mais PAS ENCORE branché dans p_oracle (sens prédictif continuation vs retour à la moyenne pas encore validé empiriquement — ne pas en inventer un sans données).
 - BTC deltaneg: bloqué sauf si gap≥0.040% ET ret3s>-0.050% (exception validée 9W/3L)
 - ETH/SOL/XRP deltaneg: seuil strict -0.010% (0% WR historique si assoupli)
