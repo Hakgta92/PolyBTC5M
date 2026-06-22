@@ -123,7 +123,7 @@ MAKER_UNDERCUT      = 0.02   # ✅ v10.25 — 2¢ sous le prix (meilleure chance
 # ✅ #1 — Exécution fill-aware: on confirme le fill RÉEL au lieu de supposer l'ordre rempli
 FILL_WAIT_S         = 3.0    # grâce laissée au maker GTC pour être rempli avant annulation
 FILL_TAKER_WAIT_S   = 1.5    # délai de vérif du fill après bascule taker (croise le spread)
-MAKER_RETRY_WINDOW_S = 10.0  # ✅ (21/06) demande user: réessaie le maker (re-prix) ~10s avant taker
+MAKER_RETRY_WINDOW_S = 10.0  # ✅ (22/06) réessaie le maker (re-prix) ~10s — maker-only, plus de bascule taker
 # Calibration sigma (auto-correction de VOL_SAFETY après N trades)
 CALIB_MIN_TRADES    = 30     # Trades mini avant d'auto-calibrer
 # Kill-switch drawdown
@@ -140,7 +140,7 @@ ORACLE_EDGE_MIN     = 0.15  # v12.4  # EV minimum — 15% (momentum/meanrev/conf
 # ✅ v12.9 (18/06) — EV oracle lag ETH/SOL/XRP abaissé 15%→10% (demande user). ⚠️ RISQUE DOCUMENTÉ:
 # les ev-skips ETH/SOL historiques sont 0W/7L (que des pertes dans cette zone). XRP non mesuré.
 # Surveillance OBLIGATOIRE: si les 1ers trades ETH/SOL/XRP à EV 10-15% perdent, remonter à 15%.
-ORACLE_EDGE_MIN_ALT = 0.10
+ORACLE_EDGE_MIN_ALT = 0.05  # ✅ (22/06) demande user: EV mini oracle lag abaissé à 5%
 # ✅ v12.9 (18/06) — STRATÉGIE OB SIGNAL (demande user, basée sur slot recorder: OB acheteur→73% UP n=237,
 # OB vendeur→88% DOWN n=156, sur marché neutre). Trade dans le sens du carnet quand l'imbalance est nette.
 # ⚠️ NON VALIDÉ en exécution réelle (le 73% est mesuré à la résolution, possible look-ahead). Mise mini, surveillance.
@@ -162,7 +162,7 @@ OB_DISAGREE_PCT       = 0.02   # 2% du bankroll
 # l'EV semblait sous-estimé par le token élevé au dénominateur). UNIQUEMENT BTC oracle lag — ETH/SOL/XRP
 # restent à 15% car leurs ev-skips sont 0W/7L (baisser = acheter des pertes). Surveillance rapprochée:
 # si les 1ers trades BTC à EV 8-15% perdent, remonter à 15%.
-ORACLE_EDGE_MIN_BTC = 0.08
+ORACLE_EDGE_MIN_BTC = 0.05  # ✅ (22/06) demande user: EV mini oracle lag abaissé à 5%
 
 # ✅ (21/06) demande user — FIABILISATION oracle_lag (#1→#5):
 # #1 Marge de sécurité dépendante du temps: la résolution = oracle_close vs oracle_open, donc le delta
@@ -204,8 +204,8 @@ TDS_TOKEN_MAX        = 0.72
 SHADOW_DOWN_ENABLED      = True   # passer à False pour désactiver le shadow logging
 SHADOW_DOWN_GAP_MIN      = 0.005  # gap positif minimum (spot encore au-dessus oracle figé)
 SHADOW_DOWN_DELTA_MIN    = 0.010  # |delta négatif| minimum (oracle descend de façon nette)
-ORACLE_WINDOW_START = 70    # ✅ (21/06) demande user: fenêtre resserrée T-70s→T-20s (était T-90s puis T-125s→T-30s)
-ORACLE_WINDOW_END   = 20    # ✅ (21/06) demande user: fenêtre resserrée T-70s→T-20s (était T-90s puis T-125s→T-30s)
+ORACLE_WINDOW_START = 40    # ✅ (22/06) demande user: fenêtre resserrée T-40s→T-10s
+ORACLE_WINDOW_END   = 10    # ✅ (22/06) demande user: fenêtre resserrée T-40s→T-10s
 # ✅ v10.36 — Filtres WR validés par étude live (medium.com/@gwrx2005, mars 2026)
 # Source: filtre 10min → -93% pertes, seuils relevés → -73% fréquence = bien meilleur WR
 ORACLE_DELTA_CONTRA_MAX = 0.03  # Si votes=1/3, delta contre doit être < 0.03% sinon skip
@@ -955,8 +955,10 @@ class PolyClient:
             except Exception as e:
                 log.error(f"place_order v2: {e}")
             return None
-        # v1 fallback: market
-        return await self.place_market_order(token_id, amount_usdc, side)
+        # ✅ (22/06) demande user: MAKER UNIQUEMENT — plus de fallback taker ici non plus (cas client v1,
+        # ne devrait normalement pas arriver puisque v2 s'init en premier). Avant: faisait un taker silencieux.
+        log.warning("place_order: client v1 (pas de GTC maker dispo) — pas de taker, ordre abandonné (maker-only)")
+        return None
 
     async def place_market_order(self,token_id,amount_usdc,side="BUY"):
         if not self.ready or not self.client: return None
@@ -2380,7 +2382,8 @@ async def _resolve_expired_bet(context, asset="BTC"):
         "score":bet.get("score",0),"fg_value":st.fg.get("value",50),
         "session":bet.get("session","?"),"aligned_15h1h":True,"source":bet.get("source","?"),
         "asset":bet_asset,"entry_token":bet.get("entry_token",0),"t_remaining":bet.get("t_remaining",0),
-        "fill_type":bet.get("fill_type","?"),"fee_est":bet.get("fee_est",0)})
+        "fill_type":bet.get("fill_type","?"),"fee_est":bet.get("fee_est",0),
+        "cost":cost,"shares":shares})  # ✅ (22/06) coût/shares RÉELS pour le calcul d'edge réaliste (/edge)
     setattr(st, f"bet{sfx}", None); setattr(st, f"active_token_id{sfx}", None); setattr(st, f"active_order_id{sfx}", None)
     setattr(st, f"shares_bought{sfx}", 0); setattr(st, f"entry_token_price{sfx}", 0); setattr(st, f"bet_expiry{sfx}", 0)
     setattr(st, f"expiry_alerted{sfx}", False)  # ✅ (21/06) reset flag alerte T-30s à la clôture
@@ -3103,25 +3106,32 @@ def edge_scorecard(include_paper_if_few=True):
         wr = wins / n
         wlo = _wilson_lower(wins, n)
         roi = total / staked * 100
+        # ✅ (22/06) demande user: edge RÉALISTE — EV théorique affiché à l'entrée (conf-entry_token-fee)
+        # vs ROI réellement réalisé. L'écart mesure le coût caché (slippage, calibration, exécution).
+        ev_theos = [float(t.get("conf",0) or 0) - float(t.get("entry_token",0) or 0) - float(t.get("fee_est",0) or 0)
+                    for t in grp if t.get("entry_token")]
+        ev_theo_avg = (sum(ev_theos)/len(ev_theos)*100) if ev_theos else 0.0
         if n < 20:           verdict = "⚠️ n<20"
         elif total <= 0:     verdict = "🔴 perdant"
         elif tstat >= 2.0:   verdict = "✅ rentable (signif.)"
         else:                verdict = "🟡 positif (non signif.)"
-        return n, wr, wlo, total, mean, roi, tstat, verdict
+        return n, wr, wlo, total, mean, roi, tstat, verdict, ev_theo_avg
 
     by_src = {}
     for t in real:
         by_src.setdefault(t.get("source","?"), []).append(t)
 
     lines = [f"📊 *EDGE SCORECARD* ({mode})", "━━━━━━━━━━━━━━"]
-    n,wr,wlo,total,mean,roi,tstat,verdict = stats(real)
+    n,wr,wlo,total,mean,roi,tstat,verdict,ev_theo = stats(real)
     lines.append(f"*GLOBAL* n={n} | PnL `{total:+.2f}$` | ROI `{roi:+.1f}%`")
     lines.append(f"  WR `{wr*100:.0f}%` (min `{wlo*100:.0f}%`) | t=`{tstat:.1f}` | {verdict}")
+    lines.append(f"  EV théorique entrée: `{ev_theo:+.1f}%` vs ROI réalisé: `{roi:+.1f}%` → écart `{roi-ev_theo:+.1f}pt` _(slippage/calib)_")
     lines.append("")
     for src, grp in sorted(by_src.items(), key=lambda kv: -sum(float(t.get('pnl',0) or 0) for t in kv[1])):
-        n,wr,wlo,total,mean,roi,tstat,verdict = stats(grp)
+        n,wr,wlo,total,mean,roi,tstat,verdict,ev_theo = stats(grp)
         lines.append(f"*{src}* n={n} | PnL `{total:+.2f}$` `{mean:+.2f}/t` | ROI `{roi:+.1f}%`")
         lines.append(f"  WR `{wr*100:.0f}%` (min `{wlo*100:.0f}%`) | t=`{tstat:.1f}` | {verdict}")
+        lines.append(f"  EV théorique: `{ev_theo:+.1f}%` vs réalisé: `{roi:+.1f}%` → écart `{roi-ev_theo:+.1f}pt`")
     lines.append("")
     lines.append("_t≥2 = edge réel (95%). Coupe les 🔴. Scale les ✅. Attends n≥20-30 pour les ⚠️._")
     return "\n".join(lines)
@@ -3537,16 +3547,16 @@ async def place_bet(context, direction, amount, conf, reasoning, conf_score, ses
             taker_blocked = False  # True si annulation maker incertaine → on s'interdit le taker (anti-doublon)
 
             if bal0 is None:
-                # Solde non vérifiable (client v1) → ancien comportement: 1 maker supposé rempli, sinon taker.
+                # ✅ (22/06) demande user: MAKER UNIQUEMENT, plus aucun ordre taker. Solde non vérifiable
+                # (client v1) → 1 tentative maker; si rejetée, pas de fallback taker, on abandonne ce slot.
                 order_id = await poly.place_order(token_used, first_amount, entry_tp, "BUY")
                 if order_id:
                     filled = True; fill_type = "assumed"
                 else:
-                    log.info(f"{asset}: maker rejeté, taker direct (solde non vérifiable)")
-                    order_id = await poly.place_market_order(token_used, first_amount, "BUY")
-                    if not order_id:
-                        await send(context.bot,"⚠️ *Ordre Polymarket refusé — réessai prochain slot*"); st.asset_trade_slot[asset] = 0; return False
-                    filled = True; fill_type = "taker"
+                    log.info(f"{asset}: maker rejeté (solde non vérifiable) — pas de taker (maker-only), abandon")
+                    log_skip(f"{asset}: maker rejeté, pas de taker (maker-only)", direction)
+                    st.asset_trade_slot[asset] = 0
+                    return False
             else:
                 # ✅ (21/06) demande user: on RÉESSAIE le maker (re-prix frais à chaque tentative) pendant
                 # ~MAKER_RETRY_WINDOW_S secondes avant de basculer en taker. Chaque tentative: pose GTC,
@@ -3559,7 +3569,7 @@ async def place_bet(context, direction, amount, conf, reasoning, conf_score, ses
                     ref_px = fresh if fresh > 0 else entry_tp
                     mid = await poly.place_order(token_used, first_amount, ref_px, "BUY")  # maker GTC
                     if not mid:
-                        log.info(f"{asset}: maker rejeté (essai {attempt}) — bascule taker")
+                        log.info(f"{asset}: maker rejeté (essai {attempt}) — abandon ce slot (maker-only)")
                         break  # maker pas sur le book → taker safe plus bas
                     order_id = mid
                     await asyncio.sleep(FILL_WAIT_S)
@@ -3590,22 +3600,16 @@ async def place_bet(context, direction, amount, conf, reasoning, conf_score, ses
                         break
                     # Annulation propre + non rempli → on reboucle (re-post maker à prix frais) si fenêtre restante
                     log.info(f"{asset}: maker non rempli (essai {attempt}), reprise…")
-                # ✅ Repli TAKER: maker épuisé sans fill ET annulation toujours propre (pas de risque doublon)
+                # ✅ (22/06) demande user: MAKER UNIQUEMENT. Maker épuisé sans fill ET annulation toujours
+                # propre → on N'ENVOIE PLUS d'ordre taker, on abandonne simplement ce slot (pas de fill).
                 if not filled and not taker_blocked:
-                    # Dernière vérif solde avant de croiser (faux no-fill possible: fill maker tardif)
+                    # Dernière vérif solde (faux no-fill possible: fill maker tardif détecté en retard)
                     bconf = await poly.get_position_size_polled(token_used, bal0, tries=4, delay=0.8)
                     if bconf is not None and bconf > bal0:
                         filled = True; fill_type = "maker"; real_shares = round(bconf - bal0, 4)
                     else:
-                        log.info(f"{asset}: maker non rempli après ~{MAKER_RETRY_WINDOW_S:.0f}s → taker")
-                        order_id = await poly.place_market_order(token_used, first_amount, "BUY")
-                        if order_id:
-                            bal2 = await poly.get_position_size_polled(token_used, bal0, tries=4, delay=0.8)
-                            filled = (bal2 is not None and bal2 > bal0)
-                            fill_type = "taker" if filled else "none"
-                            if filled: real_shares = round(bal2 - bal0, 4)
-                        else:
-                            filled = False
+                        log.info(f"{asset}: maker non rempli après ~{MAKER_RETRY_WINDOW_S:.0f}s — abandon (maker-only, pas de taker)")
+                        filled = False; fill_type = "none"
             # ✅ (21/06) COÛT RÉEL frais inclus = débit cash USDC pendant l'ordre (usdc0 - usdc1).
             if filled and real_shares and real_shares > 0:
                 usdc1 = await fetch_clob_balance()
@@ -4135,12 +4139,12 @@ async def job_oracle_lag(context):
     cur_slot = int(now // 300) * 300
     slot_remaining = cur_slot + 300 - now
     # ✅ v12.9 — Régime trendsession: >60% deltaneg → resserrer le DÉBUT (entrer plus tard, plus près de la décision)
-    # ✅ (21/06) FIX: l'ancien floor fixe à 90 dépassait désormais ORACLE_WINDOW_START (70) → ça ÉLARGISSAIT
-    # la fenêtre en régime baissier au lieu de la resserrer (effet inverse de l'intention). On borne
-    # maintenant par min(défaut, floor) pour garantir que ce régime ne fait QUE resserrer, jamais élargir.
+    # ✅ (22/06) FIX permanent: resserrement = milieu de la fenêtre configurée (proportionnel), au lieu
+    # d'un floor codé en dur qui redevenait un no-op (ou pire, un élargissement) chaque fois que la
+    # fenêtre ORACLE_WINDOW_START/END change. Reste toujours strictement plus tardif que le défaut.
     recent_30=[p for p in st.pass_reasons if now-p.get("ts",0)<=1800]
     dn_ratio=sum(1 for p in recent_30 if "delta" in p.get("reason","").lower() and "<0" in p.get("reason",""))/max(len(recent_30),1)
-    btc_win_start=min(ORACLE_WINDOW_START, max(ORACLE_WINDOW_END+30, 50)) if dn_ratio>0.60 else ORACLE_WINDOW_START
+    btc_win_start=(ORACLE_WINDOW_START+ORACLE_WINDOW_END)/2 if dn_ratio>0.60 else ORACLE_WINDOW_START
     if slot_remaining > btc_win_start or slot_remaining < ORACLE_WINDOW_END: return
 
     _resolve_pending_passes()  # ✅ v12.9 — Résolution immédiate
@@ -4335,6 +4339,15 @@ async def job_oracle_lag(context):
     amount = kelly_bet_oracle(st.bankroll, p_oracle, payout, token_price, votes=votes_for_direction)
     if amount < MIN_BET_USD: return
 
+    # ✅ (22/06) FIX race condition: verrou posé ICI (avant le await place_bet, qui peut prendre
+    # plusieurs secondes via les retries maker/taker) au lieu d'après. Avant: si job_oracle_lag était
+    # re-déclenché pendant qu'un place_bet précédent était encore en cours (await), son propre check
+    # externe était périmé et une 2e/3e tentative pouvait passer → plusieurs achats réels sur le même
+    # slot BTC (vu: 3 achats UP à tailles différentes en ~1min). Le verrou interne asset_trade_slot
+    # protège la plupart du temps mais certains chemins de retry le relâchent avant qu'un ordre touche
+    # l'exchange — cette fenêtre est désormais fermée côté oracle_lag aussi.
+    st.last_trade_slot = cur_slot
+
     # ✅ tpu/tpd doivent être des PRIX (float), pas les token_id (string) — sinon TypeError
     # str/int dès que place_bet compare entry_tp>0 (mode paper ou fallback prix).
     tpu = token_price if direction=="UP" else round(max(0.01,1-token_price),4)
@@ -4351,7 +4364,6 @@ async def job_oracle_lag(context):
     if not ok: return
     if st.bet: st.bet["calib_bucket"] = calib_bucket  # ✅ #2 — mémorise le bucket pour MAJ à la résolution
 
-    st.last_trade_slot = cur_slot
     mode = "💰 RÉEL" if not st.paper_mode else "📄 paper"
     # ✅ (21/06) fallback prix: si l'entrée réelle mesurée est 0 (fill non vu), afficher le prix token pré-ordre.
     entry_tp = (st.entry_token_price or token_price) if not st.paper_mode else token_price
@@ -4584,6 +4596,12 @@ async def job_oracle_lag_asset(context, asset:str):
     # ✅ demande user 21/06: Kelly DÉDIÉ oracle_lag ciblant 3-4% du BR, toutes cryptos (cf. BTC).
     amount=kelly_bet_oracle(st.bankroll,p_oracle,payout,token_price,votes=votes_for_direction)
     if amount<MIN_BET_USD: return
+    # ✅ (22/06) même fix que BTC: verrou posé ICI (avant le await place_bet) au lieu d'après, pour
+    # fermer la fenêtre de race condition (job_oracle_lag_asset re-déclenché pendant un place_bet
+    # encore en cours via ses retries maker/taker → doublons réels sur le même slot/asset).
+    if asset=="ETH": st.eth_last_trade_slot=cur_slot
+    elif asset=="SOL": st.sol_last_trade_slot=cur_slot
+    elif asset=="XRP": st.xrp_last_trade_slot=cur_slot
     # ✅ tpu/tpd = PRIX (float), pas token_id (string) — cf. fix job_oracle_lag BTC
     tpu = token_price if direction=="UP" else round(max(0.01,1-token_price),4)
     tpd = token_price if direction=="DOWN" else round(max(0.01,1-token_price),4)
@@ -4594,9 +4612,6 @@ async def job_oracle_lag_asset(context, asset:str):
     if not ok: return
     _b = getattr(st, f"bet{_possfx(asset)}")
     if _b: _b["calib_bucket"] = calib_bucket  # ✅ #2 — mémorise le bucket pour MAJ à la résolution
-    if asset=="ETH": st.eth_last_trade_slot=cur_slot
-    elif asset=="SOL": st.sol_last_trade_slot=cur_slot
-    elif asset=="XRP": st.xrp_last_trade_slot=cur_slot
     mode="💰 RÉEL" if not st.paper_mode else "📄 paper"
     # ✅ FIX: utilisait st.entry_token_price / st.bet (variables BTC, sans suffixe) au lieu des
     # versions PAR ASSET → affichait un prix/montant faux (souvent figé sur la dernière valeur BTC)
