@@ -141,6 +141,8 @@ ORACLE_EDGE_MIN     = 0.15  # v12.4  # EV minimum — 15% (momentum/meanrev/conf
 # les ev-skips ETH/SOL historiques sont 0W/7L (que des pertes dans cette zone). XRP non mesuré.
 # Surveillance OBLIGATOIRE: si les 1ers trades ETH/SOL/XRP à EV 10-15% perdent, remonter à 15%.
 ORACLE_EDGE_MIN_ALT = 0.05  # ✅ (22/06) demande user: EV mini oracle lag abaissé à 5%
+LIQ_PRESSURE_WINDOW_S = 30      # ✅ (22/06) demande user: fenêtre de mesure pression liquidations (s)
+LIQ_PRESSURE_MIN_USD  = 50000   # ✅ (22/06) seuil minimum (USD net) pour considérer le signal liquidation fiable
 # ✅ v12.9 (18/06) — STRATÉGIE OB SIGNAL (demande user, basée sur slot recorder: OB acheteur→73% UP n=237,
 # OB vendeur→88% DOWN n=156, sur marché neutre). Trade dans le sens du carnet quand l'imbalance est nette.
 # ⚠️ NON VALIDÉ en exécution réelle (le 73% est mesuré à la résolution, possible look-ahead). Mise mini, surveillance.
@@ -492,6 +494,25 @@ def oracle_calib_update(bucket, won):
     rec[0] += 1 if won else 0
     rec[1] += 1
     st.oracle_calib[bucket] = rec
+
+def ob_persistent_signal(asset, micro_sig, ofi):
+    """✅ (22/06) demande user: LISSAGE + PERSISTANCE du signal OB (microprice/OFI) du carnet Polymarket.
+    Une lecture instantanée unique est du bruit exploitable (spoofing/iceberg) — on exige que le signal
+    garde le MÊME sens sur plusieurs lectures récentes (~5s, min 3 échantillons, ≥70% d'accord) avant
+    de le considérer fiable. Retourne (micro_lissé, ofi_lissé, persistant:bool)."""
+    now = time.time()
+    hist = st.ob_hist.setdefault(asset, deque(maxlen=8))
+    hist.append((now, micro_sig, ofi))
+    recent = [h for h in hist if now - h[0] <= 5.0]
+    if len(recent) < 3:
+        return micro_sig, ofi, False
+    micro_vals = [h[1] for h in recent]; ofi_vals = [h[2] for h in recent]
+    micro_smooth = sum(micro_vals)/len(micro_vals)
+    ofi_smooth = sum(ofi_vals)/len(ofi_vals)
+    micro_agree = sum(1 for v in micro_vals if (v>0)==(micro_smooth>0)) / len(micro_vals)
+    ofi_agree = sum(1 for v in ofi_vals if (v>0)==(ofi_smooth>0)) / len(ofi_vals)
+    persistent = micro_agree >= 0.7 and ofi_agree >= 0.7
+    return round(micro_smooth,4), round(ofi_smooth,2), persistent
 
 def compute_vol_vote(volumes, direction, now):
     """✅ Vote volume (job_oracle_lag, toutes cryptos) — confirme la direction si spike de volume
@@ -1912,6 +1933,12 @@ class State:
         self.daily_start=50.0; self.daily_ts=time.time()
         self.daily_pause_until=0
         self.skipped=0; self.pass_reasons=[]
+        self.ob_hist={}  # ✅ (22/06) historique récent micro_sig/ofi par asset, pour lissage+persistance
+        # ✅ (22/06) demande user: liquidations + funding rate Binance Futures (nouveau outil oracle lag)
+        self.liq_hist={}      # {asset: deque[(ts, side, notional_usd)]} — flux !forceOrder@arr
+        self.liq_ws_task=None
+        self.funding_rate={}  # {asset: dernier funding rate connu (ex: 0.0001 = 0.01%/8h)}
+        self.funding_ts={}    # {asset: ts de la dernière lecture}
         # ✅ v10.37 — Auto-apprentissage
         self.oracle_patterns=[]          # [{gap,delta,ret3s,votes,dir,result,ts}]
         self.calibration_log=[]          # historique des ajustements auto
@@ -2942,7 +2969,69 @@ async def ws_oracle_loop():
         st.oracle_connected=False
         await asyncio.sleep(5)
 
-async def job_ws_watchdog_all(context):
+async def ws_binance_liq_loop():
+    """✅ (22/06) demande user: flux liquidations Binance Futures (!forceOrder@arr, public, sans clé).
+    Mécanique (pas spéculatif): une liquidation SELL = position LONG liquidée → vente forcée → pression
+    baissière immédiate. Une liquidation BUY = position SHORT liquidée → achat forcé → pression haussière.
+    On agrège le notionnel net (USD) par asset sur une fenêtre glissante via liq_pressure()."""
+    url = "wss://fstream.binance.com/ws/!forceOrder@arr"
+    symbol_map = {"BTCUSDT":"BTC","ETHUSDT":"ETH","SOLUSDT":"SOL","XRPUSDT":"XRP"}
+    while True:
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.ws_connect(url, heartbeat=20) as ws:
+                    log.info("✅ WS Binance liquidations connecté")
+                    async for msg in ws:
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            try:
+                                d = json.loads(msg.data)
+                                o = d.get("o", {}) if isinstance(d, dict) else {}
+                                asset = symbol_map.get(o.get("s",""))
+                                if not asset: continue
+                                side = o.get("S","")
+                                qty = float(o.get("q",0) or 0); price = float(o.get("ap", o.get("p",0)) or 0)
+                                notional = qty * price
+                                if notional <= 0: continue
+                                st.liq_hist.setdefault(asset, deque(maxlen=200)).append((time.time(), side, notional))
+                            except Exception as pe:
+                                log.debug(f"liq parse: {pe}")
+                        elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                            break
+        except Exception as e:
+            log.warning(f"WS Binance liquidations déconnecté: {e}")
+        await asyncio.sleep(5)
+
+def liq_pressure(asset, window_s=LIQ_PRESSURE_WINDOW_S):
+    """✅ (22/06) Pression NETTE de liquidations récentes (USD) sur `window_s`.
+    >0 = shorts liquidés net (achat forcé, pression haussière) | <0 = longs liquidés net (pression baissière)."""
+    hist = st.liq_hist.get(asset)
+    if not hist: return 0.0
+    now = time.time()
+    net = 0.0
+    for ts, side, notional in hist:
+        if now - ts > window_s: continue
+        net += notional if side == "BUY" else -notional
+    return net
+
+async def job_funding_rate(context):
+    """✅ (22/06) demande user: funding rate Binance Futures par asset (poll ~60s, API publique).
+    NOTE: affiché/loggé pour l'instant — PAS encore branché dans p_oracle. Le sens prédictif d'un
+    funding extrême (continuation vs squeeze/retour à la moyenne) doit être validé empiriquement
+    (cf. règle anti-biais n≥30) avant d'en faire une règle de trading, plutôt que deviner un sens."""
+    symbol_map = {"BTC":"BTCUSDT","ETH":"ETHUSDT","SOL":"SOLUSDT","XRP":"XRPUSDT"}
+    for asset, sym in symbol_map.items():
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get("https://fapi.binance.com/fapi/v1/premiumIndex", params={"symbol": sym},
+                                  timeout=aiohttp.ClientTimeout(total=5)) as r:
+                    if r.status == 200:
+                        data = await r.json()
+                        st.funding_rate[asset] = float(data.get("lastFundingRate", 0) or 0)
+                        st.funding_ts[asset] = time.time()
+        except Exception as e:
+            log.debug(f"funding {asset}: {e}")
+
+
     """✅ v10.23 — Garde TOUS les WS en vie (Binance + Coinbase + Kraken + Oracle)"""
     if st.ws_task is None or st.ws_task.done():
         st.ws_task = asyncio.create_task(ws_binance_loop())
@@ -2961,6 +3050,9 @@ async def job_ws_watchdog_all(context):
         st.sol_ws_task = asyncio.create_task(ws_sol_loop())
     if not hasattr(st,"xrp_ws_task") or not st.xrp_ws_task or st.xrp_ws_task.done():
         st.xrp_ws_task = asyncio.create_task(ws_xrp_loop())
+    # ✅ (22/06) demande user: flux liquidations Binance Futures
+    if not hasattr(st,"liq_ws_task") or not st.liq_ws_task or st.liq_ws_task.done():
+        st.liq_ws_task = asyncio.create_task(ws_binance_liq_loop())
 
 def consensus_price():
     """✅ v10.23 — Prix médian des exchanges frais (<3s). Filtre un exchange qui lag/diverge."""
@@ -4045,6 +4137,9 @@ async def ws_clob_loop(asset_id_up: str):
                                         else: ofi += pbav
                                         st.ob_ofi = round(ofi, 2)
                                     st.ob_prev_bbo = (best_bid, best_bid_vol, best_ask, best_ask_vol)
+                                    # ✅ (22/06) demande user: version lissée + persistante (exige cohérence sur ~5s)
+                                    st.ob_micro_smooth, st.ob_ofi_smooth, st.ob_persistent = ob_persistent_signal(
+                                        "BTC", getattr(st,"ob_micro_signal",0.0), getattr(st,"ob_ofi",0.0))
                         except Exception as pe: log.debug(f"CLOB BTC parse: {pe}")
                     elif msg.type in (aiohttp.WSMsgType.CLOSED,aiohttp.WSMsgType.ERROR): break
     except Exception as e: log.warning(f"WS CLOB BTC: {e}")
@@ -4122,9 +4217,11 @@ async def ws_clob_loop_asset(asset_id_up: str, asset: str):
                                     if asset=="ETH":
                                         st.eth_ob_imbalance=imb; st.eth_ob_ts=time.time(); st.eth_ob_spread=spr; st.eth_ob_depth=dep
                                         st.eth_ob_micro_signal=micro_sig; st.eth_ob_ofi=ofi
+                                        st.eth_ob_micro_smooth, st.eth_ob_ofi_smooth, st.eth_ob_persistent = ob_persistent_signal("ETH", micro_sig, ofi)
                                     else:
                                         st.sol_ob_imbalance=imb; st.sol_ob_ts=time.time(); st.sol_ob_spread=spr; st.sol_ob_depth=dep
                                         st.sol_ob_micro_signal=micro_sig; st.sol_ob_ofi=ofi
+                                        st.sol_ob_micro_smooth, st.sol_ob_ofi_smooth, st.sol_ob_persistent = ob_persistent_signal("SOL", micro_sig, ofi)
                         except Exception as pe: log.debug(f"CLOB {asset} parse: {pe}")
                     elif msg.type in (aiohttp.WSMsgType.CLOSED,aiohttp.WSMsgType.ERROR): break
     except Exception as e: log.warning(f"WS CLOB {asset}: {e}")
@@ -4313,12 +4410,22 @@ async def job_oracle_lag(context):
     if votes_for_direction >= 4: p_oracle = min(0.96, p_oracle + 0.02)
     if chainlink_age < 2.0: p_oracle = min(0.97, p_oracle + 0.03)
     # ✅ #5 — Microprice + OFI (order flow temps réel) en CONFIRMATION: petit bonus proba si les deux
-    # penchent dans le sens du trade et que le carnet est frais (<10s). Mesure-only avant, exploité ici.
-    micro_sig = getattr(st, "ob_micro_signal", 0.0); ofi = getattr(st, "ob_ofi", 0.0)
-    if time.time() - getattr(st, "ob_ts", 0) < 10:
+    # penchent dans le sens du trade et que le carnet est frais (<10s).
+    # ✅ (22/06) demande user: utilise la version LISSÉE+PERSISTANTE (cohérente sur ~5s) au lieu de la
+    # lecture instantanée — une lecture unique est du bruit exploitable (spoofing/iceberg).
+    micro_sig = getattr(st, "ob_micro_smooth", 0.0); ofi = getattr(st, "ob_ofi_smooth", 0.0)
+    persistent = getattr(st, "ob_persistent", False)
+    if persistent and time.time() - getattr(st, "ob_ts", 0) < 10:
         micro_ok = (direction=="UP" and micro_sig > 0) or (direction=="DOWN" and micro_sig < 0)
         ofi_ok   = (direction=="UP" and ofi > 0) or (direction=="DOWN" and ofi < 0)
         if micro_ok and ofi_ok: p_oracle = min(0.97, p_oracle + 0.02)
+    # ✅ (22/06) demande user: confirmation par pression de liquidation Binance Futures. Mécanique
+    # directe (pas spéculatif): cascade de shorts liquidés = achat forcé = pression haussière immédiate
+    # (et inversement pour les longs) — contrairement au funding rate, le SENS ici n'est pas ambigu.
+    liq = liq_pressure("BTC")
+    if abs(liq) >= LIQ_PRESSURE_MIN_USD:
+        liq_ok = (direction=="UP" and liq > 0) or (direction=="DOWN" and liq < 0)
+        if liq_ok: p_oracle = min(0.97, p_oracle + 0.02)
     # ✅ (21/06) #2 — Calibration empirique: remplace/ajuste p_oracle par le win-rate RÉEL observé pour ce
     # bucket (asset/signal/|delta|/votes), mélangé à la formule via shrinkage. Corrige les EV mal estimées.
     calib_bucket = oracle_bucket("BTC", primary_signal, oracle_delta, votes_for_direction)
@@ -4576,11 +4683,18 @@ async def job_oracle_lag_asset(context, asset:str):
     p_oracle=min(0.93,0.85+abs(spot_oracle_gap)*3.0) if primary_signal=="gap" else min(0.90,0.80+abs(oracle_delta)*2.0)
     if votes_for_direction>=3: p_oracle=min(0.95,p_oracle+0.03)
     # ✅ #5 — Microprice + OFI par asset en confirmation (ETH/SOL calculés par ws_clob_loop_asset; XRP=0)
-    micro_sig = getattr(st, f"{_pfx}_ob_micro_signal", 0.0); ofi = getattr(st, f"{_pfx}_ob_ofi", 0.0)
-    if time.time() - ob_ts_asset < 10:
+    # ✅ (22/06) demande user: version LISSÉE+PERSISTANTE au lieu de la lecture instantanée bruitée.
+    micro_sig = getattr(st, f"{_pfx}_ob_micro_smooth", 0.0); ofi = getattr(st, f"{_pfx}_ob_ofi_smooth", 0.0)
+    persistent = getattr(st, f"{_pfx}_ob_persistent", False)
+    if persistent and time.time() - ob_ts_asset < 10:
         micro_ok = (direction=="UP" and micro_sig > 0) or (direction=="DOWN" and micro_sig < 0)
         ofi_ok   = (direction=="UP" and ofi > 0) or (direction=="DOWN" and ofi < 0)
         if micro_ok and ofi_ok: p_oracle = min(0.96, p_oracle + 0.02)
+    # ✅ (22/06) demande user: confirmation par pression de liquidation Binance Futures (mécanique directe)
+    liq = liq_pressure(asset)
+    if abs(liq) >= LIQ_PRESSURE_MIN_USD:
+        liq_ok = (direction=="UP" and liq > 0) or (direction=="DOWN" and liq < 0)
+        if liq_ok: p_oracle = min(0.96, p_oracle + 0.02)
     # ✅ (21/06) #2 — calibration empirique p_oracle (win-rate réel du bucket, shrinkage vers la formule)
     calib_bucket = oracle_bucket(asset, primary_signal, oracle_delta, votes_for_direction)
     p_oracle = oracle_calibrated_p(p_oracle, calib_bucket)
@@ -5832,7 +5946,9 @@ PARAMÈTRES ACTUELS:
 - MOMENTUM (BTC/ETH/SOL/XRP): ret60s≥0.30% | T-150s→T-60s | tok 0.55$-0.65$ | filtre trend macro 10min (bloque si tendance 10min contraire ≥0.10%, source: étude live ayant réduit pertes -93%→-13% avec ce filtre) | Kelly dédié 1-3% BR (2ème fenêtre indépendante). Extension ETH/SOL/XRP NOUVELLE (17/06) — surveiller si ces assets, documentés plus bruités à court terme, performent moins bien que BTC.
 - MEAN-REVERSION (BTC/ETH/SOL/XRP): Bollinger Bandwidth≤0.12% (régime squeeze) | parie contre un spike (prix hors bandes 2σ) | tok 0.51$-0.70$ | Kelly dédié 1-3% BR (3ème fenêtre, même T-150s→T-60s, régime complémentaire au momentum — squeeze vs expansion). Stratégie NOUVELLE, seuils à calibrer avec données réelles. Extension ETH/SOL/XRP NOUVELLE (17/06).
 - CONFLUENCE (BTC/ETH/SOL/XRP, 4ème stratégie /conf): TDS = oracle_score(gap≥0.025%, fort≥0.060%) × setup_score(mean-rev ou momentum, UNIQUEMENT si aligné avec le biais oracle) × (1-noise_penalty si chop détecté) | seuil TDS≥0.35 | tok 0.52$-0.72$ | Kelly dédié 1-3% BR avec SIZING DYNAMIQUE (confidence 0.7x à TDS=seuil → 1.3x à TDS=1.0, toujours capé 1-3% BR) | même fenêtre T-150s→T-60s. Poids adaptatifs MR/momentum ajustés UNIQUEMENT après ≥20 trades par branche (neutres sinon — anti-overfitting). Stratégie TRÈS NOUVELLE (17/06), tous les seuils sont des points de départ raisonnés à calibrer en priorité avec les premières données réelles.
-- Commun: delta≥0.020% | token BTC 0.51$-0.80$ (exceptions: ret3s≤+0.010% OU delta≥0.114%+gap≥0.060%) | ETH/XRP/SOL(votes≤-1) token max 0.95$ | EV≥8% pour BTC oracle lag, EV≥10% pour ETH/SOL/XRP oracle lag (abaissé 15%→10% le 18/06 sur demande user — ⚠️ RISQUE: ev-skips ETH/SOL historiques 0W/7L, surveiller et remonter si pertes), EV≥15% pour momentum/meanrev/confluence | votes≥2 (consensus pour la direction parié, pas score brut)
+- Commun: delta≥0.020% | token BTC 0.51$-0.80$ (exceptions: ret3s≤+0.010% OU delta≥0.114%+gap≥0.060%) | ETH/XRP/SOL(votes≤-1) token max 0.95$ | EV≥{int(ORACLE_EDGE_MIN_BTC*100)}% pour BTC oracle lag, EV≥{int(ORACLE_EDGE_MIN_ALT*100)}% pour ETH/SOL/XRP oracle lag (abaissé à 5% le 22/06 sur demande user — ⚠️ RISQUE: seuil bas jamais validé en réel, surveiller via /edge et remonter si l'écart EV théorique/réalisé est négatif), EV≥15% pour momentum/meanrev/confluence | votes≥2 (consensus pour la direction parié, pas score brut)
+- ✅ (22/06) MAKER UNIQUEMENT sur oracle lag: plus aucun fallback taker (2 chemins fermés). Effet attendu: moins de trades exécutés (no-fill si le maker ne se remplit pas dans MAKER_RETRY_WINDOW_S), mais zéro frais taker. Surveiller le taux de no-fill via /exec.
+- ✅ (22/06) Confirmations additionnelles oracle lag (petit bonus +0.02 à p_oracle, jamais un gate dur): (1) OB microprice+OFI LISSÉS sur ~5s avec exigence de persistance ≥70% (remplace l'ancienne lecture instantanée bruitée) — BTC/ETH/SOL seulement, XRP=0 (pas de flux OB XRP); (2) pression de liquidation Binance Futures nette ≥{LIQ_PRESSURE_MIN_USD}$ sur {LIQ_PRESSURE_WINDOW_S}s (mécanique directe: short liquidé→achat forcé→haussier, et inversement) — 4 cryptos. Funding rate Binance collecté et affiché via /oracle mais PAS ENCORE branché dans p_oracle (sens prédictif continuation vs retour à la moyenne pas encore validé empiriquement — ne pas en inventer un sans données).
 - BTC deltaneg: bloqué sauf si gap≥0.040% ET ret3s>-0.050% (exception validée 9W/3L)
 - ETH/SOL/XRP deltaneg: seuil strict -0.010% (0% WR historique si assoupli)
 - Filtres actifs: ret3s_brutal(<-0.070%, ne bloque plus DOWN déjà confirmé) | delta_neg | gap_neg | tokenmax | tokenmin | ev
@@ -6157,6 +6273,7 @@ def _schedule_all_jobs(jq):
     st.recap_job=jq.run_repeating(job_daily_recap,interval=3600,first=60)
     jq.run_repeating(job_check_expiry,interval=30,first=15)
     jq.run_repeating(job_sync_balance,interval=60,first=12)  # ✅ (21/06) BR toujours = solde Polymarket réel
+    jq.run_repeating(job_funding_rate,interval=60,first=15)  # ✅ (22/06) demande user: funding rate Binance Futures
     jq.run_repeating(job_ws_watchdog_all,interval=30,first=1)  # ✅ v10.23 tous les WS
     jq.run_repeating(job_staged_entry,interval=5,first=14)     # ✅ v10.23 2e tranche
     jq.run_repeating(job_oracle_lag,interval=2,first=16)
@@ -7562,6 +7679,19 @@ async def cmd_oracle(update,context):
                 od="+" if _ofi>0 else ("-" if _ofi<0 else "0")
                 ta_line += f"  🎯 Microprice:`{md}` ({_msig:+.4f}) | 🌊 OFI:`{od}` ({_ofi:+.1f})\n"
     except Exception: pass
+    # ✅ (22/06) demande user: funding rate + pression liquidations (nouveaux outils oracle lag)
+    liq_line = ""
+    try:
+        rows = []
+        for a in ("BTC","ETH","SOL","XRP"):
+            fr = st.funding_rate.get(a); fts = st.funding_ts.get(a, 0)
+            liq = liq_pressure(a)
+            fr_txt = f"{fr*100:+.3f}%" if fr is not None and now-fts<180 else "n/a"
+            liq_txt = f"{liq:+,.0f}$" if liq else "0$"
+            liq_emoji = "🟢" if liq>0 else ("🔴" if liq<0 else "⚪")
+            rows.append(f"  {a}: funding `{fr_txt}` | liq {liq_emoji}`{liq_txt}`")
+        liq_line = "💸 *Funding + Liquidations* (30s)\n" + "\n".join(rows) + "\n\n"
+    except Exception: pass
     try:
         await update.message.reply_text(
             f"🔗 *ORACLE CHAINLINK — BTC/ETH/SOL/XRP*\n━━━━━━━━━━━━━━\n"
@@ -7578,6 +7708,7 @@ async def cmd_oracle(update,context):
             f"  Δslot:`{xrp_d:+.3f}%` | Gap:`{xrp_g:+.3f}%` | XRP:`${st.xrp_price:,.4f}`\n"
             f"  → {xrp_rec}\n\n"
             f"{ta_line}"
+            f"{liq_line}"
             f"WS: {' | '.join(srcs)}",
             parse_mode="Markdown")
     except Exception as e:
