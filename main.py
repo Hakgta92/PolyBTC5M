@@ -104,7 +104,8 @@ KELLY_FRACTION  = 0.25
 ENTRY_LAST_SECONDS = 60   # Entrée jusqu'à T-60s (polybacktest: pas trop tard)
 SNIPE_MIN_PROB     = 0.72 # ✅ v10.28 — abaissé (compensé par EV gate plus strict)
 SNIPE_EDGE_MIN     = 0.10 # ✅ v10.28/29 — EV net après vrais frais ≥10% (ex: token 0.65$ → p_dir≥0.77)
-SNIPE_TOKEN_MIN    = 0.41 # ✅ (21/06) aligné sur la fenêtre oracle 0.41→0.70$
+SNIPE_TOKEN_MIN    = 0.10 # ✅ (23/06) demande user: synchronisé avec ORACLE_TOKEN_MIN (0.41→0.10$) — sinon
+                            # cette vérif de sécurité dans place_bet aurait annulé les trades 0.10$-0.36$
 SNIPE_TOKEN_MAX    = 0.70 # ✅ (21/06) aligné sur la fenêtre oracle 0.41→0.70$
 
 # ✅ v10.24 — Stop loss réintroduit
@@ -135,7 +136,7 @@ KILL_SWITCH_LOSSES  = 5      # Pertes consécutives → arrêt total (au-delà d
 # Strategy: si oracle a bougé X% depuis slot open ET token gagnant encore pas cher → BUY
 ORACLE_ENTRY_DELTA  = 0.02  # v12.4  # ✅ v10.31 — baissé 0.05→0.03% (-0.049% bloqué mais ✅ dans passes)
 ORACLE_TOKEN_MAX    = 0.70  # ✅ (21/06) demande user: token 0.41→0.70$ sur TOUTES les cryptos
-ORACLE_TOKEN_MIN    = 0.41  # ✅ (21/06) demande user: min 0.41$
+ORACLE_TOKEN_MIN    = 0.10  # ✅ (23/06) demande user: min abaissé 0.41$→0.10$ (toutes cryptos)
 ORACLE_EDGE_MIN     = 0.15  # v12.4  # EV minimum — 15% (momentum/meanrev/confluence sur tous assets)
 # ✅ v12.9 (18/06) — EV oracle lag ETH/SOL/XRP abaissé 15%→10% (demande user). ⚠️ RISQUE DOCUMENTÉ:
 # les ev-skips ETH/SOL historiques sont 0W/7L (que des pertes dans cette zone). XRP non mesuré.
@@ -143,6 +144,9 @@ ORACLE_EDGE_MIN     = 0.15  # v12.4  # EV minimum — 15% (momentum/meanrev/conf
 ORACLE_EDGE_MIN_ALT = 0.05  # ✅ (22/06) demande user: EV mini oracle lag abaissé à 5%
 LIQ_PRESSURE_WINDOW_S = 30      # ✅ (22/06) demande user: fenêtre de mesure pression liquidations (s)
 LIQ_PRESSURE_MIN_USD  = 50000   # ✅ (22/06) seuil minimum (USD net) pour considérer le signal liquidation fiable
+RESOLUTION_FIX_TS = 1782195288  # ✅ (22/06) timestamp du fix du bug de résolution (faux LOSS sur de vrais WIN,
+                                 # voir _resolve_expired_bet). Tout trade AVANT ça a pu être mal résolu — /edge
+                                 # les exclut du calcul pour ne pas fausser l'edge réel avec de vieilles données corrompues.
 # ✅ v12.9 (18/06) — STRATÉGIE OB SIGNAL (demande user, basée sur slot recorder: OB acheteur→73% UP n=237,
 # OB vendeur→88% DOWN n=156, sur marché neutre). Trade dans le sens du carnet quand l'imbalance est nette.
 # ⚠️ NON VALIDÉ en exécution réelle (le 73% est mesuré à la résolution, possible look-ahead). Mise mini, surveillance.
@@ -2349,20 +2353,30 @@ async def _resolve_expired_bet(context, asset="BTC"):
                 if r.get("asset")==bet_asset and r.get("slot")==bet_slot
                 and r.get("result") in ("UP","DOWN")), None)
     won = (rec["result"] == bet["dir"]) if rec else None
-    # 2) Fallback: prix du token résolu (gagnant→~1$, perdant→~0$)
-    if won is None and active_token_id:
-        res_price = await poly.get_token_price(active_token_id)
-        if res_price >= 0.6: won = True
-        elif 0 < res_price <= 0.4: won = False
-    # ✅ (21/06 fix) GRÂCE avant la reconstruction oracle ci-dessous: ce fallback lit le prix oracle
-    # LIVE (pas le close exact du slot) → si le prix a bougé depuis la vraie clôture, le sens peut
-    # s'inverser par rapport au vrai résultat Polymarket → FAUX LOSS sur de vrais WIN (vu: ETH/XRP
-    # marqués LOSS alors que Polymarket avait déjà redeem les shares gagnantes en cash).
-    # Le slot recorder (méthode #1, fiable, suit EXACTEMENT la règle Polymarket) met seulement
-    # quelques secondes à s'enregistrer après la clôture → on lui laisse 3min avant de tenter ce
-    # fallback bruité, au lieu de sauter dessus immédiatement.
+    # ✅ (22/06 fix) GRÂCE déplacée ICI, avant TOUTE heuristique de fallback (prix résolu ET reconstruction
+    # oracle) — les deux peuvent donner une lecture confiante mais FAUSSE basée sur un prix transitoire/
+    # périmé avant que le carnet ne reflète le vrai règlement (vu: BTC et XRP marqués LOSS alors que
+    # Polymarket avait déjà redeem les shares gagnantes — résolu en ~95s, donc AVANT l'ancienne grâce de
+    # 3min qui ne protégeait que l'étape 3 reconstruction, pas l'étape 2 prix token). Le slot recorder
+    # (étape 1, seule source qui suit EXACTEMENT la règle Polymarket) a maintenant la priorité absolue
+    # pendant 3min avant qu'on tente n'importe quelle heuristique de fallback.
     if won is None and remaining > -180:
         return  # réessaie au prochain tick — laisse le slot recorder arriver
+    # 2) Fallback: prix du token résolu (gagnant→~1$, perdant→~0$)
+    # ✅ (22/06 fix) DOUBLE VÉRIFICATION: une lecture unique peut être périmée/transitoire (carnet pas
+    # encore stabilisé juste après résolution) → on exige 2 lectures espacées de 2s qui s'accordent
+    # avant de trancher, sinon on reste sur won=None (laisse le slot recorder ou le prochain tick trancher).
+    if won is None and active_token_id:
+        res_price = await poly.get_token_price(active_token_id)
+        verdict1 = True if res_price>=0.6 else (False if 0<res_price<=0.4 else None)
+        if verdict1 is not None:
+            await asyncio.sleep(2.0)
+            res_price2 = await poly.get_token_price(active_token_id)
+            verdict2 = True if res_price2>=0.6 else (False if 0<res_price2<=0.4 else None)
+            if verdict1 == verdict2:
+                won = verdict1
+            else:
+                log.info(f"{bet_asset}: prix token incohérent entre 2 lectures ({res_price:.2f}→{res_price2:.2f}) — pas de verdict, on réessaie")
     # 3) Fallback FIABLE: mouvement de l'oracle sur le slot (open mémorisé à l'entrée vs prix
     # oracle actuel ≈ close). Corrige les FAUX LOSS quand le recorder n'a pas encore enregistré le slot
     # ET que le prix token résolu renvoie 0 (marché clos) — cas vu: BTC/SOL gagnants marqués LOSS.
@@ -2694,11 +2708,11 @@ def compute_ta_score(price_history, asset="BTC"):
         details["ema_gap"]=round(gap_pct,4)
         if gap_pct>0.02: score+=1; up_score+=1.0
         elif gap_pct<-0.02: score-=1; down_score+=1.0
-    # ✅ v12.9 — MACD (top-feature ML avec RSI): histogram>0 haussier, <0 baissier
+    # ❌ (22/06) RETIRÉ du score sur demande user — confirmé ANTI-SIGNAL par /edge (48% précision,
+    # pire que pile/face, n=646 sur SLOT EDGE TOUS). On garde le calcul pour affichage/mesure
+    # (/oracle, /score) mais il ne contribue plus au score qui alimente le vote oracle_lag.
     macd_line, macd_signal, macd_hist = compute_macd(prices)
     details["macd_hist"]=round(macd_hist,4)
-    if macd_hist > 0: score+=1; up_score+=1.0
-    elif macd_hist < 0: score-=1; down_score+=1.0
     pts_3m=[x for x in price_history if now-x["ts"]<=180]
     if len(pts_3m)>=2:
         roc=(pts_3m[-1]["price"]-pts_3m[0]["price"])/pts_3m[0]["price"]*100 if pts_3m[0]["price"] else 0
@@ -3177,12 +3191,19 @@ def edge_scorecard(include_paper_if_few=True):
     Verdict: ✅ rentable significatif | 🟡 positif non significatif | 🔴 perdant | ⚠️ n insuffisant.
     C'est l'outil de décision: ne garder QUE les stratégies prouvées +EV."""
     real = [t for t in st.trades if t.get("result") in ("WIN","LOSS") and not t.get("paper")]
+    # ✅ (22/06) demande user: exclut les trades d'AVANT le fix du bug de résolution (faux LOSS sur de
+    # vrais WIN) — ces anciens trades ont pu être mal résolus, les inclure fausserait l'edge réel.
+    excluded_old = [t for t in real if t.get("ts",0) < RESOLUTION_FIX_TS]
+    real = [t for t in real if t.get("ts",0) >= RESOLUTION_FIX_TS]
     mode = "RÉEL"
     if len(real) < 10 and include_paper_if_few:
-        real = [t for t in st.trades if t.get("result") in ("WIN","LOSS")]
+        real = [t for t in st.trades if t.get("result") in ("WIN","LOSS") and t.get("ts",0) >= RESOLUTION_FIX_TS]
         mode = "RÉEL+PAPER (peu de réel)"
     if not real:
-        return "Aucun trade résolu à analyser."
+        n_old = len(excluded_old)
+        return (f"Aucun trade résolu APRÈS le fix de résolution (22/06) à analyser encore.\n"
+                f"({n_old} trades plus anciens exclus — potentiellement mal résolus par le bug corrigé, "
+                f"voir /edge à nouveau après quelques trades.)" if n_old else "Aucun trade résolu à analyser.")
 
     def stats(grp):
         n = len(grp)
@@ -3213,6 +3234,8 @@ def edge_scorecard(include_paper_if_few=True):
         by_src.setdefault(t.get("source","?"), []).append(t)
 
     lines = [f"📊 *EDGE SCORECARD* ({mode})", "━━━━━━━━━━━━━━"]
+    if excluded_old:
+        lines.append(f"_ℹ️ {len(excluded_old)} trade(s) d'avant le fix résolution (22/06) exclus — potentiellement mal résolus_")
     n,wr,wlo,total,mean,roi,tstat,verdict,ev_theo = stats(real)
     lines.append(f"*GLOBAL* n={n} | PnL `{total:+.2f}$` | ROI `{roi:+.1f}%`")
     lines.append(f"  WR `{wr*100:.0f}%` (min `{wlo*100:.0f}%`) | t=`{tstat:.1f}` | {verdict}")
@@ -3280,10 +3303,8 @@ def exec_report():
     es = getattr(st, "exec_stats", {}) or {}
     mk, tk, nf = es.get("maker",0), es.get("taker",0), es.get("nofill",0)
     tot_orders = mk + tk + nf
-    real = [t for t in st.trades if t.get("result") in ("WIN","LOSS") and not t.get("paper")]
-    gross = sum(float(t.get("pnl",0) or 0) for t in real)
-    fees = sum(float(t.get("fee_est",0) or 0) for t in real)
-    by_fill = {}
+    real = [t for t in st.trades if t.get("result") in ("WIN","LOSS") and not t.get("paper")
+            and t.get("ts",0) >= RESOLUTION_FIX_TS]  # ✅ (22/06) exclut les trades pré-fix résolution
     for t in real:
         by_fill.setdefault(t.get("fill_type","?"), []).append(t)
     lines = ["⚙️ *EXÉCUTION & FRAIS*", "━━━━━━━━━━━━━━"]
@@ -3325,9 +3346,10 @@ def _bucket_stats(trades, key, edges, fmt_lbl):
 def zones_report():
     """✅ #3 — Zones rentables: WR/PnL/ROI par PRIX D'ENTRÉE du token et par TIMING d'entrée
     (T-Xs restant). Révèle où tu gagnes vraiment → resserre la fenêtre/le prix sur les zones +EV."""
-    real = [t for t in st.trades if t.get("result") in ("WIN","LOSS") and not t.get("paper")]
+    real = [t for t in st.trades if t.get("result") in ("WIN","LOSS") and not t.get("paper")
+            and t.get("ts",0) >= RESOLUTION_FIX_TS]  # ✅ (22/06) exclut les trades pré-fix résolution
     if len(real) < 5:
-        real = [t for t in st.trades if t.get("result") in ("WIN","LOSS")]
+        real = [t for t in st.trades if t.get("result") in ("WIN","LOSS") and t.get("ts",0) >= RESOLUTION_FIX_TS]
         tag = " (réel+paper)"
     else:
         tag = ""
@@ -3347,9 +3369,10 @@ def zones_report():
 def risk_report():
     """✅ #4 — Risque: courbe d'équité, max drawdown, drawdown actuel, plus longue série de
     pertes, profit factor, espérance/trade. Pour ne pas se faire effacer sur une mauvaise série."""
-    real = [t for t in st.trades if t.get("result") in ("WIN","LOSS") and not t.get("paper")]
+    real = [t for t in st.trades if t.get("result") in ("WIN","LOSS") and not t.get("paper")
+            and t.get("ts",0) >= RESOLUTION_FIX_TS]  # ✅ (22/06) exclut les trades pré-fix résolution
     if not real:
-        return "Aucun trade réel résolu pour les métriques de risque."
+        return "Aucun trade réel résolu APRÈS le fix de résolution (22/06) pour les métriques de risque."
     pnls=[float(t.get("pnl",0) or 0) for t in real]
     n=len(pnls); wins=[p for p in pnls if p>0]; losses=[p for p in pnls if p<0]
     gross_win=sum(wins); gross_loss=abs(sum(losses))
@@ -3378,9 +3401,12 @@ def risk_report():
 def strategy_matrix():
     """✅ #5 — Matrice ASSET × STRATÉGIE: PnL et WR par croisement → repère les cases qui
     gagnent (ex: oracle_lag sur BTC) et celles qui perdent (à désactiver)."""
-    real = [t for t in st.trades if t.get("result") in ("WIN","LOSS") and not t.get("paper")]
+    # ✅ (22/06) demande user: même filtre que /edge — exclut les trades d'avant le fix du bug de
+    # résolution (faux LOSS sur de vrais WIN), sinon cette matrice serait aussi contaminée.
+    real = [t for t in st.trades if t.get("result") in ("WIN","LOSS") and not t.get("paper")
+            and t.get("ts",0) >= RESOLUTION_FIX_TS]
     if not real:
-        return "Aucun trade réel résolu pour la matrice."
+        return "Aucun trade réel résolu APRÈS le fix de résolution (22/06) pour la matrice. Attends quelques trades neufs."
     assets=["BTC","ETH","SOL","XRP"]
     srcs=sorted({t.get("source","?") for t in real})
     lines=["🧮 *MATRICE ASSET × STRATÉGIE* (PnL réel)","━━━━━━━━━━━━━━","_case = PnL$ (n)_"]
@@ -4434,7 +4460,10 @@ async def job_oracle_lag(context):
     if persistent and time.time() - getattr(st, "ob_ts", 0) < 10:
         micro_ok = (direction=="UP" and micro_sig > 0) or (direction=="DOWN" and micro_sig < 0)
         ofi_ok   = (direction=="UP" and ofi > 0) or (direction=="DOWN" and ofi < 0)
-        if micro_ok and ofi_ok: p_oracle = min(0.97, p_oracle + 0.02)
+        # ✅ (22/06) demande user: bonus doublé (0.02→0.04) — "OB+OFI accord" confirmé à 92% de précision
+        # directionnelle (n=145) par /edge, l'un des signaux les plus forts mesurés. Cette condition
+        # (micro_ok ET ofi_ok ensemble) correspond exactement à cet "accord".
+        if micro_ok and ofi_ok: p_oracle = min(0.97, p_oracle + 0.04)
     # ✅ (22/06) demande user: confirmation par pression de liquidation Binance Futures. Mécanique
     # directe (pas spéculatif): cascade de shorts liquidés = achat forcé = pression haussière immédiate
     # (et inversement pour les longs) — contrairement au funding rate, le SENS ici n'est pas ambigu.
@@ -4705,7 +4734,8 @@ async def job_oracle_lag_asset(context, asset:str):
     if persistent and time.time() - ob_ts_asset < 10:
         micro_ok = (direction=="UP" and micro_sig > 0) or (direction=="DOWN" and micro_sig < 0)
         ofi_ok   = (direction=="UP" and ofi > 0) or (direction=="DOWN" and ofi < 0)
-        if micro_ok and ofi_ok: p_oracle = min(0.96, p_oracle + 0.02)
+        # ✅ (22/06) demande user: bonus doublé (0.02→0.04), même justification que BTC (92% n=145)
+        if micro_ok and ofi_ok: p_oracle = min(0.96, p_oracle + 0.04)
     # ✅ (22/06) demande user: confirmation par pression de liquidation Binance Futures (mécanique directe)
     liq = liq_pressure(asset)
     if abs(liq) >= LIQ_PRESSURE_MIN_USD:
@@ -4955,11 +4985,11 @@ def _asset_state_attrs(asset):
     if a == "BTC":
         return dict(price="ws_price", prices="ws_prices", oracle="oracle_price",
                      slug="btc-updown-5m", mom_slot="momentum_last_slot", mr_slot="meanrev_last_slot",
-                     tds_slot="tds_last_slot")
+                     tds_slot="tds_last_slot", oracle_slot="last_trade_slot")
     pfx = a.lower()
     return dict(price=f"{pfx}_price", prices=f"{pfx}_ws_prices", oracle=f"{pfx}_oracle_price",
                  slug=f"{pfx}-updown-5m", mom_slot=f"momentum_last_slot_{pfx}", mr_slot=f"meanrev_last_slot_{pfx}",
-                 tds_slot=f"tds_last_slot_{pfx}")
+                 tds_slot=f"tds_last_slot_{pfx}", oracle_slot=f"{pfx}_last_trade_slot")
 
 
 async def job_momentum_asset(context, asset):
@@ -4974,7 +5004,12 @@ async def job_momentum_asset(context, asset):
     if not (60 <= slot_remaining <= 150): return
 
     cfg = _asset_state_attrs(asset)
-    if getattr(st, cfg["mom_slot"]) == cur_slot or getattr(st, cfg["mr_slot"]) == cur_slot: return
+    # ✅ (22/06) fix: momentum ne vérifiait que lui-même + meanrev, jamais oracle_lag ni confluence →
+    # doublons possibles si une autre stratégie avait déjà tradé cet asset/slot (vu: 2 achats XRP même
+    # slot à 57¢/58.7¢). Vérifie maintenant les 4 stratégies.
+    if (getattr(st, cfg["mom_slot"]) == cur_slot or getattr(st, cfg["mr_slot"]) == cur_slot
+            or getattr(st, cfg["tds_slot"]) == cur_slot or getattr(st, cfg["oracle_slot"]) == cur_slot):
+        return
 
     cur_price = getattr(st, cfg["price"])
     oracle_price = getattr(st, cfg["oracle"])
@@ -5093,8 +5128,11 @@ async def job_mean_reversion_btc(context):
 
     # Même fenêtre que momentum (régimes complémentaires: squeeze ici, expansion pour momentum)
     if not (60 <= slot_remaining <= 150): return
-    # Anti-double-trade: vérifie les 2 guards (momentum a pu déjà trader ce slot, ou nous-même)
-    if st.momentum_last_slot == cur_slot or st.meanrev_last_slot == cur_slot: return
+    # Anti-double-trade: vérifie les 4 guards (momentum/meanrev/oracle_lag/confluence ont pu déjà trader)
+    # ✅ (22/06) fix: manquait last_trade_slot (oracle_lag) et tds_last_slot (confluence) — même trou
+    # que sur ETH/SOL/XRP, corrigé en même temps.
+    if st.momentum_last_slot == cur_slot or st.meanrev_last_slot == cur_slot \
+            or st.last_trade_slot == cur_slot or getattr(st,"tds_last_slot",0) == cur_slot: return
     if cur_slot in (st.last_trade_slot, getattr(st,"tds_last_slot",0)): return  # ✅ v12.9 verrou global
     if st.oracle_price <= 0 or st.ws_price <= 0: return
 
@@ -5214,7 +5252,11 @@ async def job_mean_reversion_asset(context, asset):
     if not (60 <= slot_remaining <= 150): return
 
     cfg = _asset_state_attrs(asset)
-    if getattr(st, cfg["mom_slot"]) == cur_slot or getattr(st, cfg["mr_slot"]) == cur_slot: return
+    # ✅ (22/06) fix: même trou que momentum — ne vérifiait que lui-même + momentum, jamais oracle_lag
+    # ni confluence. Vérifie maintenant les 4 stratégies.
+    if (getattr(st, cfg["mom_slot"]) == cur_slot or getattr(st, cfg["mr_slot"]) == cur_slot
+            or getattr(st, cfg["tds_slot"]) == cur_slot or getattr(st, cfg["oracle_slot"]) == cur_slot):
+        return
 
     cur_price = getattr(st, cfg["price"])
     oracle_price = getattr(st, cfg["oracle"])
@@ -5513,8 +5555,9 @@ async def job_confluence_asset(context, asset):
     if not (60 <= slot_remaining <= 150): return
 
     cfg = _asset_state_attrs(asset)
+    # ✅ (22/06) fix: confluence vérifiait mom/mr/tds mais pas oracle_lag — ajouté pour cohérence totale.
     if (getattr(st, cfg["mom_slot"]) == cur_slot or getattr(st, cfg["mr_slot"]) == cur_slot
-            or getattr(st, cfg["tds_slot"]) == cur_slot):
+            or getattr(st, cfg["tds_slot"]) == cur_slot or getattr(st, cfg["oracle_slot"]) == cur_slot):
         return
 
     spot = getattr(st, cfg["price"])
@@ -5959,10 +6002,14 @@ PARAMÈTRES ACTUELS:
 - ETH: gap≥0.020% | T-{ORACLE_WINDOW_START}s→T-{ORACLE_WINDOW_END}s
 - SOL: gap≥0.020% | T-{ORACLE_WINDOW_START}s→T-{ORACLE_WINDOW_END}s
 - XRP: gap≥0.025% | T-{ORACLE_WINDOW_START}s→T-{ORACLE_WINDOW_END}s
-- MOMENTUM (BTC/ETH/SOL/XRP): ret60s≥0.30% | T-150s→T-60s | tok 0.55$-0.65$ | filtre trend macro 10min (bloque si tendance 10min contraire ≥0.10%, source: étude live ayant réduit pertes -93%→-13% avec ce filtre) | Kelly dédié 1-3% BR (2ème fenêtre indépendante). Extension ETH/SOL/XRP NOUVELLE (17/06) — surveiller si ces assets, documentés plus bruités à court terme, performent moins bien que BTC.
-- MEAN-REVERSION (BTC/ETH/SOL/XRP): Bollinger Bandwidth≤0.12% (régime squeeze) | parie contre un spike (prix hors bandes 2σ) | tok 0.51$-0.70$ | Kelly dédié 1-3% BR (3ème fenêtre, même T-150s→T-60s, régime complémentaire au momentum — squeeze vs expansion). Stratégie NOUVELLE, seuils à calibrer avec données réelles. Extension ETH/SOL/XRP NOUVELLE (17/06).
-- CONFLUENCE (BTC/ETH/SOL/XRP, 4ème stratégie /conf): TDS = oracle_score(gap≥0.025%, fort≥0.060%) × setup_score(mean-rev ou momentum, UNIQUEMENT si aligné avec le biais oracle) × (1-noise_penalty si chop détecté) | seuil TDS≥0.35 | tok 0.52$-0.72$ | Kelly dédié 1-3% BR avec SIZING DYNAMIQUE (confidence 0.7x à TDS=seuil → 1.3x à TDS=1.0, toujours capé 1-3% BR) | même fenêtre T-150s→T-60s. Poids adaptatifs MR/momentum ajustés UNIQUEMENT après ≥20 trades par branche (neutres sinon — anti-overfitting). Stratégie TRÈS NOUVELLE (17/06), tous les seuils sont des points de départ raisonnés à calibrer en priorité avec les premières données réelles.
-- Commun: delta≥0.020% | token BTC 0.51$-0.80$ (exceptions: ret3s≤+0.010% OU delta≥0.114%+gap≥0.060%) | ETH/XRP/SOL(votes≤-1) token max 0.95$ | EV≥{int(ORACLE_EDGE_MIN_BTC*100)}% pour BTC oracle lag, EV≥{int(ORACLE_EDGE_MIN_ALT*100)}% pour ETH/SOL/XRP oracle lag (abaissé à 5% le 22/06 sur demande user — ⚠️ RISQUE: seuil bas jamais validé en réel, surveiller via /edge et remonter si l'écart EV théorique/réalisé est négatif), EV≥15% pour momentum/meanrev/confluence | votes≥2 (consensus pour la direction parié, pas score brut)
+- ❌ (22/06) MOMENTUM, MEAN-REVERSION et CONFLUENCE DÉSACTIVÉES sur demande user — /edge a montré 0 trade
+  réel sur 44 au total pour ces 3 (seules sources réelles: snipe=oracle_lag n=43, ob_disagree n=1).
+  Code conservé (non supprimé) mais plus schedulé — ne plus analyser leurs skips, ils n'ont plus cours.
+  Descriptions ci-dessous gardées pour mémoire seulement:
+- MOMENTUM (BTC/ETH/SOL/XRP) [INACTIF]: ret60s≥0.30% | T-150s→T-60s | tok 0.55$-0.65$ | filtre trend macro 10min (bloque si tendance 10min contraire ≥0.10%, source: étude live ayant réduit pertes -93%→-13% avec ce filtre) | Kelly dédié 1-3% BR (2ème fenêtre indépendante). Extension ETH/SOL/XRP NOUVELLE (17/06) — surveiller si ces assets, documentés plus bruités à court terme, performent moins bien que BTC.
+- MEAN-REVERSION (BTC/ETH/SOL/XRP) [INACTIF]: Bollinger Bandwidth≤0.12% (régime squeeze) | parie contre un spike (prix hors bandes 2σ) | tok 0.51$-0.70$ | Kelly dédié 1-3% BR (3ème fenêtre, même T-150s→T-60s, régime complémentaire au momentum — squeeze vs expansion). Stratégie NOUVELLE, seuils à calibrer avec données réelles. Extension ETH/SOL/XRP NOUVELLE (17/06).
+- CONFLUENCE (BTC/ETH/SOL/XRP, 4ème stratégie /conf) [INACTIF]: TDS = oracle_score(gap≥0.025%, fort≥0.060%) × setup_score(mean-rev ou momentum, UNIQUEMENT si aligné avec le biais oracle) × (1-noise_penalty si chop détecté) | seuil TDS≥0.35 | tok 0.52$-0.72$ | Kelly dédié 1-3% BR avec SIZING DYNAMIQUE (confidence 0.7x à TDS=seuil → 1.3x à TDS=1.0, toujours capé 1-3% BR) | même fenêtre T-150s→T-60s. Poids adaptatifs MR/momentum ajustés UNIQUEMENT après ≥20 trades par branche (neutres sinon — anti-overfitting). Stratégie TRÈS NOUVELLE (17/06), tous les seuils sont des points de départ raisonnés à calibrer en priorité avec les premières données réelles.
+- Commun: delta≥0.020% | token BTC {ORACLE_TOKEN_MIN:.2f}$-{ORACLE_TOKEN_MAX:.2f}$ (abaissé 0.41$→0.10$ le 23/06 sur demande user — ⚠️ RISQUE: zone <0.41$ jamais validée en réel, surveiller via /edge) (exceptions: ret3s≤+0.010% OU delta≥0.114%+gap≥0.060%) | ETH/XRP/SOL(votes≤-1) token max 0.95$ | EV≥{int(ORACLE_EDGE_MIN_BTC*100)}% pour BTC oracle lag, EV≥{int(ORACLE_EDGE_MIN_ALT*100)}% pour ETH/SOL/XRP oracle lag (abaissé à 5% le 22/06 sur demande user — ⚠️ RISQUE: seuil bas jamais validé en réel, surveiller via /edge et remonter si l'écart EV théorique/réalisé est négatif) | votes≥2 (consensus pour la direction parié, pas score brut)
 - ✅ (22/06) Maker en priorité (zéro frais + rebate), TAKER en fallback si pas rempli. Délai d'attente
   maker ADAPTATIF (pas une constante fixe): proportionnel au temps réel restant avant la fin du slot —
   signal précoce (proche T-45s) = plein temps normal (~3s/tentative, jusqu'à 1s de fenêtre retry),
@@ -5986,7 +6033,7 @@ CONTEXTE IMPORTANT:
 - Gain moyen estimé par WIN: ~{avg_win:.2f}$ | Perte moyenne par LOSS: ~{avg_loss:.2f}$
 - Le bot a eu très peu/pas de trades réels récemment. CAUSE IMPORTANTE: un bug get_market_by_slug (endpoints /events?slug au lieu de /events/slug/) empêchait ETH/SOL/XRP (et parfois BTC) de trouver leur marché → trades tués en silence, corrigé le 18/06. Donc une partie du "0 trade" était TECHNIQUE, pas un excès de filtrage. Ne conclus PAS hâtivement que les filtres sont trop stricts: vérifie d'abord via le SLOT RECORDER si les conditions avaient une vraie valeur prédictive.
 - Objectif prioritaire: identifier des configurations qui AURAIENT dû trader et gagner
-- Token max actuel: {ORACLE_TOKEN_MAX}$ | EV min: {int(ORACLE_EDGE_MIN_BTC*100)}% (BTC oracle lag) / {int(ORACLE_EDGE_MIN_ALT*100)}% (ETH/SOL/XRP oracle lag) / {int(ORACLE_EDGE_MIN*100)}% (momentum/meanrev/confluence) | votes min: 2/5{brier_note}
+- Token max actuel: {ORACLE_TOKEN_MAX}$ | EV min: {int(ORACLE_EDGE_MIN_BTC*100)}% (BTC oracle lag) / {int(ORACLE_EDGE_MIN_ALT*100)}% (ETH/SOL/XRP oracle lag) | momentum/meanrev/confluence [INACTIF depuis 22/06, 0 trade réel/44] | votes min: 2/5{brier_note}
 - {session_note}
 - Mécanisme SMT (ETH/SOL uniquement): quand BTC et ETH/SOL divergent de ≥0.025% sur 15s, le laggard tend à rattraper (corrélation ~0.9). Si tu vois "smt=" dans les données, c'est ce signal de divergence cross-asset — facteur supplémentaire à considérer, pas encore pleinement exploité historiquement (collecte en cours).
 - 🌑 SHADOW DOWN (filter=shadow_down): signaux DOWN "fantômes" en mode LOG-ONLY (aucun trade réel). Ils capturent le cas gap+/delta- persistant (marché baissier, oracle figé au-dessus du spot tombant) SANS chute brutale — un cas que les 4 stratégies ne tradent jamais actuellement. Question clé à trancher: ces DOWN auraient-ils GAGNÉ? Si shadow_down montre un WR≥58% sur n≥30 hors d'une seule session, c'est un EDGE réel à activer. Si WR≤48%, c'est un piège (mean-reversion: le spot rebondit au lieu de continuer à tomber) → garder désactivé. ATTENTION: ne te laisse pas piéger par un WR élevé issu d'une seule session 100% baissière (cf. règle anti-biais ci-dessous).
@@ -6286,7 +6333,9 @@ def _schedule_all_jobs(jq):
         jq.run_once(job_reconcile, when=8)  # ✅ #8 — réconcilie l'état avec les positions réelles au démarrage
     st.price_job=jq.run_repeating(job_price,interval=30,first=5)
     st.macro_job=jq.run_repeating(job_macro,interval=300,first=8)
-    st.tick_job=jq.run_repeating(job_tick,interval=30,first=10)
+    # ❌ (22/06) DÉSACTIVÉ sur demande user — source="tick" jamais vue dans /edge (0 trade réel sur 44).
+    # Code conservé, st.tick_job reste None (géré proprement par le cleanup de /stop).
+    # st.tick_job=jq.run_repeating(job_tick,interval=30,first=10)
     st.tp_job=jq.run_repeating(job_take_profit,interval=TAKE_PROFIT_CHECK,first=10)
     st.backup_job=jq.run_repeating(job_backup,interval=120,first=60)  # v12.4 backup 2min
     st.recap_job=jq.run_repeating(job_daily_recap,interval=3600,first=60)
@@ -6299,20 +6348,23 @@ def _schedule_all_jobs(jq):
     jq.run_repeating(job_oracle_lag_eth,interval=2,first=18)
     jq.run_repeating(job_oracle_lag_sol,interval=2,first=20)
     jq.run_repeating(job_oracle_lag_xrp,interval=2,first=22)
-    jq.run_repeating(job_momentum_btc,interval=2,first=24)  # ✅ v12.9 — 2ème fenêtre momentum
-    jq.run_repeating(job_mean_reversion_btc,interval=2,first=26)  # ✅ v12.9 — 3ème fenêtre mean-reversion (ajout pur)
+    # ❌ (22/06) DÉSACTIVÉ sur demande user — /edge a montré 0 trade réel sur 44 au total pour momentum/
+    # meanrev/confluence (seules sources présentes: snipe=oracle_lag n=43, ob_disagree n=1). Ces 3
+    # stratégies ne contribuaient déjà à RIEN en pratique. Code conservé, juste plus schedulé.
+    # jq.run_repeating(job_momentum_btc,interval=2,first=24)  # ✅ v12.9 — 2ème fenêtre momentum
+    # jq.run_repeating(job_mean_reversion_btc,interval=2,first=26)  # ✅ v12.9 — 3ème fenêtre mean-reversion (ajout pur)
     # ✅ v12.9 — Extension multi-asset momentum+meanrev (ETH/SOL/XRP), sizing 1-3% BR dédié (demande user 17/06)
-    jq.run_repeating(job_momentum_eth,interval=2,first=28)
-    jq.run_repeating(job_momentum_sol,interval=2,first=30)
-    jq.run_repeating(job_momentum_xrp,interval=2,first=32)
-    jq.run_repeating(job_mean_reversion_eth,interval=2,first=34)
-    jq.run_repeating(job_mean_reversion_sol,interval=2,first=36)
-    jq.run_repeating(job_mean_reversion_xrp,interval=2,first=38)
+    # jq.run_repeating(job_momentum_eth,interval=2,first=28)
+    # jq.run_repeating(job_momentum_sol,interval=2,first=30)
+    # jq.run_repeating(job_momentum_xrp,interval=2,first=32)
+    # jq.run_repeating(job_mean_reversion_eth,interval=2,first=34)
+    # jq.run_repeating(job_mean_reversion_sol,interval=2,first=36)
+    # jq.run_repeating(job_mean_reversion_xrp,interval=2,first=38)
     # ✅ v12.9 — 4ème stratégie CONFLUENCE (/conf), demande user 17/06
-    jq.run_repeating(job_confluence_btc,interval=2,first=40)
-    jq.run_repeating(job_confluence_eth,interval=2,first=42)
-    jq.run_repeating(job_confluence_sol,interval=2,first=44)
-    jq.run_repeating(job_confluence_xrp,interval=2,first=46)
+    # jq.run_repeating(job_confluence_btc,interval=2,first=40)
+    # jq.run_repeating(job_confluence_eth,interval=2,first=42)
+    # jq.run_repeating(job_confluence_sol,interval=2,first=44)
+    # jq.run_repeating(job_confluence_xrp,interval=2,first=46)
     # ✅ v12.9 — STRATÉGIE OB SIGNAL (trade dans le sens du carnet, fenêtre T-150→T-30)
     jq.run_repeating(job_ob_signal_btc,interval=3,first=48)
     jq.run_repeating(job_ob_signal_eth,interval=3,first=49)
@@ -7660,21 +7712,36 @@ async def cmd_oracle(update,context):
     eth_g=(st.eth_price-eth_o)/eth_o*100 if eth_o>0 and st.eth_price>0 else 0
     eth_ok=eth_o>0 and now-st.eth_oracle_ts<15
     eth_sig="UP" if eth_d>ORACLE_ENTRY_DELTA else ("DOWN" if eth_d<-ORACLE_ENTRY_DELTA else None)
-    eth_rec=f"⚡ Signal ETH *{eth_sig}* T-`{int(slot_remaining)}s`" if eth_sig and eth_ok else "📡 Pas de signal ETH"
+    if eth_sig and eth_ok and in_window:
+        eth_rec=f"⚡ Signal ETH *{eth_sig}* T-`{int(slot_remaining)}s`"
+    elif eth_sig and eth_ok:
+        eth_rec=f"⏳ Signal ETH *{eth_sig}* — hors fenêtre (T-`{int(slot_remaining)}s`)"
+    else:
+        eth_rec="📡 Pas de signal ETH"
     # SOL oracle
     sol_o=st.sol_oracle_price; sol_so=st.sol_oracle_slot_open
     sol_d=(sol_o-sol_so)/sol_so*100 if sol_so>0 else 0
     sol_g=(st.sol_price-sol_o)/sol_o*100 if sol_o>0 and st.sol_price>0 else 0
     sol_ok=sol_o>0 and now-st.sol_oracle_ts<15
     sol_sig="UP" if sol_d>ORACLE_ENTRY_DELTA else ("DOWN" if sol_d<-ORACLE_ENTRY_DELTA else None)
-    sol_rec=f"⚡ Signal SOL *{sol_sig}* T-`{int(slot_remaining)}s`" if sol_sig and sol_ok else "📡 Pas de signal SOL"
+    if sol_sig and sol_ok and in_window:
+        sol_rec=f"⚡ Signal SOL *{sol_sig}* T-`{int(slot_remaining)}s`"
+    elif sol_sig and sol_ok:
+        sol_rec=f"⏳ Signal SOL *{sol_sig}* — hors fenêtre (T-`{int(slot_remaining)}s`)"
+    else:
+        sol_rec="📡 Pas de signal SOL"
     # XRP oracle
     xrp_o=st.xrp_oracle_price; xrp_so=st.xrp_oracle_slot_open
     xrp_d=(xrp_o-xrp_so)/xrp_so*100 if xrp_so>0 else 0
     xrp_g=(st.xrp_price-xrp_o)/xrp_o*100 if xrp_o>0 and st.xrp_price>0 else 0
     xrp_ok=xrp_o>0 and now-st.xrp_oracle_ts<15
     xrp_sig="UP" if xrp_d>ORACLE_ENTRY_DELTA else ("DOWN" if xrp_d<-ORACLE_ENTRY_DELTA else None)
-    xrp_rec=f"⚡ Signal XRP *{xrp_sig}* T-`{int(slot_remaining)}s`" if xrp_sig and xrp_ok else "📡 Pas de signal XRP"
+    if xrp_sig and xrp_ok and in_window:
+        xrp_rec=f"⚡ Signal XRP *{xrp_sig}* T-`{int(slot_remaining)}s`"
+    elif xrp_sig and xrp_ok:
+        xrp_rec=f"⏳ Signal XRP *{xrp_sig}* — hors fenêtre (T-`{int(slot_remaining)}s`)"
+    else:
+        xrp_rec="📡 Pas de signal XRP"
     # ✅ v12.9 — MACD + dual model BTC temps réel
     ta_line = ""
     try:
