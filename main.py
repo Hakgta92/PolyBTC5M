@@ -7141,7 +7141,7 @@ async def job_reversal_guard(context):
             if ok:
                 st.reversal_hist[asset] = deque(maxlen=REVERSAL_CONFIRM_READS+2)
 
-
+async def cmd_sellcheck(update,context):
     """✅ (21/06) Affiche le PnL actuel sans vendre, par crypto (/sellcheck [btc|eth|sol|xrp])."""
     if not auth(update): return
     open_assets = [a for a in ASSETS if getattr(st, f"bet{_possfx(a)}")]
