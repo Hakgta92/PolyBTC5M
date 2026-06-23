@@ -144,6 +144,15 @@ ORACLE_EDGE_MIN     = 0.15  # v12.4  # EV minimum — 15% (momentum/meanrev/conf
 ORACLE_EDGE_MIN_ALT = 0.05  # ✅ (22/06) demande user: EV mini oracle lag abaissé à 5%
 LIQ_PRESSURE_WINDOW_S = 30      # ✅ (22/06) demande user: fenêtre de mesure pression liquidations (s)
 LIQ_PRESSURE_MIN_USD  = 50000   # ✅ (22/06) seuil minimum (USD net) pour considérer le signal liquidation fiable
+# ✅ (23/06) demande user: GARDE DE RETOURNEMENT — vend la position en cours si le marché part clairement
+# contre nous, au lieu d'attendre la résolution. Exige une CONFIRMATION (pas un seul tick bruité, même
+# logique que le lissage OB) sauf en cas de cascade de liquidation forte (réaction immédiate justifiée).
+REVERSAL_GUARD_ENABLED   = True
+REVERSAL_DELTA_PCT       = 0.05   # mouvement oracle contre nous (%, depuis l'open du slot) pour être "candidat"
+REVERSAL_CONFIRM_READS   = 3      # nb de lectures consécutives d'accord nécessaires (~check_interval×3)
+REVERSAL_CHECK_INTERVAL_S = 2.0   # fréquence de vérification du garde
+REVERSAL_LIQ_OVERRIDE_USD = 100000  # cascade de liquidation contre nous ≥ ce seuil → sortie immédiate, sans attendre la confirmation
+REVERSAL_MIN_REMAINING_S = 4       # sous ce temps restant, plus le temps d'agir → on n'essaie même pas
 RESOLUTION_FIX_TS = 1782195288  # ✅ (22/06) timestamp du fix du bug de résolution (faux LOSS sur de vrais WIN,
                                  # voir _resolve_expired_bet). Tout trade AVANT ça a pu être mal résolu — /edge
                                  # les exclut du calcul pour ne pas fausser l'edge réel avec de vieilles données corrompues.
@@ -1937,6 +1946,7 @@ class State:
         self.daily_pause_until=0
         self.skipped=0; self.pass_reasons=[]
         self.ob_hist={}  # ✅ (22/06) historique récent micro_sig/ofi par asset, pour lissage+persistance
+        self.reversal_hist={}  # ✅ (23/06) {asset: deque[bool]} lectures récentes "retournement contre nous"
         # ✅ (22/06) demande user: liquidations + funding rate Binance Futures (nouveau outil oracle lag)
         self.liq_hist={}      # {asset: deque[(ts, side, notional_usd)]} — flux !forceOrder@arr
         self.liq_ws_task=None
@@ -2938,7 +2948,13 @@ async def ws_oracle_loop():
                             p = float(val); now = time.time()
                             cl_ts = ts_ms/1000 if ts_ms>0 else now
                             if ts_ms>0 and (now-cl_ts)>30: continue
-                            slot_start = int(now//300)*300
+                            # ✅ (23/06) FIX: attribue le tick à son slot via le timestamp CHAINLINK (event time),
+                            # pas via `now` (processing time). Avant: un tick représentant la VRAIE clôture du
+                            # slot N pouvait arriver juste après que l'horloge du bot ait basculé sur le slot N+1
+                            # (délai réseau/traitement) → mal classé comme "open" du nouveau slot, tandis qu'un
+                            # tick plus ancien/périmé servait de "close" pour le slot N → résultat parfois inversé
+                            # dans les cas serrés (vu: BTC marqué WIN par le bot alors que Polymarket dit LOSS).
+                            slot_start = int(cl_ts//300)*300
                             st.oracle_chainlink_ts = cl_ts
                             if symbol == "btc/usd":
                                 if st.oracle_slot_ts!=slot_start:
@@ -6014,7 +6030,14 @@ PARAMÈTRES ACTUELS:
   maker ADAPTATIF (pas une constante fixe): proportionnel au temps réel restant avant la fin du slot —
   signal précoce (proche T-45s) = plein temps normal (~3s/tentative, jusqu'à 1s de fenêtre retry),
   signal tardif (proche T-5s) = bascule taker quasi immédiate pour ne pas rater le slot.
-- ✅ (22/06) Confirmations additionnelles oracle lag (petit bonus +0.02 à p_oracle, jamais un gate dur): (1) OB microprice+OFI LISSÉS sur ~5s avec exigence de persistance ≥70% (remplace l'ancienne lecture instantanée bruitée) — BTC/ETH/SOL seulement, XRP=0 (pas de flux OB XRP); (2) pression de liquidation Binance Futures nette ≥{LIQ_PRESSURE_MIN_USD}$ sur {LIQ_PRESSURE_WINDOW_S}s (mécanique directe: short liquidé→achat forcé→haussier, et inversement) — 4 cryptos. Funding rate Binance collecté et affiché via /oracle mais PAS ENCORE branché dans p_oracle (sens prédictif continuation vs retour à la moyenne pas encore validé empiriquement — ne pas en inventer un sans données).
+- ✅ (22/06, bonus doublé 23/06) Confirmations additionnelles oracle lag (bonus +0.04 à p_oracle, jamais un gate dur — doublé de 0.02 le 23/06 suite preuve /edge "OB+OFI accord" 92% précision n=145): (1) OB microprice+OFI LISSÉS sur ~5s avec exigence de persistance ≥70% (remplace l'ancienne lecture instantanée bruitée) — BTC/ETH/SOL seulement, XRP=0 (pas de flux OB XRP); (2) pression de liquidation Binance Futures nette ≥{LIQ_PRESSURE_MIN_USD}$ sur {LIQ_PRESSURE_WINDOW_S}s (mécanique directe: short liquidé→achat forcé→haussier, et inversement) — 4 cryptos. Funding rate Binance collecté et affiché via /oracle mais PAS ENCORE branché dans p_oracle (sens prédictif continuation vs retour à la moyenne pas encore validé empiriquement — ne pas en inventer un sans données).
+- ✅ (23/06) demande user: GARDE DE RETOURNEMENT — surveille les positions réelles ouvertes toutes les
+  {REVERSAL_CHECK_INTERVAL_S}s, vend en taker immédiatement (priorité vitesse) si le marché part
+  clairement contre la direction parié de ≥{REVERSAL_DELTA_PCT}% (confirmé sur {REVERSAL_CONFIRM_READS}
+  lectures consécutives, sauf cascade de liquidation ≥{REVERSAL_LIQ_OVERRIDE_USD}$ contre nous → sortie
+  immédiate sans attendre confirmation). N'agit pas sous {REVERSAL_MIN_REMAINING_S}s restant (plus le
+  temps). Ces sorties anticipées apparaissent dans /trades avec reasoning="🚨 Sortie auto..." — NE PAS
+  les confondre avec des résolutions normales de fin de slot dans l'analyse.
 - BTC deltaneg: bloqué sauf si gap≥0.040% ET ret3s>-0.050% (exception validée 9W/3L)
 - ETH/SOL/XRP deltaneg: seuil strict -0.010% (0% WR historique si assoupli)
 - Filtres actifs: ret3s_brutal(<-0.070%, ne bloque plus DOWN déjà confirmé) | delta_neg | gap_neg | tokenmax | tokenmin | ev
@@ -6337,6 +6360,7 @@ def _schedule_all_jobs(jq):
     # Code conservé, st.tick_job reste None (géré proprement par le cleanup de /stop).
     # st.tick_job=jq.run_repeating(job_tick,interval=30,first=10)
     st.tp_job=jq.run_repeating(job_take_profit,interval=TAKE_PROFIT_CHECK,first=10)
+    jq.run_repeating(job_reversal_guard,interval=REVERSAL_CHECK_INTERVAL_S,first=6)  # ✅ (23/06) demande user
     st.backup_job=jq.run_repeating(job_backup,interval=120,first=60)  # v12.4 backup 2min
     st.recap_job=jq.run_repeating(job_daily_recap,interval=3600,first=60)
     jq.run_repeating(job_check_expiry,interval=30,first=15)
@@ -7011,6 +7035,58 @@ def _pick_bet_sfx(context):
         if getattr(st, f"bet{_possfx(a)}") is not None: return _possfx(a)
     return ""
 
+async def _execute_position_exit(context, sfx, reason_label="Sortie"):
+    """✅ (23/06) demande user: extrait de cmd_sell pour être réutilisable par le garde de retournement
+    automatique (qui n'a pas d'objet `update`). Vend la position active immédiatement (taker — la vitesse
+    prime sur le rebate maker dans ce cas), met à jour bankroll/trades/state, envoie l'alerte Telegram.
+    Retourne (success: bool, gross_pnl: float|None)."""
+    bet = getattr(st, f"bet{sfx}")
+    if not bet or st.paper_mode:
+        return False, None
+    active_token_id = getattr(st, f"active_token_id{sfx}")
+    entry_token_price = getattr(st, f"entry_token_price{sfx}")
+    shares_bought = getattr(st, f"shares_bought{sfx}")
+    if not active_token_id:
+        return False, None
+    asset = bet.get("asset","?")
+    current_price = await poly.get_token_price(active_token_id)
+    gain_mult = current_price/entry_token_price if entry_token_price>0 and current_price>0 else 0
+    opposite_token = None
+    if st.current_market:
+        opposite_token = st.current_market.get("token_down") if bet.get("dir")=="UP" else st.current_market.get("token_up")
+    result = await poly.sell_position(active_token_id, shares_bought, opposite_token, current_price)
+    if not result:
+        return False, None
+    others_open = any(getattr(st, f"bet{_possfx(a)}") for a in ASSETS if _possfx(a) != sfx)
+    clob_bal = None if others_open else await fetch_clob_balance()
+    if clob_bal and clob_bal > 0:
+        gross = round(clob_bal - st.bankroll, 2)
+        st.bankroll = clob_bal
+    else:
+        gross = round((current_price - entry_token_price) * shares_bought, 2)
+        st.bankroll = max(0.0, st.bankroll + gross)
+    st.pnl += gross
+    won = gross >= 0
+    register_trade_result(won)
+    st.trades.append({"dir":bet["dir"],"amount":bet["amount"],"pnl":round(gross,4),
+        "conf":bet["conf"],"result":"WIN" if won else "LOSS",
+        "entry":bet["entry"],"exit":st.price,"reasoning":reason_label,
+        "paper":False,"ts":int(time.time()),"score":bet.get("score",0),
+        "fg_value":st.fg.get("value",50),"session":bet.get("session","?"),
+        "source":bet.get("source","?"),"aligned_15h1h":True,
+        "asset":asset,"entry_token":bet.get("entry_token",0),"t_remaining":bet.get("t_remaining",0),
+        "fill_type":bet.get("fill_type","?"),"fee_est":bet.get("fee_est",0)})
+    setattr(st, f"bet{sfx}", None); setattr(st, f"active_token_id{sfx}", None); setattr(st, f"active_order_id{sfx}", None)
+    setattr(st, f"shares_bought{sfx}", 0); setattr(st, f"entry_token_price{sfx}", 0); setattr(st, f"bet_expiry{sfx}", 0)
+    if sfx=="": st.token_price_peak=0; st.trailing_active=False
+    emoji = "✅" if won else "❌"
+    await send(context.bot,
+        f"{emoji} *{reason_label} {asset}*\n"
+        f"`{bet['dir']}` | x`{gain_mult:.2f}` | PnL:`{fmt(gross)}$`\n"
+        f"BR:`{st.bankroll:.2f}$` | ROI:`{roi()}`")
+    st.backup()
+    return True, gross
+
 async def cmd_sell(update,context):
     """✅ v10.19d — Vente manuelle immédiate de la position active (+ slot réservé BTC oracle via /sell reserved)"""
     if not auth(update): return
@@ -7020,59 +7096,52 @@ async def cmd_sell(update,context):
         await update.message.reply_text("❌ Aucune position active."); return
     if st.paper_mode:
         await update.message.reply_text("❌ Paper mode — pas de vente réelle."); return
-    active_token_id = getattr(st, f"active_token_id{sfx}")
-    entry_token_price = getattr(st, f"entry_token_price{sfx}")
-    shares_bought = getattr(st, f"shares_bought{sfx}")
-    if not active_token_id:
+    if not getattr(st, f"active_token_id{sfx}"):
         await update.message.reply_text("❌ Pas de token actif."); return
-
     _sell_asset = bet.get("asset","?")
     await update.message.reply_text(f"⏳ Vente {_sell_asset} en cours...")
-    current_price = await poly.get_token_price(active_token_id)
-    gain_mult = current_price/entry_token_price if entry_token_price>0 and current_price>0 else 0
-
-    opposite_token = None
-    if st.current_market:
-        if bet.get("dir") == "DOWN":
-            opposite_token = st.current_market.get("token_up")
-        else:
-            opposite_token = st.current_market.get("token_down")
-    result = await poly.sell_position(active_token_id, shares_bought, opposite_token, current_price)
-    if result:
-        others_open = any(getattr(st, f"bet{_possfx(a)}") for a in ASSETS if _possfx(a) != sfx)
-        clob_bal = None if others_open else await fetch_clob_balance()
-        if clob_bal and clob_bal > 0:
-            gross = round(clob_bal - st.bankroll, 2)
-            st.bankroll = clob_bal
-        else:
-            gross = round((current_price - entry_token_price) * shares_bought, 2)
-            st.bankroll = max(0.0, st.bankroll + gross)
-        st.pnl += gross
-        won = gross >= 0
-        register_trade_result(won)
-        st.trades.append({"dir":bet["dir"],"amount":bet["amount"],"pnl":round(gross,4),
-            "conf":bet["conf"],"result":"WIN" if won else "LOSS",
-            "entry":bet["entry"],"exit":st.price,"reasoning":"Vente manuelle /sell",
-            "paper":False,"ts":int(time.time()),"score":bet.get("score",0),
-            "fg_value":st.fg.get("value",50),"session":bet.get("session","?"),
-            "source":bet.get("source","?"),"aligned_15h1h":True,
-            "asset":bet.get("asset","?"),"entry_token":bet.get("entry_token",0),"t_remaining":bet.get("t_remaining",0),
-            "fill_type":bet.get("fill_type","?"),"fee_est":bet.get("fee_est",0)})
-        setattr(st, f"bet{sfx}", None); setattr(st, f"active_token_id{sfx}", None); setattr(st, f"active_order_id{sfx}", None)
-        setattr(st, f"shares_bought{sfx}", 0); setattr(st, f"entry_token_price{sfx}", 0); setattr(st, f"bet_expiry{sfx}", 0)
-        if sfx=="": st.token_price_peak=0; st.trailing_active=False
-        emoji = "✅" if won else "❌"
-        await update.message.reply_text(
-            f"{emoji} *Vente manuelle {_sell_asset}*\n"
-            f"`{bet['dir']}` | x`{gain_mult:.2f}` | PnL:`{fmt(gross)}$`\n"
-            f"BR:`{st.bankroll:.2f}$` | ROI:`{roi()}`",
-            parse_mode="Markdown")
-        st.backup()
-    else:
+    ok, gross = await _execute_position_exit(context, sfx, reason_label="Vente manuelle /sell")
+    if not ok:
         await update.message.reply_text("⚠️ Vente échouée — réessaie ou attends la résolution auto.")
 
 
-async def cmd_sellcheck(update,context):
+async def job_reversal_guard(context):
+    """✅ (23/06) demande user: GARDE DE RETOURNEMENT — surveille les positions RÉELLES ouvertes en
+    continu (toutes les ~2s) et vend immédiatement (taker — la vitesse prime sur le rebate maker ici)
+    si le marché part clairement contre notre direction, au lieu d'attendre la résolution et perdre 100%.
+    Exige une CONFIRMATION sur plusieurs lectures consécutives (même logique que le lissage OB: un seul
+    tick bruité ne suffit pas) — SAUF cascade de liquidation forte contre nous, qui justifie une sortie
+    immédiate sans attendre la confirmation (signal rapide et mécaniquement fiable)."""
+    if not REVERSAL_GUARD_ENABLED or not st.running or st.killed or st.paper_mode: return
+    now = time.time()
+    cur_slot = int(now // 300) * 300
+    slot_remaining = cur_slot + 300 - now
+    for asset in ASSETS:
+        sfx = _possfx(asset)
+        bet = getattr(st, f"bet{sfx}", None)
+        if not bet: continue
+        cfg = _asset_state_attrs(asset)
+        oracle_now = getattr(st, cfg["oracle"], 0)
+        slot_open = bet.get("slot_open_px", 0)
+        if oracle_now <= 0 or slot_open <= 0 or slot_remaining < REVERSAL_MIN_REMAINING_S:
+            continue
+        delta_pct = (oracle_now - slot_open) / slot_open * 100
+        direction = bet.get("dir")
+        against_us = (direction=="UP" and delta_pct < -REVERSAL_DELTA_PCT) or (direction=="DOWN" and delta_pct > REVERSAL_DELTA_PCT)
+        hist = st.reversal_hist.setdefault(asset, deque(maxlen=REVERSAL_CONFIRM_READS+2))
+        hist.append(against_us)
+        recent = list(hist)[-REVERSAL_CONFIRM_READS:]
+        confirmed = len(recent) >= REVERSAL_CONFIRM_READS and all(recent)
+        liq = liq_pressure(asset)
+        liq_override = (direction=="UP" and liq < -REVERSAL_LIQ_OVERRIDE_USD) or (direction=="DOWN" and liq > REVERSAL_LIQ_OVERRIDE_USD)
+        if confirmed or liq_override:
+            reason = "🚨 Sortie auto (cascade liquidation)" if liq_override and not confirmed else "🚨 Sortie auto (retournement confirmé)"
+            log.info(f"{asset}: GARDE RETOURNEMENT déclenché — delta={delta_pct:+.3f}% dir={direction} liq={liq:+.0f}$ ({reason})")
+            ok, gross = await _execute_position_exit(context, sfx, reason_label=reason)
+            if ok:
+                st.reversal_hist[asset] = deque(maxlen=REVERSAL_CONFIRM_READS+2)
+
+
     """✅ (21/06) Affiche le PnL actuel sans vendre, par crypto (/sellcheck [btc|eth|sol|xrp])."""
     if not auth(update): return
     open_assets = [a for a in ASSETS if getattr(st, f"bet{_possfx(a)}")]
