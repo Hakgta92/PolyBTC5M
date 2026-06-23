@@ -2358,13 +2358,15 @@ async def _resolve_expired_bet(context, asset="BTC"):
 
     bet_asset = bet.get("asset","BTC")
     bet_slot = (int(bet.get("ts", now))//300)*300
-    # 0) ✅ (23/06 fix v2) VÉRITÉ TERRAIN — solde RÉEL du compte Polymarket.
-    # ⚠️ (23/06) BUG TROUVÉ: le 1er seuil (diff≥40% du coût) était trop permissif — un règlement
-    # RETARDÉ d'une AUTRE position (latence blockchain/exchange, redemption qui arrive en différé)
-    # peut faire bondir le solde pile au moment où CE trade-ci est vérifié, et se faire mal-attribuer
-    # comme un WIN alors que CE trade a réellement perdu (vu: +7$ de solde alors qu'une redemption de
-    # +3$ d'un AUTRE trade plus ancien venait juste d'arriver). FIX: exiger une correspondance PRÉCISE
-    # avec le payout EXACT attendu de CE trade (shares×1$), pas juste "le solde a augmenté de qqch".
+    # 0) ✅ (23/06 fix v3) VÉRITÉ TERRAIN — solde RÉEL du compte Polymarket, mais ASYMÉTRIQUE:
+    # ⚠️ (23/06) NOUVEAU BUG TROUVÉ: "le solde n'a pas bougé" N'EST PAS la preuve d'une perte — le
+    # règlement Polymarket (blockchain) peut simplement ne pas avoir encore atterri sur le compte au
+    # moment du tout premier check (~90-100s après clôture), même pour un VRAI gagnant (vu: trade gagnant
+    # marqué LOSS parce que vérifié avant que la redemption +2$ n'ait été créditée). Donc: une hausse de
+    # solde qui correspond PRÉCISÉMENT au payout attendu = preuve POSITIVE et fiable de WIN (rien d'autre
+    # n'explique un montant aussi précis) → on l'accepte immédiatement. Mais l'ABSENCE de hausse ne prouve
+    # RIEN (peut être "vraiment perdu" OU "pas encore réglé") → on ne conclut JAMAIS LOSS depuis le solde,
+    # on laisse le slot recorder (étape 1, déjà corrigé) trancher la perte avec sa propre grâce.
     won = None; rec = None; _step0_bal = None
     others_open_now = any(getattr(st, f"bet{_possfx(a)}") for a in ASSETS if _possfx(a) != sfx)
     shares_now = getattr(st, f"shares_bought{sfx}") or 0
@@ -2377,16 +2379,10 @@ async def _resolve_expired_bet(context, asset="BTC"):
             tol = max(0.05, expected_win_diff * 0.08)  # tolérance serrée (8%, plancher 5¢)
             if abs(diff - expected_win_diff) <= tol:
                 won = True
-            elif abs(diff) <= tol:
-                won = False
-            # sinon: diff ne correspond PRÉCISÉMENT ni à "gagné" ni à "perdu" → probablement contaminé
-            # par le règlement d'une AUTRE position → won reste None, on retombe sur les fallbacks.
-            if won is not None:
-                log.info(f"{bet_asset}: résolu via SOLDE RÉEL (vérité terrain) BR avant={st.bankroll:.2f} "
-                         f"actuel={_step0_bal:.2f} diff={diff:+.2f} attendu_si_win={expected_win_diff:.2f} → {'WIN' if won else 'LOSS'}")
-            else:
-                log.info(f"{bet_asset}: solde ambigu (diff={diff:+.2f}, ni ≈0 ni ≈{expected_win_diff:.2f}) — probablement contaminé par une autre position, fallback")
-    # 1) Outcome RÉEL via le slot recorder (seulement si la vérité terrain n'a pas déjà tranché)
+                log.info(f"{bet_asset}: résolu via SOLDE RÉEL (preuve positive WIN) BR avant={st.bankroll:.2f} "
+                         f"actuel={_step0_bal:.2f} diff={diff:+.2f} attendu={expected_win_diff:.2f}")
+            # ❌ pas de branche LOSS ici — voir explication ci-dessus. won reste None → fallbacks.
+    # 1) Outcome RÉEL via le slot recorder (seulement si la vérité terrain n'a pas déjà confirmé un WIN)
     if won is None:
         rec = next((r for r in reversed(st.slot_records)
                     if r.get("asset")==bet_asset and r.get("slot")==bet_slot
