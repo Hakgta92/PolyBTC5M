@@ -168,7 +168,7 @@ OB_SIGNAL_WIN_END   = 30
 OB_SIGNAL_EV_MIN     = 0.03  # EV min dédié OB (bas car signal mesuré à 73% = edge réel; un seuil élevé bloquerait tout trade)
 # ✅ (21/06) demande user — Stratégie ob_oracle_disagree (RÉEL, BTC uniquement): trade quand le carnet
 # (OB) et l'oracle DIVERGENT; on suit le carnet (acheteurs→UP, vendeurs→DOWN). Token 0.41-0.75$, mise 2% BR.
-OB_DISAGREE_ENABLED   = True
+OB_DISAGREE_ENABLED   = False  # ❌ (23/06) demande user: désactivé
 OB_DISAGREE_THRESHOLD = 0.15   # |OB imbalance| minimum pour agir
 OB_DISAGREE_TOKEN_MIN = 0.41
 OB_DISAGREE_TOKEN_MAX = 0.75
@@ -219,7 +219,7 @@ TDS_TOKEN_MAX        = 0.72
 SHADOW_DOWN_ENABLED      = True   # passer à False pour désactiver le shadow logging
 SHADOW_DOWN_GAP_MIN      = 0.005  # gap positif minimum (spot encore au-dessus oracle figé)
 SHADOW_DOWN_DELTA_MIN    = 0.010  # |delta négatif| minimum (oracle descend de façon nette)
-ORACLE_WINDOW_START = 45    # ✅ (22/06) demande user: fenêtre T-45s→T-5s (fin abaissée de T-10s)
+ORACLE_WINDOW_START = 25    # ✅ (23/06) demande user: correction T-20s→T-25s
 ORACLE_WINDOW_END   = 5     # ✅ (22/06) demande user: fenêtre T-45s→T-5s (fin abaissée de T-10s)
 # ✅ v10.36 — Filtres WR validés par étude live (medium.com/@gwrx2005, mars 2026)
 # Source: filtre 10min → -93% pertes, seuils relevés → -73% fréquence = bien meilleur WR
@@ -2358,11 +2358,40 @@ async def _resolve_expired_bet(context, asset="BTC"):
 
     bet_asset = bet.get("asset","BTC")
     bet_slot = (int(bet.get("ts", now))//300)*300
-    # 1) Outcome RÉEL via le slot recorder
-    rec = next((r for r in reversed(st.slot_records)
-                if r.get("asset")==bet_asset and r.get("slot")==bet_slot
-                and r.get("result") in ("UP","DOWN")), None)
-    won = (rec["result"] == bet["dir"]) if rec else None
+    # 0) ✅ (23/06 fix v2) VÉRITÉ TERRAIN — solde RÉEL du compte Polymarket.
+    # ⚠️ (23/06) BUG TROUVÉ: le 1er seuil (diff≥40% du coût) était trop permissif — un règlement
+    # RETARDÉ d'une AUTRE position (latence blockchain/exchange, redemption qui arrive en différé)
+    # peut faire bondir le solde pile au moment où CE trade-ci est vérifié, et se faire mal-attribuer
+    # comme un WIN alors que CE trade a réellement perdu (vu: +7$ de solde alors qu'une redemption de
+    # +3$ d'un AUTRE trade plus ancien venait juste d'arriver). FIX: exiger une correspondance PRÉCISE
+    # avec le payout EXACT attendu de CE trade (shares×1$), pas juste "le solde a augmenté de qqch".
+    won = None; rec = None; _step0_bal = None
+    others_open_now = any(getattr(st, f"bet{_possfx(a)}") for a in ASSETS if _possfx(a) != sfx)
+    shares_now = getattr(st, f"shares_bought{sfx}") or 0
+    cost_now = round(shares_now * (entry_token_price or 0), 2)
+    if not others_open_now and cost_now > 0 and shares_now > 0:
+        _step0_bal = await fetch_clob_balance()
+        if _step0_bal is not None:
+            diff = _step0_bal - st.bankroll
+            expected_win_diff = shares_now * 1.0  # payout exact si gagnant: shares × 1$
+            tol = max(0.05, expected_win_diff * 0.08)  # tolérance serrée (8%, plancher 5¢)
+            if abs(diff - expected_win_diff) <= tol:
+                won = True
+            elif abs(diff) <= tol:
+                won = False
+            # sinon: diff ne correspond PRÉCISÉMENT ni à "gagné" ni à "perdu" → probablement contaminé
+            # par le règlement d'une AUTRE position → won reste None, on retombe sur les fallbacks.
+            if won is not None:
+                log.info(f"{bet_asset}: résolu via SOLDE RÉEL (vérité terrain) BR avant={st.bankroll:.2f} "
+                         f"actuel={_step0_bal:.2f} diff={diff:+.2f} attendu_si_win={expected_win_diff:.2f} → {'WIN' if won else 'LOSS'}")
+            else:
+                log.info(f"{bet_asset}: solde ambigu (diff={diff:+.2f}, ni ≈0 ni ≈{expected_win_diff:.2f}) — probablement contaminé par une autre position, fallback")
+    # 1) Outcome RÉEL via le slot recorder (seulement si la vérité terrain n'a pas déjà tranché)
+    if won is None:
+        rec = next((r for r in reversed(st.slot_records)
+                    if r.get("asset")==bet_asset and r.get("slot")==bet_slot
+                    and r.get("result") in ("UP","DOWN")), None)
+        won = (rec["result"] == bet["dir"]) if rec else None
     # ✅ (22/06 fix) GRÂCE déplacée ICI, avant TOUTE heuristique de fallback (prix résolu ET reconstruction
     # oracle) — les deux peuvent donner une lecture confiante mais FAUSSE basée sur un prix transitoire/
     # périmé avant que le carnet ne reflète le vrai règlement (vu: BTC et XRP marqués LOSS alors que
@@ -2417,7 +2446,7 @@ async def _resolve_expired_bet(context, asset="BTC"):
     # gross = PnL déterministe de CE trade (parts × résultat), pour le PnL cumulé/stats uniquement.
     gross = est_gross
     st.pnl += gross
-    clob_bal = await fetch_clob_balance()  # valeurs aberrantes (>1M$/<0) déjà filtrées → None
+    clob_bal = _step0_bal if _step0_bal is not None else await fetch_clob_balance()  # ✅ (23/06) réutilise l'appel de l'étape 0 si dispo
     if clob_bal is not None and clob_bal > 0:
         st.bankroll = clob_bal  # ← BR réel
     else:
