@@ -104,8 +104,7 @@ KELLY_FRACTION  = 0.25
 ENTRY_LAST_SECONDS = 60   # Entrée jusqu'à T-60s (polybacktest: pas trop tard)
 SNIPE_MIN_PROB     = 0.72 # ✅ v10.28 — abaissé (compensé par EV gate plus strict)
 SNIPE_EDGE_MIN     = 0.10 # ✅ v10.28/29 — EV net après vrais frais ≥10% (ex: token 0.65$ → p_dir≥0.77)
-SNIPE_TOKEN_MIN    = 0.10 # ✅ (23/06) demande user: synchronisé avec ORACLE_TOKEN_MIN (0.41→0.10$) — sinon
-                            # cette vérif de sécurité dans place_bet aurait annulé les trades 0.10$-0.36$
+SNIPE_TOKEN_MIN    = 0.35 # ✅ (23/06) demande user: synchronisé avec ORACLE_TOKEN_MIN (0.10→0.35$)
 SNIPE_TOKEN_MAX    = 0.70 # ✅ (21/06) aligné sur la fenêtre oracle 0.41→0.70$
 
 # ✅ v10.24 — Stop loss réintroduit
@@ -136,7 +135,7 @@ KILL_SWITCH_LOSSES  = 5      # Pertes consécutives → arrêt total (au-delà d
 # Strategy: si oracle a bougé X% depuis slot open ET token gagnant encore pas cher → BUY
 ORACLE_ENTRY_DELTA  = 0.02  # v12.4  # ✅ v10.31 — baissé 0.05→0.03% (-0.049% bloqué mais ✅ dans passes)
 ORACLE_TOKEN_MAX    = 0.70  # ✅ (21/06) demande user: token 0.41→0.70$ sur TOUTES les cryptos
-ORACLE_TOKEN_MIN    = 0.10  # ✅ (23/06) demande user: min abaissé 0.41$→0.10$ (toutes cryptos)
+ORACLE_TOKEN_MIN    = 0.35  # ✅ (23/06) demande user: min remonté 0.10$→0.35$ (toutes cryptos)
 ORACLE_EDGE_MIN     = 0.15  # v12.4  # EV minimum — 15% (momentum/meanrev/confluence sur tous assets)
 # ✅ v12.9 (18/06) — EV oracle lag ETH/SOL/XRP abaissé 15%→10% (demande user). ⚠️ RISQUE DOCUMENTÉ:
 # les ev-skips ETH/SOL historiques sont 0W/7L (que des pertes dans cette zone). XRP non mesuré.
@@ -147,7 +146,7 @@ LIQ_PRESSURE_MIN_USD  = 50000   # ✅ (22/06) seuil minimum (USD net) pour consi
 # ✅ (23/06) demande user: GARDE DE RETOURNEMENT — vend la position en cours si le marché part clairement
 # contre nous, au lieu d'attendre la résolution. Exige une CONFIRMATION (pas un seul tick bruité, même
 # logique que le lissage OB) sauf en cas de cascade de liquidation forte (réaction immédiate justifiée).
-REVERSAL_GUARD_ENABLED   = True
+REVERSAL_GUARD_ENABLED   = False  # ❌ (23/06) demande user: désactivé définitivement — laisse la résolution se faire naturellement
 REVERSAL_DELTA_PCT       = 0.05   # mouvement oracle contre nous (%, depuis l'open du slot) pour être "candidat"
 REVERSAL_CONFIRM_READS   = 3      # nb de lectures consécutives d'accord nécessaires (~check_interval×3)
 REVERSAL_CHECK_INTERVAL_S = 2.0   # fréquence de vérification du garde
@@ -6050,19 +6049,13 @@ PARAMÈTRES ACTUELS:
 - MOMENTUM (BTC/ETH/SOL/XRP) [INACTIF]: ret60s≥0.30% | T-150s→T-60s | tok 0.55$-0.65$ | filtre trend macro 10min (bloque si tendance 10min contraire ≥0.10%, source: étude live ayant réduit pertes -93%→-13% avec ce filtre) | Kelly dédié 1-3% BR (2ème fenêtre indépendante). Extension ETH/SOL/XRP NOUVELLE (17/06) — surveiller si ces assets, documentés plus bruités à court terme, performent moins bien que BTC.
 - MEAN-REVERSION (BTC/ETH/SOL/XRP) [INACTIF]: Bollinger Bandwidth≤0.12% (régime squeeze) | parie contre un spike (prix hors bandes 2σ) | tok 0.51$-0.70$ | Kelly dédié 1-3% BR (3ème fenêtre, même T-150s→T-60s, régime complémentaire au momentum — squeeze vs expansion). Stratégie NOUVELLE, seuils à calibrer avec données réelles. Extension ETH/SOL/XRP NOUVELLE (17/06).
 - CONFLUENCE (BTC/ETH/SOL/XRP, 4ème stratégie /conf) [INACTIF]: TDS = oracle_score(gap≥0.025%, fort≥0.060%) × setup_score(mean-rev ou momentum, UNIQUEMENT si aligné avec le biais oracle) × (1-noise_penalty si chop détecté) | seuil TDS≥0.35 | tok 0.52$-0.72$ | Kelly dédié 1-3% BR avec SIZING DYNAMIQUE (confidence 0.7x à TDS=seuil → 1.3x à TDS=1.0, toujours capé 1-3% BR) | même fenêtre T-150s→T-60s. Poids adaptatifs MR/momentum ajustés UNIQUEMENT après ≥20 trades par branche (neutres sinon — anti-overfitting). Stratégie TRÈS NOUVELLE (17/06), tous les seuils sont des points de départ raisonnés à calibrer en priorité avec les premières données réelles.
-- Commun: delta≥0.020% | token BTC {ORACLE_TOKEN_MIN:.2f}$-{ORACLE_TOKEN_MAX:.2f}$ (abaissé 0.41$→0.10$ le 23/06 sur demande user — ⚠️ RISQUE: zone <0.41$ jamais validée en réel, surveiller via /edge) (exceptions: ret3s≤+0.010% OU delta≥0.114%+gap≥0.060%) | ETH/XRP/SOL(votes≤-1) token max 0.95$ | EV≥{int(ORACLE_EDGE_MIN_BTC*100)}% pour BTC oracle lag, EV≥{int(ORACLE_EDGE_MIN_ALT*100)}% pour ETH/SOL/XRP oracle lag (abaissé à 5% le 22/06 sur demande user — ⚠️ RISQUE: seuil bas jamais validé en réel, surveiller via /edge et remonter si l'écart EV théorique/réalisé est négatif) | votes≥2 (consensus pour la direction parié, pas score brut)
+- Commun: delta≥0.020% | token BTC {ORACLE_TOKEN_MIN:.2f}$-{ORACLE_TOKEN_MAX:.2f}$ (historique: 0.41$→0.10$ le 23/06 puis remonté à 0.35$ le 23/06 sur demande user) (exceptions: ret3s≤+0.010% OU delta≥0.114%+gap≥0.060%) | ETH/XRP/SOL(votes≤-1) token max 0.95$ | EV≥{int(ORACLE_EDGE_MIN_BTC*100)}% pour BTC oracle lag, EV≥{int(ORACLE_EDGE_MIN_ALT*100)}% pour ETH/SOL/XRP oracle lag (abaissé à 5% le 22/06 sur demande user — ⚠️ RISQUE: seuil bas jamais validé en réel, surveiller via /edge et remonter si l'écart EV théorique/réalisé est négatif) | votes≥2 (consensus pour la direction parié, pas score brut)
 - ✅ (22/06) Maker en priorité (zéro frais + rebate), TAKER en fallback si pas rempli. Délai d'attente
   maker ADAPTATIF (pas une constante fixe): proportionnel au temps réel restant avant la fin du slot —
   signal précoce (proche T-45s) = plein temps normal (~3s/tentative, jusqu'à 1s de fenêtre retry),
   signal tardif (proche T-5s) = bascule taker quasi immédiate pour ne pas rater le slot.
 - ✅ (22/06, bonus doublé 23/06) Confirmations additionnelles oracle lag (bonus +0.04 à p_oracle, jamais un gate dur — doublé de 0.02 le 23/06 suite preuve /edge "OB+OFI accord" 92% précision n=145): (1) OB microprice+OFI LISSÉS sur ~5s avec exigence de persistance ≥70% (remplace l'ancienne lecture instantanée bruitée) — BTC/ETH/SOL seulement, XRP=0 (pas de flux OB XRP); (2) pression de liquidation Binance Futures nette ≥{LIQ_PRESSURE_MIN_USD}$ sur {LIQ_PRESSURE_WINDOW_S}s (mécanique directe: short liquidé→achat forcé→haussier, et inversement) — 4 cryptos. Funding rate Binance collecté et affiché via /oracle mais PAS ENCORE branché dans p_oracle (sens prédictif continuation vs retour à la moyenne pas encore validé empiriquement — ne pas en inventer un sans données).
-- ✅ (23/06) demande user: GARDE DE RETOURNEMENT — surveille les positions réelles ouvertes toutes les
-  {REVERSAL_CHECK_INTERVAL_S}s, vend en taker immédiatement (priorité vitesse) si le marché part
-  clairement contre la direction parié de ≥{REVERSAL_DELTA_PCT}% (confirmé sur {REVERSAL_CONFIRM_READS}
-  lectures consécutives, sauf cascade de liquidation ≥{REVERSAL_LIQ_OVERRIDE_USD}$ contre nous → sortie
-  immédiate sans attendre confirmation). N'agit pas sous {REVERSAL_MIN_REMAINING_S}s restant (plus le
-  temps). Ces sorties anticipées apparaissent dans /trades avec reasoning="🚨 Sortie auto..." — NE PAS
-  les confondre avec des résolutions normales de fin de slot dans l'analyse.
+- ❌ (23/06) GARDE DE RETOURNEMENT DÉSACTIVÉ sur demande user — code conservé mais inactif (`REVERSAL_GUARD_ENABLED=False`). Le bot ne vend plus automatiquement sur retournement; chaque position va jusqu'à la résolution naturelle du slot. Si tu vois encore des trades avec reasoning="🚨 Sortie auto..." dans /trades, ce sont des reliquats d'avant cette désactivation, pas un signe que le garde tourne encore.
 - BTC deltaneg: bloqué sauf si gap≥0.040% ET ret3s>-0.050% (exception validée 9W/3L)
 - ETH/SOL/XRP deltaneg: seuil strict -0.010% (0% WR historique si assoupli)
 - Filtres actifs: ret3s_brutal(<-0.070%, ne bloque plus DOWN déjà confirmé) | delta_neg | gap_neg | tokenmax | tokenmin | ev
